@@ -381,7 +381,7 @@ newly added named workspace letter (`Option+A` ... `Option+Z`) register on the n
 spaceman ctl pause
 spaceman ctl status
 spaceman ctl quit
-open "/Applications/Spaceman.app"
+open "/Applications/SpaceFred.app"
 ```
 
 `spaceman ctl restart` safely restores parked windows and exits, but currently does not relaunch the

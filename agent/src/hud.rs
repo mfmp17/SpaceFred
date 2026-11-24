@@ -71,10 +71,10 @@ pub const fn panel_edge(position: HudPosition) -> ScreenEdge {
 }
 /// One panel per display, up to this many displays.
 const PANEL_NAMES: [&str; 4] = [
-    "Spaceman HUD",
-    "Spaceman HUD 2",
-    "Spaceman HUD 3",
-    "Spaceman HUD 4",
+    "SpaceFred HUD",
+    "SpaceFred HUD 2",
+    "SpaceFred HUD 3",
+    "SpaceFred HUD 4",
 ];
 
 pub(super) struct HudOverlay {

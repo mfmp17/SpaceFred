@@ -1,17 +1,17 @@
-# Spaceman 🪐
+# SpaceFred 🪐
 
-Spaceman is an experimental macOS tiling window manager with a soft spot for windows that refuse to sit still. It is built around stable logical windows. A native window, including a selected Ghostty native tab, can change its physical Accessibility identity without creating a new tile. Spaceman keeps the logical slot and replaces its physical binding when the evidence is unambiguous. Same seat. New body. No drama. ✨
+SpaceFred is Fred's fork of [Spaceman](https://github.com/anomalyco/spaceman), the experimental macOS tiling window manager from [Anomaly](https://anoma.ly/spaceman). Same logical windows, same soft spot for ones that refuse to sit still, and a name that does not pretend to be the official app. A native window, including a selected Ghostty native tab, can change its physical Accessibility identity without creating a new tile. SpaceFred keeps the logical slot and replaces its physical binding when the evidence is unambiguous. Same seat. New body. No drama. ✨
 
-[Website](https://anoma.ly/spaceman) · [Download for Apple silicon](https://anoma.ly/spaceman/download/macos-arm64)
+The bundle is `SpaceFred.app` (`one.frederico.spacefred`), so it can sit next to official Spaceman without sharing its updates. A source build never installs Anomaly's releases. Settings still live in `~/Library/Application Support/Spaceman`, so a config you already had comes along.
 
 > [!WARNING]
-> Disable AeroSpace, yabai, Amethyst, and every other window manager before first opening Spaceman
+> Disable AeroSpace, yabai, Amethyst, and every other window manager before first opening SpaceFred
 > or installing it from source. Two managers can repeatedly move the same windows. Keep the parked
-> window state until Spaceman has successfully paused or quit and restored every window.
+> window state until SpaceFred has successfully paused or quit and restored every window.
 
 ## What it does 🪟
 
-Spaceman currently:
+SpaceFred currently:
 
 - starts automatic tiling when Accessibility permission and its global hotkeys are available;
 - provides ten default numbered workspaces plus opt-in named workspaces A-Z, with 1-5 on the main
@@ -19,7 +19,7 @@ Spaceman currently:
 - assigns workspaces to `main`, `secondary`, a display UUID, or an exact display name, falling back
   to the main display when a preferred display disconnects;
 - persists active workspaces, nested split layouts, tile order and weights, and parked-window recovery
-  metadata across Spaceman restarts, and remembers each application's window placements by bundle
+  metadata across restarts, and remembers each application's window placements by bundle
   identifier so reboots and startup recovery return windows to their workspaces;
 - journals window arrangements and model/screen disagreements locally, summarized in Settings (`Activity`)
   and by `spaceman doctor`;
@@ -37,14 +37,15 @@ Spaceman currently:
   or resizing them;
 - exposes a local CLI over a user-only Unix socket.
 
-Spaceman uses Accessibility APIs to observe, focus, move, and resize eligible windows. It requires no
+SpaceFred uses Accessibility APIs to observe, focus, move, and resize eligible windows. It requires no
 SIP change. Read [Security and privacy](docs/security-and-privacy.md),
 [Compatibility](docs/compatibility.md), and [Limitations](docs/limitations.md) before trying it.
 
-## Install the preview 📦
+## Upstream Spaceman preview 📦
 
-The current preview is a Developer ID-signed, notarized arm64 build for Apple silicon Macs. It remains
-experimental; read [Known limitations](docs/limitations.md) before installing it.
+This is Anomaly's official app, not SpaceFred. It is a Developer ID-signed, notarized arm64 build for
+Apple silicon Macs. It remains experimental; read [Known limitations](docs/limitations.md) before
+installing it. It updates itself from Anomaly and uses bundle ID `anomaly.spaceman`.
 
 1. Disable every other window manager. For AeroSpace: `aerospace enable off`.
 2. Download, install and open the latest build:
@@ -86,7 +87,7 @@ From an existing repository checkout, first disable every other window manager, 
 ```
 
 Set `SPACEMAN_CODESIGN_IDENTITY` if auto-detection does not choose the desired identity. The script
-builds and signs `target/Spaceman.app`, installs it at `/Applications/Spaceman.app`, links the CLI to
+builds and signs `target/SpaceFred.app`, installs it at `/Applications/SpaceFred.app`, links the CLI to
 `~/.local/bin/spaceman`, and opens the app.
 
 Ensure `~/.local/bin` is on `PATH`. For zsh:
@@ -102,9 +103,9 @@ maintainer workflow.
 ## First open 👋
 
 1. Disable every other window manager. For AeroSpace: `aerospace enable off`.
-2. Open Spaceman: `open "/Applications/Spaceman.app"`.
-3. On a fresh install, Spaceman opens its three-step setup tour when Accessibility access is missing.
-   Choose `Allow` and grant Spaceman access in **System Settings > Privacy & Security** (the
+2. Open SpaceFred: `open "/Applications/SpaceFred.app"`.
+3. On a fresh install, SpaceFred opens its three-step setup tour when Accessibility access is missing.
+   Choose `Allow` and grant SpaceFred access in **System Settings > Privacy & Security** (the
    Accessibility list, named System & App Protection Override on macOS 27.3 and later), optionally
    enable `Launch at Login`, then press `Start Tiling`.
 4. Confirm operation with `spaceman ctl status`.
@@ -115,7 +116,7 @@ Accessibility permission, the menu reports the permission error and tiling remai
 tiling, the menu lists each display's workspaces (the visible one checked, plus any holding windows,
 with their apps' icons); choosing one switches to it. The menu actions are `Setup Tour…` (while
 Accessibility is missing), `Pause Tiling` (or `Resume Tiling` while paused), `Workspace HUD`,
-`Launch at Login`, `Settings...` (`⌘,`), `Check for Updates...`, and `Quit Spaceman` (`⌘Q`). Settings
+`Launch at Login`, `Settings...` (`⌘,`), `Check for Updates...`, and `Quit SpaceFred` (`⌘Q`). Settings
 includes `General`, `Layout` (window gaps, screen-edge padding, and a single-window width for wide
 displays, over a live preview), `Rules`, `Workspaces`, `Shortcuts`, and `Activity` (title-free arrangement
 diagnostics and process vitals). If macOS requires approval, the login item action opens **System
@@ -190,7 +191,7 @@ spaceman ctl resume
 
 ## Configure 🧩
 
-Spaceman reads `~/Library/Application Support/Spaceman/config.toml` at startup and reloads rule,
+SpaceFred reads `~/Library/Application Support/Spaceman/config.toml` at startup (the same folder official Spaceman uses, so existing settings carry over) and reloads rule,
 display, and HUD (on/off, style, and screen edge) edits automatically when the file changes. See the exact current schema and
 [config.example.toml](config.example.toml) in [Configuration](docs/configuration.md).
 

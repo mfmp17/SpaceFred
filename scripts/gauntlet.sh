@@ -4,7 +4,7 @@
 #
 #   scripts/gauntlet.sh [--app PATH] [--out DIR] [--host SSH_TARGET] [--only LIST] [--reflow-budget-ms N]
 #
-# --app     Spaceman.app to test (default target/Spaceman.app from scripts/build-app.sh).
+# --app     SpaceFred.app to test (default target/SpaceFred.app from scripts/build-app.sh).
 # --out     receipt directory (default /tmp/spaceman-gauntlet-<timestamp>).
 # --host    run on another Mac over ssh: copies both apps there, runs, and copies the receipt back.
 #           GAUNTLET_SSH replaces the ssh command (for example "ssh -i KEY -J JUMP").
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-app="$root/target/Spaceman.app"
+app="$root/target/SpaceFred.app"
 out=""
 host=""
 forward=()
@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
 done
 out="${out:-/tmp/spaceman-gauntlet-$(date +%Y%m%d-%H%M%S)}"
 [[ -x "$app/Contents/MacOS/spaceman-agent" ]] || {
-  echo "no Spaceman.app at $app; build it with scripts/build-app.sh" >&2
+  echo "no SpaceFred.app at $app; build it with scripts/build-app.sh" >&2
   exit 2
 }
 

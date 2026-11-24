@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds target/Spaceman.app and signs it for a local install.
+# Builds target/SpaceFred.app and signs it for a local install.
 # SPACEMAN_CODESIGN_IDENTITY, or the first matching identity in the keychain:
 # Developer ID Application is preferred, then Apple Development. Releases are
 # not this path; they are signed with Developer ID after an unsigned build
@@ -12,7 +12,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-bundle="$root/target/Spaceman.app"
+bundle="$root/target/SpaceFred.app"
 icon_output="$root/target/AppIcon.assets"
 icon_info="$root/target/AppIcon-info.plist"
 identity=${SPACEMAN_CODESIGN_IDENTITY:-}
@@ -139,7 +139,7 @@ codesign --force --timestamp --options runtime --sign "$identity" \
 codesign --force --timestamp --options runtime --sign "$identity" \
   "$bundle/Contents/MacOS/spaceman"
 codesign --force --timestamp --options runtime --sign "$identity" \
-  --identifier anomaly.spaceman \
+  --identifier one.frederico.spacefred \
   "$bundle"
 codesign --verify --deep --strict "$bundle"
 

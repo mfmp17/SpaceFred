@@ -2,7 +2,7 @@ use spaceman::shortcuts::parse_chord;
 
 use super::*;
 
-const SOURCE: &str = r#"# Spaceman configuration.
+const SOURCE: &str = r#"# SpaceFred configuration.
 version = 1
 
 [[rules]]
@@ -201,7 +201,7 @@ fn reset_removes_the_table_and_keeps_everything_else() {
     let doc = saved(&doc);
     let source = doc.source();
     assert!(!source.contains("shortcuts"), "{source}");
-    assert!(source.contains("# Spaceman configuration."), "{source}");
+    assert!(source.contains("# SpaceFred configuration."), "{source}");
     assert_eq!(doc.shortcuts(), Shortcuts::default());
 }
 

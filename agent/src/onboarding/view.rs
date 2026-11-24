@@ -73,7 +73,7 @@ pub fn overlay(ui: &Ui, p: Paint) -> Option<El> {
         col()
             .key("tour")
             .role("dialog")
-            .label("Spaceman setup")
+            .label("SpaceFred setup")
             .absolute(0.0, 0.0)
             .w_full()
             .h_full()
@@ -225,7 +225,7 @@ fn welcome(p: Paint, conflicts: &[String]) -> El {
         .child(welcome_hero(p))
         .child(title_block(
             p,
-            "Welcome to Spaceman",
+            "Welcome to SpaceFred",
             Some(
                 "Fast macOS workspaces and automatic tiling, with every window restored if you pause or quit.",
             ),
@@ -375,7 +375,7 @@ fn setup(ui: &Ui, p: Paint, view: &View) -> El {
 
     let login_desc = match ui.agent.as_ref().map(|agent| &agent.launch_at_login) {
         Some(UiLaunchAtLogin::NeedsApproval) => (
-            "Approve Spaceman in System Settings › General › Login Items.".to_owned(),
+            "Approve SpaceFred in System Settings › General › Login Items.".to_owned(),
             p.warning(),
         ),
         Some(UiLaunchAtLogin::Failed(error)) => (error.clone(), p.danger()),
@@ -397,7 +397,7 @@ fn setup(ui: &Ui, p: Paint, view: &View) -> El {
     col()
         .key("setup")
         .gap(24.0)
-        .child(title_block(p, "Give Spaceman window access", None))
+        .child(title_block(p, "Give SpaceFred window access", None))
         .child(controls::card(p, "setup-card", vec![access_row, login_row]))
 }
 
@@ -408,7 +408,7 @@ fn done(p: Paint, sandbox: &Sandbox) -> El {
         .child(title_block(
             p,
             "You're all set",
-            Some("Try the shortcuts here. Spaceman lives in the menu bar."),
+            Some("Try the shortcuts here. SpaceFred lives in the menu bar."),
         ))
         .child(desk::practice(p, sandbox))
 }

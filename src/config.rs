@@ -609,6 +609,8 @@ pub fn application_support_path(file: &str) -> Option<PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
+                // Keep Spaceman's folder so an existing config, workspaces, and
+                // parked-window recovery carry over to this SpaceFred fork.
                 .map(|home| home.join("Library/Application Support/Spaceman"))
         })
         .map(|directory| directory.join(file))

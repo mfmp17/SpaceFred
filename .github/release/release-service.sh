@@ -33,7 +33,7 @@ distributions='[
 
 publish() {
   local dir=$1 notes_url=$2 zip
-  zip="$dir/Spaceman-$SPACEMAN_VERSION-macos-arm64.zip"
+  zip="$dir/SpaceFred-$SPACEMAN_VERSION-macos-arm64.zip"
   [ -f "$zip" ] || die "Missing $zip."
 
   jq -n --arg channel "$SPACEMAN_RELEASE_CHANNEL" --arg version "$SPACEMAN_VERSION" --arg notes_url "$notes_url" \

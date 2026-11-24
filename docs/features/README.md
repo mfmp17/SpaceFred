@@ -1,7 +1,8 @@
 # Feature Map 🗺️
 
-What a Spaceman user can do, how they reach it, and what currently proves it works. Think of this
-as the treasure map: behavior is described from the user's point of view, and
+What a SpaceFred user can do. SpaceFred is Fred's fork of Anomaly's Spaceman: same map, different
+bundle, and it does not install Anomaly's releases. Behavior is described from the user's point of
+view, and
 [Controls](../controls.md) and [Configuration](../configuration.md) remain the reference for exact
 keys and schema. If a shortcut and this page ever disagree, trust those two and then fix this page. 🔧
 
@@ -34,7 +35,7 @@ secondary-display workspaces ships in the notarized preview at
 
 ## Common Prerequisites 🎫
 
-- macOS with Accessibility permission granted to `Spaceman.app`. Without it, or without global
+- macOS with Accessibility permission granted to `SpaceFred.app`. Without it, or without global
   hotkey registration, Spaceman starts paused and only restores parked windows.
 - No other window manager running (AeroSpace, yabai, Amethyst): two managers fight over frames.
 - Only standard, movable, on-screen, non-native-fullscreen `AXWindow`s are managed. Panels,
@@ -54,7 +55,7 @@ Each feature file labels evidence as one of:
   hotkeys against disposable Ghostty windows. They require AeroSpace enabled initially and two
   displays.
 - **Live gauntlet**: `scripts/gauntlet.sh` (see [Development](../development.md#live-gauntlet)) runs a
-  real Spaceman.app against disposable windows on one display and asserts each step against both
+  real SpaceFred.app against disposable windows on one display and asserts each step against both
   the window server and Spaceman's state files, with a JSON receipt. Proves real frames, parking,
   focus, timing and restoration; it does not drive hotkeys or a second display.
 - **Observed**: behavior seen in `agent.log` or `journal.jsonl` on the maintainer's machine, with the

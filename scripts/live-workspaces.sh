@@ -151,7 +151,7 @@ aerospace move-node-to-workspace --window-id "$window_id" spaceman-workspace-tes
 aerospace workspace spaceman-workspace-test >/dev/null
 aerospace enable off >/dev/null
 
-SPACEMAN_CONFIG="$test_config" SPACEMAN_APPLICATION_SUPPORT="$test_state" SPACEMAN_MANAGED_DISPLAY=secondary "$root/target/Spaceman.app/Contents/MacOS/spaceman-agent" &
+SPACEMAN_CONFIG="$test_config" SPACEMAN_APPLICATION_SUPPORT="$test_state" SPACEMAN_MANAGED_DISPLAY=secondary "$root/target/SpaceFred.app/Contents/MacOS/spaceman-agent" &
 agent_pid=$!
 sleep 2
 
@@ -298,10 +298,10 @@ assert_not_minimized "hard kill"
 state_file="$test_state/parked-windows.json"
 [[ -s "$state_file" && "$(jq length "$state_file")" -eq 1 ]] || { echo "FAIL: parked window was not persisted before hard kill" >&2; exit 1; }
 
-SPACEMAN_CONFIG="$test_config" SPACEMAN_APPLICATION_SUPPORT="$test_state" SPACEMAN_MANAGED_DISPLAY=secondary "$root/target/Spaceman.app/Contents/MacOS/spaceman-agent" &
+SPACEMAN_CONFIG="$test_config" SPACEMAN_APPLICATION_SUPPORT="$test_state" SPACEMAN_MANAGED_DISPLAY=secondary "$root/target/SpaceFred.app/Contents/MacOS/spaceman-agent" &
 agent_pid=$!
 sleep 2
-SPACEMAN_APPLICATION_SUPPORT="$test_state" "$root/target/Spaceman.app/Contents/MacOS/spaceman" ctl pause >/dev/null
+SPACEMAN_APPLICATION_SUPPORT="$test_state" "$root/target/SpaceFred.app/Contents/MacOS/spaceman" ctl pause >/dev/null
 wait_for_position equal "$normal_position" || { echo "FAIL: startup recovery did not restore the parked window after pause" >&2; exit 1; }
 assert_not_minimized "crash recovery"
 for _ in $(seq 1 30); do

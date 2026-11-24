@@ -95,9 +95,9 @@ pub fn snapshot(cycle: u64) -> Result<(NativeObservation, Settings), SnapshotErr
 /// Spaceman's own windows (Settings, Onboarding, HUD) are never managed, even when `spaceman` CLI
 /// observes `Spaceman.app` from a second process.
 pub(super) fn is_own_application(application: &NSRunningApplication) -> bool {
-    application
-        .bundleIdentifier()
-        .is_some_and(|id| &*id == ns_string!("anomaly.spaceman"))
+    application.bundleIdentifier().is_some_and(|id| {
+        &*id == ns_string!("one.frederico.spacefred") || &*id == ns_string!("anomaly.spaceman")
+    })
 }
 
 #[must_use]

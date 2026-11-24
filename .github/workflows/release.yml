@@ -122,10 +122,10 @@ jobs:
           SPACEMAN_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           bundle=$(scripts/build-app.sh | tail -n 1)
-          [ "$bundle" = "$PWD/target/Spaceman.app" ] || { echo "::error::build-app.sh made $bundle."; exit 1; }
+          [ "$bundle" = "$PWD/target/SpaceFred.app" ] || { echo "::error::build-app.sh made $bundle."; exit 1; }
           scripts/validate-release.sh --metadata-only
           mkdir -p "$RUNNER_TEMP/macos"
-          /usr/bin/ditto -c -k --keepParent "$bundle" "$RUNNER_TEMP/macos/Spaceman.app.zip"
+          /usr/bin/ditto -c -k --keepParent "$bundle" "$RUNNER_TEMP/macos/SpaceFred.app.zip"
       - id: upload
         uses: ./.github/release/upload
         with:
@@ -195,7 +195,7 @@ jobs:
         env:
           SPACEMAN_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           SPACEMAN_NOTARY_ISSUER: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-        run: bash .github/release/sign-macos.sh "$RUNNER_TEMP/in/build-macos-arm64/Spaceman.app.zip" "$RUNNER_TEMP/out"
+        run: bash .github/release/sign-macos.sh "$RUNNER_TEMP/in/build-macos-arm64/SpaceFred.app.zip" "$RUNNER_TEMP/out"
       - name: Remove the credentials
         if: always()
         run: |
@@ -229,11 +229,11 @@ jobs:
       - name: Check the signed app
         run: |
           dir="$RUNNER_TEMP/in/sign-macos"
-          zip="Spaceman-$SPACEMAN_VERSION-macos-arm64.zip"
+          zip="SpaceFred-$SPACEMAN_VERSION-macos-arm64.zip"
           (cd "$dir" && shasum -a 256 -c "$zip.sha256")
           check=$(mktemp -d)
           ditto -x -k "$dir/$zip" "$check"
-          app="$check/Spaceman.app"
+          app="$check/SpaceFred.app"
           SPACEMAN_RELEASE_ARCH=arm64 scripts/validate-release.sh "$app" "$dir/$zip"
           details=$(codesign --display --verbose=4 "$app" 2>&1)
           grep -qx "TeamIdentifier=$SPACEMAN_TEAM_ID" <<< "$details" || { echo "::error::Not signed by team $SPACEMAN_TEAM_ID."; exit 1; }

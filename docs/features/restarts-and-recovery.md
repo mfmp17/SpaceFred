@@ -60,7 +60,7 @@ Diagnose                                                   // recover.doctor
 
 ```ts
 Menu bar: workspaces (switch) | Pause Tiling (pause + restore) | Workspace HUD | Settings... (⌘,)
-          | Check for Updates... / Install Spaceman <version> and Restart | Quit Spaceman (⌘Q)
+          | Check for Updates... / Install SpaceFred <version> and Restart | Quit SpaceFred (⌘Q)
 Settings: sidebar foot and General -> Updates (Install & Restart, Switch to Dev/Stable, Download,
           Check Now, Update channel)
 Settings: Activity -> Journal (Show in Finder) | Save Snapshot

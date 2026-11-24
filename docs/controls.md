@@ -143,8 +143,8 @@ The menu-bar control shows active workspace/layout glyphs and runtime errors. It
 - `Launch at Login`, shown checked when macOS has enabled the signed app bundle;
 - `Settings...` (`⌘,`), opening the Rune Settings window (`General`, `Layout`, `Rules`, `Workspaces`, `Shortcuts`, and `Activity`, plus `⇧⌘D` Playground);
 - `Check for Updates...`, which checks and opens Settings (its sidebar and `General > Updates` show
-  the result), or `Install Spaceman <version> and Restart` once an update is downloaded and verified;
-- `Quit Spaceman` (`⌘Q`).
+  the result), or `Install SpaceFred <version> and Restart` once an update is downloaded and verified;
+- `Quit SpaceFred` (`⌘Q`).
 
 If macOS reports that the login item requires approval, the menu label says
 `Launch at Login (Approval Required...)`; choosing it opens Login Items settings. Registration does
@@ -165,7 +165,7 @@ and a copy Spaceman can't replace offers `Download`.
 Homebrew cask installs link the bundled CLI into `$(brew --prefix)/bin/spaceman` (typically
 `/opt/homebrew/bin/spaceman`, already on `PATH`). Source installs (`scripts/install-app.sh`) link
 `~/.local/bin/spaceman` (add `~/.local/bin` to `PATH` or invoke that absolute path), and direct ZIP
-installs bundle the CLI at `/Applications/Spaceman.app/Contents/MacOS/spaceman`. Commands that
+installs bundle the CLI at `/Applications/SpaceFred.app/Contents/MacOS/spaceman`. Commands that
 alter layouts require automatic tiling to be enabled.
 
 ```sh

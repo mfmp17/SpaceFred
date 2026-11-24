@@ -1,6 +1,6 @@
 use super::*;
 
-const SOURCE: &str = r#"# Spaceman configuration.
+const SOURCE: &str = r#"# SpaceFred configuration.
 version = 1
 
 [[rules]]
@@ -333,7 +333,7 @@ fn inline_rules_array_reads_adds_moves_and_removes_without_losing_entries() {
             "]\n",
         ),
         concat!(
-            "# Spaceman configuration.\n",
+            "# SpaceFred configuration.\n",
             "version = 1\n",
             "\n",
             "rules = [\n",
@@ -419,7 +419,7 @@ fn inline_workspaces_array_reads_updates_adds_and_clears_assignments() {
     let variants = [
         "version = 1\nworkspaces = [{ workspace = 9, monitor = \"main\" }]\n",
         concat!(
-            "# Spaceman configuration.\n",
+            "# SpaceFred configuration.\n",
             "version = 1\n",
             "\n",
             "workspaces = [\n",

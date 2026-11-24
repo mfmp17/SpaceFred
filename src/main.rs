@@ -162,7 +162,7 @@ fn run_doctor(hours: Option<u64>) -> Result<String, String> {
     let (lines, skipped) = spaceman::journal::read(&[&rotated, &live])?;
     if lines.is_empty() && skipped == 0 {
         return Ok(format!(
-            "No arrangement journal at {} yet. It is written by a running Spaceman agent.",
+            "No arrangement journal at {} yet. It is written by a running SpaceFred agent.",
             live.display()
         ));
     }
@@ -179,7 +179,7 @@ fn doctor_since(now: u64, hours: Option<u64>) -> u64 {
 
 #[cfg(target_os = "macos")]
 fn write_hud_frame(out: &mut impl Write, debug: &serde_json::Value) -> io::Result<()> {
-    write!(out, "\x1b[2J\x1b[HSpaceman HUD  (Ctrl-C to close)\n\n")?;
+    write!(out, "\x1b[2J\x1b[HSpaceFred HUD  (Ctrl-C to close)\n\n")?;
     for display in debug["displays"].as_array().into_iter().flatten() {
         let frame = &display["frame"];
         let layout = if display["fullscreen_layout"].as_bool() == Some(true) {

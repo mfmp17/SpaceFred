@@ -27,7 +27,7 @@ windows` unless it is irrecoverably stuck.
 Reopen the same installed app without deleting state:
 
 ```sh
-open "/Applications/Spaceman.app"
+open "/Applications/SpaceFred.app"
 ```
 
 If workspace state is absent or invalid, startup first attempts to restore every window recorded in
@@ -78,7 +78,7 @@ they contain bundle identifiers and geometry, though never window titles.
 7. Remove the app and CLI link.
 
 ```sh
-rm -rf "/Applications/Spaceman.app"
+rm -rf "/Applications/SpaceFred.app"
 rm -f "$HOME/.local/bin/spaceman"
 ```
 

@@ -126,9 +126,9 @@ pub fn add_instructions() -> String {
 
 fn instructions(list: &str, drag: bool) -> String {
     if drag {
-        format!("Drag Spaceman into the {list} list, or switch it on in System Settings.")
+        format!("Drag SpaceFred into the {list} list, or switch it on in System Settings.")
     } else {
-        format!("Click the Privacy & Security notification, or add Spaceman in {list}.")
+        format!("Click the Privacy & Security notification, or add SpaceFred in {list}.")
     }
 }
 
@@ -330,11 +330,11 @@ mod tests {
     fn instructions_follow_each_macos_tier() {
         // macOS 14 through 26.
         let legacy = instructions("Accessibility", true);
-        assert!(legacy.contains("Drag Spaceman into the Accessibility list"));
+        assert!(legacy.contains("Drag SpaceFred into the Accessibility list"));
 
         // macOS 27.0 through 27.2: renamed, still draggable.
         let renamed = instructions("Device Control and Data Access", true);
-        assert!(renamed.contains("Drag Spaceman into the Device Control and Data Access list"));
+        assert!(renamed.contains("Drag SpaceFred into the Device Control and Data Access list"));
 
         // macOS 27.3: no drag, so the copy points at the notification instead.
         let protected = instructions("System & App Protection Override", false);
