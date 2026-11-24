@@ -62,6 +62,31 @@ pub use reconcile::{
 pub use runtime::{CycleTicket, Engine, StaleCycle};
 pub use workspace::{DisplaySelector, DisplayTarget, WorkspaceId, Workspaces};
 
+/// Characters the active keyboard layout types, including Option combinations, so Settings
+/// can warn when a shortcut collides with one. Empty when the layout can't be read.
+#[cfg(target_os = "macos")]
+pub fn current_layout_glyphs() -> Vec<shortcuts::LayoutGlyph> {
+    keyboard_layout::cached_layout_glyphs()
+}
+
+/// Characters the active keyboard layout types. Always empty off macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn current_layout_glyphs() -> Vec<shortcuts::LayoutGlyph> {
+    Vec::new()
+}
+
+/// Enabled Mission Control shortcuts. Spaceman does not register a chord one of these owns.
+#[cfg(target_os = "macos")]
+pub fn mission_control_shortcuts() -> Vec<shortcuts::SystemChord> {
+    macos::mission_control_shortcuts()
+}
+
+/// Enabled Mission Control shortcuts. Always empty off macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn mission_control_shortcuts() -> Vec<shortcuts::SystemChord> {
+    Vec::new()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResizeDirection {
     Shrink,

@@ -1,8 +1,9 @@
-# Feature Map
+# Feature Map 🗺️
 
-What a Spaceman user can do, how they reach it, and what currently proves it works. Behavior is
-described from the user's point of view; [Controls](../controls.md) and
-[Configuration](../configuration.md) remain the reference for exact keys and schema.
+What a Spaceman user can do, how they reach it, and what currently proves it works. Think of this
+as the treasure map: behavior is described from the user's point of view, and
+[Controls](../controls.md) and [Configuration](../configuration.md) remain the reference for exact
+keys and schema. If a shortcut and this page ever disagree, trust those two and then fix this page. 🔧
 
 ```ts
 docs/features/
@@ -14,7 +15,7 @@ docs/features/
 └── restarts-and-recovery.md // what survives restarts/relaunches/reboots, restoration, doctor
 ```
 
-## Availability
+## Availability 📦
 
 Baseline: `dev` at 0.3.2 (`93897a4`). Everything below except named workspaces and
 secondary-display workspaces ships in the notarized preview at
@@ -26,12 +27,12 @@ secondary-display workspaces ships in the notarized preview at
 | Parking exemption, remembered placements (`window-memory.json`), arrangement journal, `spaceman doctor` | Preview artifact and source builds |
 | Single-process Rune Settings (`Activity`), three-step setup tour, non-activating Workspace HUD (`[settings] hud`) | Preview artifact and source builds |
 | Named workspaces A-Z | Opt-in: enabled by a `route` rule or `[[workspaces]]` entry |
-| Custom shortcuts (`[shortcuts]`) | Preview artifact and source builds; rebind, unbind, or replace the built-in keys in `config.toml` or by recording a chord in Settings › Shortcuts, with a base `modifier` for the built-ins, applied live without a restart. Covered by unit tests in `src/shortcuts.rs`, `src/hotkeys.rs`, `src/config.rs`, `src/app/app_loop/live_shortcuts.rs`, `agent/src/rules/shortcuts/tests.rs`, and `agent/src/panes/shortcuts/`; no live harness exercises a rebound chord or live re-registration yet |
+| Custom shortcuts (`[shortcuts]`) | Preview artifact and source builds; rebind, unbind, or replace the built-in keys in `config.toml` or by recording a chord in Settings › Shortcuts, with a base `modifier` for the built-ins, applied live without a restart. Switch to space 1–10 defaults to Control+number (not Option+number) while the base is Option, and each one is its own recorder under Settings › Shortcuts › Switching, including clear and Reset to Defaults. An enabled Mission Control shortcut on the same chord is left for macOS. Covered by unit tests in `src/shortcuts.rs`, `src/hotkeys.rs`, `src/config.rs`, `src/app/app_loop/live_shortcuts.rs`, `agent/src/rules/shortcuts/tests.rs`, and `agent/src/panes/shortcuts/`; no live harness exercises a rebound chord or live re-registration yet |
 | Scratchpad (`[labs] scratchpad`) | Opt-in Lab in source builds; off by default, shortcuts register only when on |
 | Secondary-display workspaces 6-10 | Require a second display; with one display they fall back to `main` |
 | Three or more displays | Assign workspaces in Settings › Workspaces (each display past `secondary` by UUID) or with `[[workspaces]] monitor = "<uuid>"` |
 
-## Common Prerequisites
+## Common Prerequisites 🎫
 
 - macOS with Accessibility permission granted to `Spaceman.app`. Without it, or without global
   hotkey registration, Spaceman starts paused and only restores parked windows.
@@ -42,7 +43,7 @@ secondary-display workspaces ships in the notarized preview at
 - CLI paths assume `~/.local/bin/spaceman` is on `PATH`; layout-changing `ctl` commands require
   automatic tiling to be enabled.
 
-## Evidence Conventions
+## Evidence Conventions 🧪
 
 Each feature file labels evidence as one of:
 
@@ -62,7 +63,7 @@ Each feature file labels evidence as one of:
 
 Absence of a check is a **gap**, not a defect; a defect is a reproduced or reported wrong outcome.
 
-## Keeping This Map Current
+## Keeping This Map Current 🧭
 
 Update the affected feature file when a change alters a shortcut, CLI command, menu item, rule
 semantics, what survives a restart, or which tests cover a flow. Add a new file only for a distinct

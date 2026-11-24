@@ -138,12 +138,7 @@ impl Doc {
                 }
             }
             for chord in suppress_moved {
-                let modifiers = if chord.modifiers.shift {
-                    modifier.with_shift()
-                } else {
-                    modifier
-                };
-                let moved = Chord { modifiers, ..chord };
+                let moved = shortcuts::retarget_built_in(chord, old, modifier);
                 if find_chord(bindings, moved).is_none() {
                     let key = moved.source();
                     bindings.insert(&key, value("none"));
@@ -169,6 +164,18 @@ impl Doc {
     /// Back to the built-in shortcuts: `[shortcuts]` leaves the file.
     pub fn reset_shortcuts(&mut self) {
         self.remove_table("shortcuts");
+    }
+
+    /// Puts Switch to space 1–10 back on their built-in chords and leaves every other shortcut.
+    pub fn reset_switch_shortcuts(&mut self) {
+        let modifier = self.shortcuts().modifier;
+        for number in 1..=10 {
+            let default = shortcuts::Chord {
+                modifiers: shortcuts::numbered_switch_modifiers(modifier),
+                key: shortcuts::Key::Number(number),
+            };
+            self.set_shortcut(&format!("switch {number}"), Some(default), Some(default));
+        }
     }
 
     fn shortcuts_table(&self) -> Option<&dyn TableLike> {

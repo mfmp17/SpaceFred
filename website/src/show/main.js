@@ -779,7 +779,7 @@ export function createShow({ still, canvas, base, capture = false, reduced = fal
       render()
       schedule()
     },
-    // Option+n during the visitor's turn.
+    // Control+n during the visitor's turn.
     key(n) {
       if (phase !== "live" || t < HOLD[0] || t > HOLD[1] - 0.5 || n < 1 || n > 3) return false
       world.switchTo(n)

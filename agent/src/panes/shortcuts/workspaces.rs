@@ -72,10 +72,12 @@ fn default_chord(kind: WorkspaceKind, workspace: WorkspaceId, base: Modifiers) -
         (_, Some(letter)) => Key::Character(letter.to_ascii_lowercase()),
         _ => unreachable!("workspace ID is always valid"),
     };
-    Chord {
-        modifiers: kind.modifiers(base),
-        key,
-    }
+    let modifiers = if kind == WorkspaceKind::Switch && workspace.number().is_some() {
+        spaceman::shortcuts::numbered_switch_modifiers(base)
+    } else {
+        kind.modifiers(base)
+    };
+    Chord { modifiers, key }
 }
 
 /// Active chords that run `kind` on `workspace` under `shortcuts`, matching `HotkeyPlan`.
@@ -101,8 +103,8 @@ pub fn active_chords(
 /// All workspace rows for the Workspaces card in Settings › Shortcuts: numbered Switch and Move,
 /// then named Switch and Move.
 pub fn rows(shortcuts: &Shortcuts, named: &[WorkspaceId]) -> Vec<WorkspaceRow> {
-    let mut out = numbered_rows(shortcuts, WorkspaceKind::Switch);
-    out.extend(numbered_rows(shortcuts, WorkspaceKind::Move));
+    // Numbered Switch to space rows are recorders in the Switching section, not this card.
+    let mut out = numbered_rows(shortcuts, WorkspaceKind::Move);
     out.extend(named_rows(shortcuts, named, WorkspaceKind::Switch));
     out.extend(named_rows(shortcuts, named, WorkspaceKind::Move));
     out
@@ -283,11 +285,6 @@ mod tests {
             rows,
             vec![
                 WorkspaceRow {
-                    key: "switch".into(),
-                    title: "Switch to workspace 1–10".into(),
-                    keys: RowKeys::Range(vec!["⌥".into(), "1…9, 0".into()]),
-                },
-                WorkspaceRow {
                     key: "move".into(),
                     title: "Move window to workspace 1–10".into(),
                     keys: RowKeys::Range(vec!["⌥".into(), "⇧".into(), "1…9, 0".into()]),
@@ -307,9 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn rebinding_workspace_1_shows_replacement_and_omits_unbound_option_1() {
+    fn rebinding_space_1_keeps_control_on_the_others_and_leaves_move_alone() {
         let rebound =
-            parse("[shortcuts.bindings]\n\"alt+1\" = \"none\"\n\"ctrl+alt+1\" = \"switch 1\"\n");
+            parse("[shortcuts.bindings]\n\"ctrl+1\" = \"none\"\n\"ctrl+alt+1\" = \"switch 1\"\n");
         let ws1 = WorkspaceId::new(1).unwrap();
         let ws2 = WorkspaceId::new(2).unwrap();
         assert_eq!(
@@ -318,79 +315,51 @@ mod tests {
         );
         assert_eq!(
             active_chords(&rebound, WorkspaceKind::Switch, ws2),
-            vec![chord("alt+2")]
+            vec![chord("ctrl+2")]
         );
-
+        // Numbered switches are recorders in Switching, not rows on this card.
         let list = rows(&rebound, &[]);
-        assert_eq!(
-            list[0],
-            WorkspaceRow {
-                key: "switch-1".into(),
-                title: "Switch to workspace 1".into(),
-                keys: RowKeys::Chords(vec![chord("ctrl+alt+1")]),
-            }
-        );
-        assert_eq!(
-            list[1],
-            WorkspaceRow {
-                key: "switch".into(),
-                title: "Switch to workspace 2–10".into(),
-                keys: RowKeys::Range(vec!["⌥".into(), "2…9, 0".into()]),
-            }
-        );
-        // Move family is untouched.
-        assert_eq!(list[2].title, "Move window to workspace 1–10");
+        assert_eq!(list[0].title, "Move window to workspace 1–10");
+        assert!(list.iter().all(|row| !row.key.starts_with("switch")));
 
-        // Removing both bindings restores the default Option+1..0 family row.
-        let restored = rows(&parse(""), &[]);
-        assert_eq!(restored[0].title, "Switch to workspace 1–10");
-        assert_eq!(
-            restored[0].keys,
-            RowKeys::Range(vec!["⌥".into(), "1…9, 0".into()])
-        );
+        let restored = active_chords(&parse(""), WorkspaceKind::Switch, ws1);
+        assert_eq!(restored, vec![chord("ctrl+1")]);
     }
 
     #[test]
     fn unbinding_or_stealing_a_workspace_chord_shows_not_set_and_splits_the_range() {
-        let unbound = parse("[shortcuts.bindings]\n\"alt+3\" = \"none\"\n");
-        let list = rows(&unbound, &[]);
+        let unbound = parse("[shortcuts.bindings]\n\"ctrl+3\" = \"none\"\n");
+        let ws3 = WorkspaceId::new(3).unwrap();
+        assert!(active_chords(&unbound, WorkspaceKind::Switch, ws3).is_empty());
         assert_eq!(
-            list[0],
-            WorkspaceRow {
-                key: "switch".into(),
-                title: "Switch to workspace 1–2, 4–10".into(),
-                keys: RowKeys::Range(vec!["⌥".into(), "1, 2, 4…9, 0".into()]),
-            }
+            active_chords(
+                &unbound,
+                WorkspaceKind::Switch,
+                WorkspaceId::new(2).unwrap()
+            ),
+            vec![chord("ctrl+2")]
         );
+        // Move still shows the compact family; unbinding Control+3 does not split it.
         assert_eq!(
-            list[1],
-            WorkspaceRow {
-                key: "switch-3".into(),
-                title: "Switch to workspace 3".into(),
-                keys: RowKeys::Chords(vec![]),
-            }
+            rows(&unbound, &[])[0].title,
+            "Move window to workspace 1–10"
         );
     }
 
     #[test]
-    fn stealing_workspace_10_chord_omits_0_from_the_default_range() {
-        let stolen = parse("[shortcuts.bindings]\n\"alt+0\" = \"float\"\n");
-        let list = rows(&stolen, &[]);
-        assert_eq!(
-            list[0],
-            WorkspaceRow {
-                key: "switch".into(),
-                title: "Switch to workspace 1–9".into(),
-                keys: RowKeys::Range(vec!["⌥".into(), "1…9".into()]),
-            }
+    fn stealing_workspace_10_chord_omits_the_default_switch() {
+        let stolen = parse("[shortcuts.bindings]\n\"ctrl+0\" = \"float\"\n");
+        assert!(
+            active_chords(
+                &stolen,
+                WorkspaceKind::Switch,
+                WorkspaceId::new(10).unwrap()
+            )
+            .is_empty()
         );
         assert_eq!(
-            list[1],
-            WorkspaceRow {
-                key: "switch-10".into(),
-                title: "Switch to workspace 10".into(),
-                keys: RowKeys::Chords(vec![]),
-            }
+            active_chords(&stolen, WorkspaceKind::Switch, WorkspaceId::new(9).unwrap()),
+            vec![chord("ctrl+9")]
         );
     }
 
@@ -401,18 +370,15 @@ mod tests {
         );
         assert_eq!(
             rows(&custom, &[]),
-            vec![
-                WorkspaceRow {
-                    key: "switch-1".into(),
-                    title: "Switch to workspace 1".into(),
-                    keys: RowKeys::Chords(vec![chord("ctrl+alt+1")]),
-                },
-                WorkspaceRow {
-                    key: "move-1".into(),
-                    title: "Move window to workspace 1".into(),
-                    keys: RowKeys::Chords(vec![chord("ctrl+alt+shift+1")]),
-                },
-            ]
+            vec![WorkspaceRow {
+                key: "move-1".into(),
+                title: "Move window to workspace 1".into(),
+                keys: RowKeys::Chords(vec![chord("ctrl+alt+shift+1")]),
+            }]
+        );
+        assert_eq!(
+            active_chords(&custom, WorkspaceKind::Switch, WorkspaceId::new(1).unwrap()),
+            vec![chord("ctrl+alt+1")]
         );
     }
 
@@ -425,8 +391,9 @@ mod tests {
             WorkspaceId::named('D').unwrap(),
         ];
         let list = rows(&rebound, &named);
+        assert_eq!(list[0].title, "Move window to workspace 1–10");
         assert_eq!(
-            list[2],
+            list[1],
             WorkspaceRow {
                 key: "switch-A".into(),
                 title: "Switch to workspace A".into(),
@@ -434,14 +401,14 @@ mod tests {
             }
         );
         assert_eq!(
-            list[3],
+            list[2],
             WorkspaceRow {
                 key: "switch-named".into(),
                 title: "Switch to workspace D".into(),
                 keys: RowKeys::Range(vec!["⌥".into(), "D".into()]),
             }
         );
-        assert_eq!(list[4].title, "Move window to a named workspace");
+        assert_eq!(list[3].title, "Move window to a named workspace");
     }
 
     #[test]

@@ -10,7 +10,7 @@ import { ALBUM, albumGrid, scrollOn } from "./library.js"
 import { walkerAt } from "./feeds.js"
 import { sitePageGeom } from "./sitepage.js"
 
-// this cut has no visitor's turn: Option+1/2/3 never take over the film
+// this cut has no visitor's turn: Control+1/2/3 never take over the film
 export const HOLD = [-10, -9]
 
 const norm = (s) => s.toLowerCase().replace(/[^a-z0-9']/g, "")

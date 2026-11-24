@@ -54,6 +54,8 @@ pub(crate) struct LayoutSnapshot {
     fingerprint: LayoutFingerprint,
     primary: Vec<KeyOutput>,
     ascii_fallback: Vec<KeyOutput>,
+    /// Characters produced while Option is held, for shortcut collision warnings.
+    option_glyphs: Vec<crate::shortcuts::LayoutGlyph>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,8 +216,47 @@ impl LayoutSnapshot {
             },
             primary: convert(primary),
             ascii_fallback: convert(fallback),
+            option_glyphs: Vec::new(),
         }
     }
+
+    /// Plain and Option-modified characters, so a shortcut can warn when it types one.
+    pub(crate) fn layout_glyphs(&self) -> Vec<crate::shortcuts::LayoutGlyph> {
+        let mut glyphs = Vec::with_capacity(self.primary.len() + self.option_glyphs.len());
+        for output in &self.primary {
+            glyphs.push(crate::shortcuts::LayoutGlyph {
+                key_code: output.key_code,
+                option: false,
+                shift: output.shift,
+                character: output.character,
+                dead: output.dead,
+            });
+        }
+        glyphs.extend(self.option_glyphs.iter().copied());
+        glyphs
+    }
+}
+
+/// Option-modified characters for the active layout, reused for a couple of seconds so
+/// Settings can warn without translating the whole keyboard on every frame.
+pub(crate) fn cached_layout_glyphs() -> Vec<crate::shortcuts::LayoutGlyph> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static CACHE: Mutex<Option<(Instant, Vec<crate::shortcuts::LayoutGlyph>)>> = Mutex::new(None);
+    if let Ok(guard) = CACHE.lock()
+        && let Some((at, glyphs)) = guard.as_ref()
+        && at.elapsed() < Duration::from_secs(2)
+    {
+        return glyphs.clone();
+    }
+    let glyphs = LayoutSnapshot::current()
+        .map(|snapshot| snapshot.layout_glyphs())
+        .unwrap_or_default();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((Instant::now(), glyphs.clone()));
+    }
+    glyphs
 }
 
 fn semantic_key_code(key: SemanticKey) -> Result<u32, ResolveError> {
@@ -376,19 +417,29 @@ mod macos {
             )))
         }
 
-        fn outputs(&self) -> Result<Option<Vec<KeyOutput>>, ResolveError> {
+        fn outputs(&self) -> Result<Option<LayoutTables>, ResolveError> {
             let Some((layout, _)) = self.layout_data()? else {
                 return Ok(None);
             };
             let mut outputs = Vec::with_capacity(256);
+            let mut option_glyphs = Vec::with_capacity(256);
             for key_code in VIRTUAL_KEY_CODES {
                 for shift in [false, true] {
                     if let Some(output) = translate(layout.cast(), key_code, shift)? {
                         outputs.push(output);
                     }
                 }
+                // Option is modifier state bit 3 (Carbon `optionKey >> 8`).
+                for (shift, state) in [(false, 8), (true, 10)] {
+                    if let Some(glyph) = translate_option(layout.cast(), key_code, state, shift)? {
+                        option_glyphs.push(glyph);
+                    }
+                }
             }
-            Ok(Some(outputs))
+            Ok(Some(LayoutTables {
+                outputs,
+                option_glyphs,
+            }))
         }
 
         fn layout_hash(&self) -> Result<u64, ResolveError> {
@@ -459,7 +510,7 @@ mod macos {
         // IMEs commonly expose no UCKeyboardLayout. In that case, macOS's current
         // keyboard-layout source is the authoritative layout beneath the IME.
         let primary = match sources.selected.outputs()? {
-            Some(outputs) => outputs,
+            Some(tables) => tables,
             None => sources.layout.outputs()?.ok_or_else(|| {
                 ResolveError::System("current input sources expose no Unicode layout data".into())
             })?,
@@ -469,9 +520,15 @@ mod macos {
         })?;
         Ok(LayoutSnapshot {
             fingerprint,
-            primary,
-            ascii_fallback,
+            primary: primary.outputs,
+            ascii_fallback: ascii_fallback.outputs,
+            option_glyphs: primary.option_glyphs,
         })
+    }
+
+    struct LayoutTables {
+        outputs: Vec<KeyOutput>,
+        option_glyphs: Vec<crate::shortcuts::LayoutGlyph>,
     }
 
     fn translate(
@@ -489,6 +546,29 @@ mod macos {
             key_code,
             character,
             shift,
+            dead: normal.dead_key_state != 0,
+        }))
+    }
+
+    fn translate_option(
+        layout: *const c_void,
+        key_code: u16,
+        modifier_state: u32,
+        shift: bool,
+    ) -> Result<Option<crate::shortcuts::LayoutGlyph>, ResolveError> {
+        let normal = translate_raw(layout, key_code, modifier_state, 0)?;
+        let no_dead_key = translate_raw(layout, key_code, modifier_state, NO_DEAD_KEYS_MASK)?;
+        let Some(character) = no_dead_key.text.or(normal.text) else {
+            return Ok(None);
+        };
+        if character.is_control() {
+            return Ok(None);
+        }
+        Ok(Some(crate::shortcuts::LayoutGlyph {
+            key_code,
+            option: true,
+            shift,
+            character,
             dead: normal.dead_key_state != 0,
         }))
     }
@@ -616,6 +696,7 @@ mod tests {
             fingerprint: fingerprint("test"),
             primary: vec![output(99, '1'), output(98, '\t')],
             ascii_fallback: vec![],
+            option_glyphs: vec![],
         };
         assert_eq!(
             snapshot
@@ -654,6 +735,7 @@ mod tests {
             fingerprint: fingerprint("test"),
             primary: vec![output(1, 'ж'), output(2, '-')],
             ascii_fallback: vec![output(3, 'h'), output(4, '-')],
+            option_glyphs: vec![],
         };
         assert_eq!(
             snapshot

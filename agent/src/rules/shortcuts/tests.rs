@@ -166,6 +166,30 @@ fn modifier_keeps_fixed_scratchpad_unbinds_in_place() {
 }
 
 #[test]
+fn reset_switch_shortcuts_restores_control_number_and_keeps_other_bindings() {
+    let mut doc = Doc::parse("version = 1\n");
+    doc.set_shortcut("switch 2", Some(chord("ctrl+2")), Some(chord("cmd+2")));
+    doc.set_shortcut(
+        "focus left",
+        Some(chord("alt+h")),
+        Some(chord("ctrl+alt+h")),
+    );
+    let doc = saved(&doc);
+    assert_eq!(bound(&doc, "ctrl+2"), Some(None));
+    assert_eq!(
+        bound(&doc, "cmd+2"),
+        Some(Some("switch workspace 2".into()))
+    );
+    let mut doc = doc;
+    doc.reset_switch_shortcuts();
+    let doc = saved(&doc);
+    assert_eq!(bound(&doc, "ctrl+2"), None);
+    assert_eq!(bound(&doc, "cmd+2"), None);
+    assert_eq!(bound(&doc, "ctrl+alt+h"), Some(Some("focus left".into())));
+    assert_eq!(bound(&doc, "alt+h"), Some(None));
+}
+
+#[test]
 fn reset_removes_the_table_and_keeps_everything_else() {
     let mut doc = Doc::parse(SOURCE);
     doc.set_shortcut_modifier(Modifiers {

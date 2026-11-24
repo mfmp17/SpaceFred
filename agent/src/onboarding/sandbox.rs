@@ -1,7 +1,8 @@
 //! The Done step's practice desktop: two pretend workspaces that the real shortcuts, or a click
 //! on their keycaps, play. Pure state; nothing here touches a real window.
 
-/// A shortcut the practice desktop answers, always with Option held.
+/// A shortcut the practice desktop answers. Focus and flip use Option; workspace
+/// switches use Control, matching the built-in shortcuts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
     Left,
@@ -13,7 +14,7 @@ pub enum Key {
 }
 
 impl Key {
-    /// The key under Option for an ANSI virtual key code, as the key tap reports it.
+    /// The practice key for an ANSI virtual key code, as the key tap reports it.
     pub fn from_key_code(code: u32) -> Option<Self> {
         Some(match code {
             4 => Self::Left,

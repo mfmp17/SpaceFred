@@ -2,7 +2,7 @@ use super::*;
 
 /// What a request for the workspace that is already up on its display does.
 ///
-/// A repeat press of the active workspace's shortcut (`Option+2` while on
+/// A repeat press of the active workspace's shortcut (`Control+2` while on
 /// Space 2) walks the focus through that workspace's tiles, which is the only
 /// way to reach them in Fullscreen Layout. A menu-bar or HUD click on the same
 /// workspace is a re-selection, not a repeat: it leaves focus where it is.

@@ -62,7 +62,7 @@ ln -sf "/Applications/Spaceman.app/Contents/MacOS/spaceman" "$HOME/.local/bin/sp
 
 | Keys | Action |
 | --- | --- |
-| `Option+1` … `Option+0` | Switch to workspace 1 … 10 |
+| `Control+1` … `Control+0` | Switch to workspace 1 … 10 (editable in Settings › Shortcuts › Switching; not Option+number, so Option+2 can still type @) |
 | `Option+Shift+1` … `Option+Shift+0` | Move focused window to workspace 1 … 10 |
 | `Option+A` … `Option+Z` | Switch to a configured named workspace |
 | `Option+Shift+A` … `Option+Shift+Z` | Move focused window to a configured named workspace |

@@ -13,7 +13,8 @@ pub struct Shortcuts {
     /// Keep the built-in shortcuts that no binding overrides.
     pub defaults: bool,
     /// The modifiers every built-in shortcut holds (`modifier`, Option by default). The
-    /// built-in Move shortcuts add Shift to it.
+    /// built-in Move shortcuts add Shift to it. Switch to space 1–10 stays on Control while
+    /// this is Option, so Option+number can still type a character.
     pub modifier: Modifiers,
     /// User bindings in chord order. Each claims its chord before any built-in shortcut.
     pub bindings: Vec<Binding>,
@@ -95,6 +96,13 @@ impl Modifiers {
         command: false,
         control: false,
         option: true,
+        shift: false,
+    };
+
+    pub const CONTROL: Self = Self {
+        command: false,
+        control: true,
+        option: false,
         shift: false,
     };
 
@@ -217,13 +225,56 @@ pub fn parse_modifier(source: &str) -> Result<Modifiers, String> {
     Ok(chord.modifiers)
 }
 
+/// Modifiers for the built-in Switch to space 1–10 shortcuts under `base`.
+///
+/// The Option base leaves them on Control, so Option+number stays free to type a character
+/// (`@` is Option+2 on a Portuguese layout). Any other base moves them with the rest of the
+/// built-ins.
+#[must_use]
+pub fn numbered_switch_modifiers(base: Modifiers) -> Modifiers {
+    if base == Modifiers::OPTION {
+        Modifiers::CONTROL
+    } else {
+        base
+    }
+}
+
+/// Where a built-in chord moves when `[shortcuts] modifier` changes from `old` to `new`.
+/// Switch to space follows [`numbered_switch_modifiers`]; everything else swaps in `new`
+/// and keeps Shift.
+#[must_use]
+pub fn retarget_built_in(chord: Chord, old: Modifiers, new: Modifiers) -> Chord {
+    if matches!(chord.key, Key::Number(1..=10))
+        && !chord.modifiers.shift
+        && chord.modifiers == numbered_switch_modifiers(old)
+    {
+        return Chord {
+            modifiers: numbered_switch_modifiers(new),
+            ..chord
+        };
+    }
+    let modifiers = if chord.modifiers.shift {
+        new.with_shift()
+    } else {
+        new
+    };
+    Chord { modifiers, ..chord }
+}
+
 /// Whether `chord` is a built-in default shortcut under `base` (with `named_workspaces`
 /// enabled) — i.e. a shortcut that moves when `[shortcuts] modifier` changes.
 ///
 /// Fixed Lab chords such as Scratchpad's `alt+\` and `alt+shift+\` do not follow
-/// `[shortcuts] modifier` and return `false`.
+/// `[shortcuts] modifier` and return `false`. Switch to space 1–10 is a built-in on
+/// Control while `base` is Option, and on `base` otherwise.
 #[must_use]
 pub fn is_built_in_chord(chord: Chord, base: Modifiers, named_workspaces: &[WorkspaceId]) -> bool {
+    if matches!(chord.key, Key::Number(1..=10))
+        && !chord.modifiers.shift
+        && chord.modifiers == numbered_switch_modifiers(base)
+    {
+        return true;
+    }
     let shift = if chord.modifiers == base {
         false
     } else if chord.modifiers == base.with_shift() {
@@ -232,7 +283,9 @@ pub fn is_built_in_chord(chord: Chord, base: Modifiers, named_workspaces: &[Work
         return false;
     };
     match chord.key {
-        Key::Number(1..=10) | Key::Code(0x30) => true,
+        // Unshifted digits are Switch to space, handled above.
+        Key::Number(1..=10) => shift,
+        Key::Code(0x30) => true,
         Key::Code(0x31) => shift,
         Key::Character(character) => {
             let is_named = named_workspaces.iter().any(|workspace| {
@@ -539,6 +592,151 @@ impl Command {
     }
 }
 
+/// ANSI virtual key codes for the physical number row, 1 through 0. Shortcut planning uses
+/// the same row, so a warning lines up with the key Carbon would register.
+const NUMBER_ROW: [u16; 10] = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1a, 0x1c, 0x19, 0x1d];
+
+/// One character a keyboard layout produces on a physical key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayoutGlyph {
+    pub key_code: u16,
+    /// Produced while Option is held.
+    pub option: bool,
+    pub shift: bool,
+    pub character: char,
+    pub dead: bool,
+}
+
+/// An enabled macOS Mission Control shortcut Spaceman must not take over.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemChord {
+    pub key_code: u16,
+    pub modifiers: Modifiers,
+    /// What macOS calls it, such as `Switch to Desktop 2`.
+    pub name: String,
+}
+
+/// One row of `com.apple.symbolichotkeys`, before it is filtered to Mission Control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolicHotkey {
+    pub id: u16,
+    pub enabled: bool,
+    pub key_code: u16,
+    /// `NSEvent` modifier flags: Shift `1 << 17`, Control `1 << 18`, Option `1 << 19`,
+    /// Command `1 << 20`.
+    pub modifier_flags: u32,
+}
+
+/// Enabled Mission Control shortcuts from `hotkeys`. Anything else in the symbolic-hotkey
+/// table is left out, and a disabled row does not reserve its chord.
+#[must_use]
+pub fn mission_control_chords(hotkeys: &[SymbolicHotkey]) -> Vec<SystemChord> {
+    hotkeys
+        .iter()
+        .filter(|hotkey| hotkey.enabled && hotkey.key_code != 0 && hotkey.key_code != u16::MAX)
+        .filter_map(|hotkey| {
+            Some(SystemChord {
+                key_code: hotkey.key_code,
+                modifiers: modifiers_from_symbolic_flags(hotkey.modifier_flags),
+                name: mission_control_name(hotkey.id)?,
+            })
+        })
+        .collect()
+}
+
+fn modifiers_from_symbolic_flags(flags: u32) -> Modifiers {
+    Modifiers {
+        shift: flags & (1 << 17) != 0,
+        control: flags & (1 << 18) != 0,
+        option: flags & (1 << 19) != 0,
+        command: flags & (1 << 20) != 0,
+    }
+}
+
+fn mission_control_name(id: u16) -> Option<String> {
+    Some(match id {
+        32 => "Mission Control".to_owned(),
+        33 => "Application windows".to_owned(),
+        36 | 37 => "Show Desktop".to_owned(),
+        79 => "Move left a space".to_owned(),
+        81 => "Move right a space".to_owned(),
+        118..=133 => format!("Switch to Desktop {}", id - 117),
+        _ => return None,
+    })
+}
+
+/// Why `chord` is a poor Switch to space shortcut: it types a character on this layout, or
+/// an enabled Mission Control shortcut already owns it. `None` when Spaceman can take it.
+#[must_use]
+pub fn switch_shortcut_warning(
+    chord: Chord,
+    glyphs: &[LayoutGlyph],
+    system: &[SystemChord],
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(text) = layout_warning(chord, glyphs) {
+        parts.push(text);
+    }
+    if let Some(text) = system_warning(chord, glyphs, system) {
+        parts.push(text);
+    }
+    match parts.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        _ => Some(parts.join(". ")),
+    }
+}
+
+fn layout_warning(chord: Chord, glyphs: &[LayoutGlyph]) -> Option<String> {
+    // Control and Command chords do not insert a character. Option (and Option+Shift) does.
+    if chord.modifiers.command || chord.modifiers.control || !chord.modifiers.option {
+        return None;
+    }
+    let key_code = resolved_key_code(chord, glyphs)?;
+    let shift = chord.modifiers.shift;
+    let produced = glyphs
+        .iter()
+        .find(|glyph| glyph.key_code == key_code && glyph.option && glyph.shift == shift)?;
+    if produced.dead {
+        return Some("Starts a character on this keyboard".to_owned());
+    }
+    let plain = glyphs.iter().find(|glyph| {
+        glyph.key_code == key_code && !glyph.option && !glyph.dead && glyph.shift == shift
+    });
+    if plain.is_some_and(|plain| plain.character == produced.character)
+        || produced.character.is_control()
+    {
+        return None;
+    }
+    Some(format!("Types \"{}\" on this keyboard", produced.character))
+}
+
+fn system_warning(chord: Chord, glyphs: &[LayoutGlyph], system: &[SystemChord]) -> Option<String> {
+    let key_code = resolved_key_code(chord, glyphs)?;
+    let owner = system
+        .iter()
+        .find(|entry| entry.key_code == key_code && entry.modifiers == chord.modifiers)?;
+    Some(format!(
+        "{} uses this shortcut, so Spaceman leaves it alone",
+        owner.name
+    ))
+}
+
+fn resolved_key_code(chord: Chord, glyphs: &[LayoutGlyph]) -> Option<u16> {
+    match chord.key {
+        Key::Number(number @ 1..=10) => Some(NUMBER_ROW[usize::from(number - 1)]),
+        Key::Number(_) => None,
+        Key::Code(code) => Some(code),
+        Key::Character(character) => glyphs.iter().find_map(|glyph| {
+            (!glyph.option
+                && !glyph.shift
+                && !glyph.dead
+                && glyph.character.eq_ignore_ascii_case(&character))
+            .then_some(glyph.key_code)
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,7 +981,8 @@ mod tests {
             WorkspaceId::named('F').unwrap(),
         ];
         for source in [
-            "alt+1",
+            "ctrl+1",
+            "ctrl+0",
             "alt+shift+0",
             "alt+h",
             "alt+shift+l",
@@ -806,6 +1005,8 @@ mod tests {
             );
         }
         for source in [
+            "alt+1",
+            "alt+0",
             "alt+\\",
             "alt+shift+\\",
             "alt+space",
@@ -825,5 +1026,111 @@ mod tests {
             base,
             &[]
         ));
+        let ctrl_alt = Modifiers {
+            control: true,
+            option: true,
+            ..Modifiers::default()
+        };
+        assert!(is_built_in_chord(
+            parse_chord("ctrl+alt+1").unwrap(),
+            ctrl_alt,
+            &[]
+        ));
+        assert!(!is_built_in_chord(
+            parse_chord("ctrl+1").unwrap(),
+            ctrl_alt,
+            &[]
+        ));
+        assert_eq!(
+            retarget_built_in(parse_chord("ctrl+2").unwrap(), base, ctrl_alt),
+            parse_chord("ctrl+alt+2").unwrap()
+        );
+        assert_eq!(
+            retarget_built_in(parse_chord("ctrl+alt+2").unwrap(), ctrl_alt, base),
+            parse_chord("ctrl+2").unwrap()
+        );
+    }
+
+    #[test]
+    fn option_number_warns_when_the_layout_types_a_character() {
+        let at = LayoutGlyph {
+            key_code: 0x13,
+            option: true,
+            shift: false,
+            character: '@',
+            dead: false,
+        };
+        let plain = LayoutGlyph {
+            key_code: 0x13,
+            option: false,
+            shift: false,
+            character: '2',
+            dead: false,
+        };
+        let glyphs = [plain, at];
+        assert_eq!(
+            switch_shortcut_warning(parse_chord("alt+2").unwrap(), &glyphs, &[]).as_deref(),
+            Some("Types \"@\" on this keyboard")
+        );
+        // Control+2 is the default and does not insert @.
+        assert_eq!(
+            switch_shortcut_warning(parse_chord("ctrl+2").unwrap(), &glyphs, &[]),
+            None
+        );
+        let plain_e = LayoutGlyph {
+            key_code: 0x0e,
+            option: false,
+            shift: false,
+            character: 'e',
+            dead: false,
+        };
+        let dead = LayoutGlyph {
+            key_code: 0x0e,
+            option: true,
+            shift: false,
+            character: 'e',
+            dead: true,
+        };
+        assert_eq!(
+            switch_shortcut_warning(parse_chord("alt+e").unwrap(), &[plain_e, dead], &[])
+                .as_deref(),
+            Some("Starts a character on this keyboard")
+        );
+    }
+
+    #[test]
+    fn enabled_mission_control_shortcut_is_reserved_and_a_disabled_one_is_not() {
+        let hotkeys = [
+            SymbolicHotkey {
+                id: 118,
+                enabled: true,
+                key_code: 0x12,
+                modifier_flags: 1 << 18,
+            },
+            SymbolicHotkey {
+                id: 119,
+                enabled: false,
+                key_code: 0x13,
+                modifier_flags: 1 << 18,
+            },
+            SymbolicHotkey {
+                id: 64,
+                enabled: true,
+                key_code: 0x31,
+                modifier_flags: 1 << 20,
+            },
+        ];
+        let reserved = mission_control_chords(&hotkeys);
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].name, "Switch to Desktop 1");
+        assert_eq!(reserved[0].modifiers, Modifiers::CONTROL);
+        assert_eq!(
+            switch_shortcut_warning(parse_chord("ctrl+1").unwrap(), &[], &reserved).as_deref(),
+            Some("Switch to Desktop 1 uses this shortcut, so Spaceman leaves it alone")
+        );
+        assert_eq!(
+            switch_shortcut_warning(parse_chord("ctrl+2").unwrap(), &[], &reserved),
+            None
+        );
     }
 }

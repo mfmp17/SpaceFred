@@ -183,10 +183,15 @@ modifier = "alt"                      # optional (default: "alt"); every built-i
 "alt+h" = "none"                      # unbinds the built-in Option+H
 ```
 
-`modifier` moves every built-in shortcut at once: `"ctrl+alt"` makes Switch to workspace 3
+`modifier` moves every built-in shortcut at once, except Switch to space 1–10 while it is `"alt"`
+(the default): those stay `Control+1` through `Control+0`, so Option+number can still type a
+character (`@` is Option+2 on a Portuguese layout). `"ctrl+alt"` makes Switch to space 3
 `Control+Option+3` and Move to workspace 3 `Control+Option+Shift+3`. It takes the same modifier names
 as a chord, needs `alt`, `cmd`, or `ctrl`, and can't include `shift`, which the built-in Move
-shortcuts add. Bindings are exact chords and don't follow it.
+shortcuts add. Bindings are exact chords and don't follow it. Settings › Shortcuts › Switching
+records each Switch to space shortcut on its own (any chord, or none) and can reset those ten to
+the built-in chords above. Spaceman does not change Mission Control's shortcuts; an enabled system
+shortcut on the same chord is left for macOS, and the row says so.
 
 A chord is one or more modifiers and one key, joined by `+`, in any order and case:
 
@@ -243,7 +248,7 @@ Shortcut changes apply live: saving `config.toml` registers the new chords withi
 seconds, without a restart. If the new table can't be registered, the previous shortcuts keep working
 and Settings shows `Shortcuts not applied` with the reason. Workspaces enabled by a config edit still
 get their shortcuts on the next start. The menu-bar workspace list keeps showing the built-in
-`Option`+number/letter hints next to each workspace.
+hints next to each workspace: Control+number, and Option+letter for a named workspace.
 
 Settings › Shortcuts edits the same table. Click a shortcut's keys and press a new chord: it is saved
 to `[shortcuts.bindings]` and registered at once, and the built-in chord it replaces gets `none`.

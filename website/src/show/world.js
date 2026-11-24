@@ -328,7 +328,7 @@ export class World {
     const keep = this.lastFocus?.[ws]
     if (ids.length) this.setFocus(ids.includes(keep) ? keep : ids[ids.length - 1])
     this.barGo(prev, ws)
-    if (!quiet) this.keyCast(["⌥", String(ws % 10)])
+    if (!quiet) this.keyCast(["⌃", String(ws % 10)])
   }
 
   // A macOS notification banner: in from the right edge, it sits, and goes back the way it came.

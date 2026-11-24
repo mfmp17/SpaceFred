@@ -8,8 +8,8 @@ fails after the old registrations are released, it pauses and reports `Hotkeys u
 
 | Keys | Action |
 | --- | --- |
-| `Option+1` ... `Option+9`, `Option+0` | Switch workspace 1 ... 10 |
-| Add `Shift` to a workspace key | Move the focused window there without switching |
+| `Control+1` ... `Control+9`, `Control+0` | Switch workspace 1 ... 10 |
+| `Option+Shift+1` ... `Option+Shift+0` | Move the focused window to workspace 1 ... 10 |
 | `Option+A` ... `Option+Z` | Switch to that configured named workspace |
 | Add `Shift` to a named workspace key | Move the focused window there without switching |
 | `Option+Tab` | Focus the workspace focused before this one, on any display; only a hidden one switches its display |
@@ -34,7 +34,16 @@ Every shortcut above can be rebound, unbound, or replaced in the config file's `
 see [Configuration › Shortcuts](configuration.md#shortcuts). The table lists the built-in defaults.
 Settings › Shortcuts shows each shortcut's current chord: click its keys and press a new chord to
 rebind it (`esc` cancels, `⌫` clears it), or pick a Base modifier (`⌥`, `⌃⌥`, or `⌃⌥⌘`) to move
-every built-in shortcut at once. Changes register live, with no restart.
+the built-in shortcuts at once. Switch to space 1–10 is its own section there: each space has a
+recorder, any chord or none, saved to `config.toml`, with **Reset to Defaults** putting them back
+on Control+number. While the base modifier is Option (the default), those ten stay on Control
+instead of following Option, so Option+number can still type a character. Another base modifier
+moves them with the rest. Changes register live, with no restart.
+
+Spaceman does not change macOS Mission Control shortcuts. If an enabled Mission Control
+shortcut already uses a chord (often Control+number for Switch to Desktop), Spaceman leaves that
+chord alone and the Switching row says so. A chord that types a character on the active keyboard
+layout, such as Option+2 for `@` on a Portuguese layout, is allowed and marked on that row.
 
 Named workspace shortcuts are registered only when referenced by config. If a configured letter
 overlaps a built-in shortcut, the workspace shortcut takes precedence. A `[shortcuts]` binding claims

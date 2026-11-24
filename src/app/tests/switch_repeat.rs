@@ -37,7 +37,7 @@ fn warp_calls(runtime: &WorkspaceRuntime<FakeBackend>) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Option+2 on Space 2 again walks the tiles, in tile order, wrapping at the
+/// Control+2 on Space 2 again walks the tiles, in tile order, wrapping at the
 /// end: A -> B -> C -> A, in a split layout and in Fullscreen Layout alike.
 #[test]
 fn pressing_the_active_workspace_shortcut_again_cycles_its_tiles() {

@@ -107,7 +107,12 @@ struct Registration {
 impl HotkeyPlan {
     pub(crate) fn current(enabled: &[WorkspaceId], shortcuts: &Shortcuts) -> Result<Self, String> {
         let layout = LayoutSnapshot::current().map_err(|error| error.to_string())?;
-        Self::from_layout(enabled, shortcuts, &layout)
+        Self::from_layout_with_system(
+            enabled,
+            shortcuts,
+            &layout,
+            &crate::mission_control_shortcuts(),
+        )
     }
 
     pub(crate) fn from_layout(
@@ -115,14 +120,27 @@ impl HotkeyPlan {
         shortcuts: &Shortcuts,
         layout: &LayoutSnapshot,
     ) -> Result<Self, String> {
-        let mut plan = PlanBuilder::new(layout, 18 + enabled.len() * 2 + shortcuts.bindings.len());
+        Self::from_layout_with_system(enabled, shortcuts, layout, &[])
+    }
+
+    pub(crate) fn from_layout_with_system(
+        enabled: &[WorkspaceId],
+        shortcuts: &Shortcuts,
+        layout: &LayoutSnapshot,
+        system: &[shortcuts::SystemChord],
+    ) -> Result<Self, String> {
+        let mut plan = PlanBuilder::new(
+            layout,
+            18 + enabled.len() * 2 + shortcuts.bindings.len(),
+            system,
+        );
         // `[shortcuts]` bindings claim their chords first, so a built-in shortcut on the same
         // chord quietly gives way instead of colliding.
         for binding in &shortcuts.bindings {
             plan.push_binding(binding, enabled);
         }
         if shortcuts.defaults {
-            push_defaults(&mut plan, enabled, carbon_modifiers(shortcuts.modifier));
+            push_defaults(&mut plan, enabled, shortcuts);
         }
         if shortcuts.scratchpad {
             push_scratchpad(&mut plan);
@@ -161,8 +179,11 @@ impl HotkeyPlan {
 }
 
 /// The built-in shortcuts, in priority order.
-/// `base` is `[shortcuts] modifier`'s Carbon modifiers; Move shortcuts add Shift to it.
-fn push_defaults(plan: &mut PlanBuilder<'_>, enabled: &[WorkspaceId], base: u32) {
+/// Move shortcuts add Shift to `[shortcuts] modifier`. Numbered Switch to space uses Control
+/// while that modifier is Option, and follows it otherwise.
+fn push_defaults(plan: &mut PlanBuilder<'_>, enabled: &[WorkspaceId], shortcuts: &Shortcuts) {
+    let base = carbon_modifiers(shortcuts.modifier);
+    let switch = carbon_modifiers(shortcuts::numbered_switch_modifiers(shortcuts.modifier));
     let claimed_letters = enabled
         .iter()
         .filter_map(|workspace| workspace.letter().map(|letter| letter.to_ascii_lowercase()))
@@ -173,9 +194,14 @@ fn push_defaults(plan: &mut PlanBuilder<'_>, enabled: &[WorkspaceId], base: u32)
             (_, Some(letter)) => LogicalKey::Character(letter.to_ascii_lowercase()),
             _ => unreachable!("workspace ID is always valid"),
         };
+        let switch_modifiers = if workspace.number().is_some() {
+            switch
+        } else {
+            base
+        };
         plan.push(
             key,
-            base,
+            switch_modifiers,
             WorkerAction::SwitchWorkspace(workspace),
             format!("switch workspace {workspace}"),
         );
@@ -344,6 +370,8 @@ fn carbon_modifiers(modifiers: shortcuts::Modifiers) -> u32 {
 struct PlanBuilder<'a> {
     layout: &'a LayoutSnapshot,
     registrations: Vec<Registration>,
+    /// Enabled Mission Control chords, by Carbon key code and modifiers.
+    system: BTreeMap<(u32, u32), String>,
     occupied: BTreeMap<(u32, u32), String>,
     /// Chords a `[shortcuts]` binding claimed (or unbound); built-in shortcuts skip them quietly.
     user_chords: BTreeSet<(u32, u32)>,
@@ -352,10 +380,20 @@ struct PlanBuilder<'a> {
 }
 
 impl<'a> PlanBuilder<'a> {
-    fn new(layout: &'a LayoutSnapshot, capacity: usize) -> Self {
+    fn new(layout: &'a LayoutSnapshot, capacity: usize, system: &[shortcuts::SystemChord]) -> Self {
+        let system = system
+            .iter()
+            .map(|entry| {
+                (
+                    (u32::from(entry.key_code), carbon_modifiers(entry.modifiers)),
+                    entry.name.clone(),
+                )
+            })
+            .collect();
         Self {
             layout,
             registrations: Vec::with_capacity(capacity),
+            system,
             occupied: BTreeMap::new(),
             user_chords: BTreeSet::new(),
             warnings: Vec::new(),
@@ -375,17 +413,27 @@ impl<'a> PlanBuilder<'a> {
             }
         };
         let base = carbon_modifiers(binding.chord.modifiers);
-        let Some(chord) = candidates
+        let chords = candidates
             .into_iter()
             .map(|candidate| {
                 let shift = if candidate.shift { SHIFT_KEY } else { 0 };
                 (candidate.key_code, base | shift)
             })
-            .find(|chord| !self.occupied.contains_key(chord))
+            .collect::<Vec<_>>();
+        let Some(chord) = chords
+            .iter()
+            .copied()
+            .find(|chord| !self.occupied.contains_key(chord) && !self.system.contains_key(chord))
         else {
-            self.warnings.push(format!(
-                "skipped shortcut {source}: another shortcut already uses that key"
-            ));
+            let owner = chords.iter().find_map(|chord| self.system.get(chord));
+            self.warnings.push(match owner {
+                Some(owner) => {
+                    format!("skipped shortcut {source}: {owner} uses this shortcut, left for macOS")
+                }
+                None => {
+                    format!("skipped shortcut {source}: another shortcut already uses that key")
+                }
+            });
             return;
         };
         self.user_chords.insert(chord);
@@ -429,12 +477,17 @@ impl<'a> PlanBuilder<'a> {
                 return;
             }
         };
+        let mut left_for_macos = None;
         for candidate in candidates {
             let modifiers = modifiers | if candidate.shift { SHIFT_KEY } else { 0 };
             let chord = (candidate.key_code, modifiers);
             if self.user_chords.contains(&chord) {
                 // A `[shortcuts]` binding replaced this built-in shortcut.
                 return;
+            }
+            if let Some(owner) = self.system.get(&chord) {
+                left_for_macos = Some(owner.clone());
+                continue;
             }
             if self.occupied.contains_key(&chord) {
                 continue;
@@ -446,6 +499,12 @@ impl<'a> PlanBuilder<'a> {
                 action,
                 description,
             });
+            return;
+        }
+        if let Some(owner) = left_for_macos {
+            self.warnings.push(format!(
+                "skipped {description}: {owner} uses this shortcut, left for macOS"
+            ));
             return;
         }
         self.warnings.push(format!(
@@ -1172,5 +1231,59 @@ mod tests {
             .find(|registration| registration.description == "switch workspace 1")
             .unwrap();
         assert_eq!(switch_1.modifiers, CONTROL_KEY | OPTION_KEY);
+    }
+
+    #[test]
+    fn default_switch_to_space_uses_control_and_leaves_option_number_free() {
+        let enabled = WorkspaceId::numbered().collect::<Vec<_>>();
+        let plan = HotkeyPlan::from_layout(&enabled, &Shortcuts::default(), &layout()).unwrap();
+        let switch_1 = plan
+            .registrations
+            .iter()
+            .find(|registration| registration.description == "switch workspace 1")
+            .unwrap();
+        assert_eq!(switch_1.key_code, 0x12);
+        assert_eq!(switch_1.modifiers, CONTROL_KEY);
+        assert!(!plan.registrations.iter().any(|registration| {
+            registration.description.starts_with("switch workspace")
+                && registration
+                    .description
+                    .split_whitespace()
+                    .next_back()
+                    .is_some_and(|word| word.parse::<u8>().is_ok())
+                && registration.modifiers & OPTION_KEY != 0
+        }));
+        let move_1 = plan
+            .registrations
+            .iter()
+            .find(|registration| registration.description == "move window to workspace 1")
+            .unwrap();
+        assert_eq!(move_1.modifiers, OPTION_KEY | SHIFT_KEY);
+    }
+
+    #[test]
+    fn an_enabled_mission_control_shortcut_is_not_registered() {
+        let enabled = WorkspaceId::numbered().collect::<Vec<_>>();
+        let reserved = [shortcuts::SystemChord {
+            key_code: 0x12,
+            modifiers: shortcuts::Modifiers::CONTROL,
+            name: "Switch to Desktop 1".into(),
+        }];
+        let plan = HotkeyPlan::from_layout_with_system(
+            &enabled,
+            &Shortcuts::default(),
+            &layout(),
+            &reserved,
+        )
+        .unwrap();
+        assert_eq!(action(&plan, "switch workspace 1"), None);
+        assert!(
+            plan.warnings.iter().any(|warning| {
+                warning.contains("switch workspace 1") && warning.contains("Switch to Desktop 1")
+            }),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(action(&plan, "switch workspace 2").is_some());
     }
 }
