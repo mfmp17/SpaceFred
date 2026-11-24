@@ -19,6 +19,8 @@ use std::fmt;
 
 /// The registered macOS URL scheme for Spaceman.
 pub const SCHEME: &str = "spaceman";
+/// SpaceFred's own URL scheme, so it does not claim official Spaceman's `spaceman://`.
+pub const FORK_SCHEME: &str = "spacefred";
 
 /// Maximum accepted raw link length in bytes.
 pub const MAX_LINK_LEN: usize = 2048;
@@ -125,7 +127,9 @@ impl fmt::Display for DeepLinkError {
             Self::Empty => f.write_str("deep link is empty"),
             Self::TooLong => f.write_str("deep link exceeds maximum length"),
             Self::UnsafeCharacters => f.write_str("deep link contains disallowed characters"),
-            Self::InvalidScheme => f.write_str("deep link must use the spaceman:// scheme"),
+            Self::InvalidScheme => {
+                f.write_str("deep link must use the spacefred:// or spaceman:// scheme")
+            }
             Self::MissingHost => f.write_str("deep link is missing a target host"),
             Self::InvalidHost => f.write_str("deep link host must use only [a-z0-9-]"),
             Self::InvalidSegment => f.write_str("deep link path segment must use only [a-z0-9-]"),
@@ -353,7 +357,7 @@ pub fn parse_url(raw: &str) -> Result<DeepLink, DeepLinkError> {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return Err(DeepLinkError::InvalidScheme);
     };
-    if !scheme.eq_ignore_ascii_case(SCHEME) {
+    if !scheme.eq_ignore_ascii_case(SCHEME) && !scheme.eq_ignore_ascii_case(FORK_SCHEME) {
         return Err(DeepLinkError::InvalidScheme);
     }
 

@@ -390,7 +390,7 @@ fn setup(ui: &mut Ui, waker: Waker) {
 
 fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     if !ui.fixture && !ui.frame_remembered {
-        ui.frame_remembered = rune_mac::remember_frame("Spaceman");
+        ui.frame_remembered = rune_mac::remember_frame("SpaceFred");
     }
     let mut changed = onboarding::poll(ui, tx);
     changed |= panes::workspaces::poll_displays(ui, clock);
@@ -496,7 +496,7 @@ fn on_open_url(ui: &mut Ui, link: &str, _tx: &mut Tx) {
 
 fn spec() -> AppSpec<Ui> {
     AppSpec {
-        title: "Spaceman",
+        title: "SpaceFred",
         size: WINDOW_SIZE,
         min_size: Some(WINDOW_SIZE),
         init: playground::blank_fixture,
@@ -586,7 +586,7 @@ fn main() {
     if let Err(error) = host::run() {
         drop(std::io::Write::write_all(
             &mut std::io::stderr(),
-            format!("Spaceman failed: {error}\n").as_bytes(),
+            format!("SpaceFred failed: {error}\n").as_bytes(),
         ));
         std::process::exit(1);
     }

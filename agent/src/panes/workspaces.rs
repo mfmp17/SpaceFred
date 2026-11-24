@@ -227,7 +227,7 @@ fn monitor_row(p: Paint, choices: &[Choice], workspace: WorkspaceId, effective: 
         .build(p.k)
         .key("monitor");
     let title = match workspace.number() {
-        Some(10) => "Workspace 10 (⌥0)".to_owned(),
+        Some(10) => "Workspace 10 (⌃0)".to_owned(),
         Some(_) => format!("Workspace {workspace}"),
         None => format!("Workspace {workspace} (named)"),
     };

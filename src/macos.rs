@@ -7,6 +7,7 @@ mod events;
 mod keys;
 mod presenter;
 mod swipes;
+mod symbolic_hotkeys;
 #[cfg(test)]
 mod tests;
 mod window_attributes;
@@ -45,6 +46,7 @@ pub use presenter::{
     WriteOutcome,
 };
 pub use swipes::SwipeMonitor;
+pub(crate) use symbolic_hotkeys::mission_control_shortcuts;
 
 use apply::{cache_managed_window, evict_managed_app, prune_managed_app};
 use ax::{
@@ -93,9 +95,9 @@ pub fn snapshot(cycle: u64) -> Result<(NativeObservation, Settings), SnapshotErr
 /// Spaceman's own windows (Settings, Onboarding, HUD) are never managed, even when `spaceman` CLI
 /// observes `Spaceman.app` from a second process.
 pub(super) fn is_own_application(application: &NSRunningApplication) -> bool {
-    application
-        .bundleIdentifier()
-        .is_some_and(|id| &*id == ns_string!("anomaly.spaceman"))
+    application.bundleIdentifier().is_some_and(|id| {
+        &*id == ns_string!("one.frederico.spacefred") || &*id == ns_string!("anomaly.spaceman")
+    })
 }
 
 #[must_use]

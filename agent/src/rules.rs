@@ -12,7 +12,7 @@ use toml_edit::{
     Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value,
 };
 
-const EMPTY: &str = "# Spaceman configuration.\nversion = 1\n";
+const EMPTY: &str = "# SpaceFred configuration.\nversion = 1\n";
 
 /// Where a rule sends an app's windows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

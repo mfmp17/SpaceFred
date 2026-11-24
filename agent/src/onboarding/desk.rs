@@ -495,24 +495,30 @@ fn marker(p: Paint, lesson: Lesson, done: bool, current: bool) -> El {
         )
 }
 
-/// ⌥, then each key it plays. A press remounts the pressed cap, and the ⌥ beside it, under a
+/// The lesson's modifier, then each key it plays. A press remounts the pressed caps under a
 /// new key so their dip and glow replay; with no transition, nothing fades between the two.
 fn chords(p: Paint, s: &Sandbox, lesson: Lesson) -> El {
     let keys = s.keys(lesson);
     let pressed = s.last.filter(|key| keys.contains(key));
-    let mut chords =
-        row()
-            .key("chords")
-            .gap(4.0)
-            .center_y()
-            .child(cap(p, s, "option", "⌥", pressed.is_some()));
+    let (modifier_id, modifier, name) = if lesson == Lesson::Switch {
+        ("control", "⌃", "Control")
+    } else {
+        ("option", "⌥", "Option")
+    };
+    let mut chords = row().key("chords").gap(4.0).center_y().child(cap(
+        p,
+        s,
+        modifier_id,
+        modifier,
+        pressed.is_some(),
+    ));
     for key in keys {
         let lit = pressed == Some(key);
         let id = format!("key-{}", key.legend());
         chords = chords.child(
             cap(p, s, &id, key.legend(), lit)
                 .cursor(Cursor::Pointer)
-                .label(format!("Option {}", key.legend()))
+                .label(format!("{name} {}", key.legend()))
                 .on_press(move |ui: &mut Ui| {
                     super::press(ui, key);
                 }),

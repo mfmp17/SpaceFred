@@ -7,14 +7,17 @@ instantly, and send windows or whole apps to a workspace, without using macOS Sp
 
 ```ts
 Switch workspace                                           // ws.switch
-├── Option+1..0 / Option+A..Z / spaceman ctl switch <ws> / a workspace in the menu bar menu
+├── Control+1..0 (Option+A..Z for named) / spaceman ctl switch <ws> / a workspace in the menu bar menu
+│   └── Each Switch to space shortcut is editable in Settings › Shortcuts › Switching; Control+number
+│       is the default so Option+number can type a character. An enabled Mission Control shortcut
+│       on the same chord is left for macOS.
 ├── Incoming parked windows revealed -> laid out -> outgoing windows parked off-screen
 │   └── Reveal not confirmed by the window server in time -> switch rolled back, old workspace stays
 ├── Focus -> last-focused tile of the incoming workspace, keyboard focus included
 │   (that window raised and made main, then its app brought forward with `AXFrontmost`), unless
 │   one of its windows already has focus (e.g. focus follow): that window keeps it
 └── Already active -> stays and re-focuses its remembered tile (keeps current focus if it is there)
-    ├── Pressed again (`Option+<ws>` / `ctl switch`) while focus is on that workspace -> the
+    ├── Pressed again (`Control+<number>` / `Option+<letter>` / `ctl switch`) while focus is on that workspace -> the
     │   next tile takes focus, wrapping at the end of the tile order; the way to walk the shared
     │   frame in Fullscreen Layout
     ├── Focus on another display's workspace -> only brings focus back; the press after that cycles
@@ -144,7 +147,7 @@ frame persisted to `parked-windows.json` first.
 
 ```ts
 Keyboard (while tiling is enabled)
-├── Option+<1..0 | A..Z>        -> switch; pressed again on the active workspace -> next tile
+├── Control+1..0 / Option+A..Z  -> switch; pressed again on the active workspace -> next tile
 │                                  (wraps, and is how Fullscreen Layout tiles get focus)
 ├── Option+` / Option+Shift+`   -> next / previous window on the workspace, floats included
 ├── Option+Shift+<1..0 | A..Z>  -> move focused window
@@ -156,7 +159,7 @@ CLI: spaceman ctl switch | back-and-forth | move-workspace | move | move-app
 Config: ~/Library/Application Support/Spaceman/config.toml -> [[rules]], [[workspaces]],
         [settings] workspace_order (edits apply when the file changes; new named-workspace shortcuts register on the next app start)
 Menu bar: shows the active workspace glyphs; its menu lists each display's visible workspace (checked)
-          and occupied ones with their apps' icons and Option shortcut -> choose one to switch
+          and occupied ones with their apps' icons and shortcut -> choose one to switch
 Mouse: drop a tile on another display -> moves it to that display's active workspace (see tiling.md)
 ```
 

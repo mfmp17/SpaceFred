@@ -547,7 +547,7 @@ const fn plural(count: usize) -> &'static str {
 fn human_restore_reason(reason: &str) -> String {
     match reason {
         "pause" => "Paused automatic tiling".into(),
-        "restore all" => "Paused or quitting Spaceman".into(),
+        "restore all" => "Paused or quitting SpaceFred".into(),
         "startup without saved workspaces" => "Startup recovery without saved workspaces".into(),
         other => other.into(),
     }

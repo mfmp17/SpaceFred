@@ -87,7 +87,7 @@ static NSString *spacemanAppName(NSURL *bundleURL) {
     if ([name.pathExtension.lowercaseString isEqualToString:@"app"]) {
         name = name.stringByDeletingPathExtension;
     }
-    return name.length > 0 ? name : @"Spaceman";
+    return name.length > 0 ? name : @"SpaceFred";
 }
 
 /// macOS 27 renamed the Accessibility list to Device Control and Data Access.

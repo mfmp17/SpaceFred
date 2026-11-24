@@ -135,10 +135,10 @@ the setup skill and the website. Published version names are never reused.
 ```sh
 SPACEMAN_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
   ./scripts/build-app.sh
-codesign --verify --deep --strict target/Spaceman.app
+codesign --verify --deep --strict target/SpaceFred.app
 ```
 
-Do not publish `target/Spaceman.app` as a release based only on those commands.
+Do not publish `target/SpaceFred.app` as a release based only on those commands.
 
 ## Remaining Qualification Gaps
 

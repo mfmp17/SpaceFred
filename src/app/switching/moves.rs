@@ -122,7 +122,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             })?;
             self.workspaces
                 .workspace_of_any(&window)
-                .ok_or("Window is not managed by Spaceman")?
+                .ok_or("Window is not managed by SpaceFred")?
         };
         if source == target {
             return Ok(MoveWindowOutcome::Moved(self.status(0, &outputs)));

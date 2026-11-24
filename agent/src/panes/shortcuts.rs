@@ -1,6 +1,7 @@
 //! Shortcuts pane: every global shortcut with its chord from `[shortcuts]`. Pressing a
-//! shortcut's keys records a new chord (`recorder`), the base modifier moves every built-in
-//! shortcut at once, and each change is saved to `config.toml` and registered live.
+//! shortcut's keys records a new chord (`recorder`). The base modifier moves the built-in
+//! shortcuts; Switch to space 1–10 stays on Control while that base is Option, and each of
+//! those ten has its own recorder. Each change is saved to `config.toml` and registered live.
 
 mod catalog;
 mod keycap;
@@ -11,7 +12,7 @@ use rune::{El, Shadow, col, row, text};
 use rune_kit::SegmentedControl;
 use spaceman::{
     WorkspaceId,
-    shortcuts::{Chord, Modifiers, Shortcuts},
+    shortcuts::{self, Chord, Modifiers, Shortcuts},
 };
 
 pub use recorder::Capture;
@@ -57,6 +58,18 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
             ))
             .child(
                 col()
+                    .key("switching")
+                    .gap(8.0)
+                    .child(controls::heading(
+                        p,
+                        "header",
+                        "Switching",
+                        Some("Click a shortcut to record · esc cancels · ⌫ clears"),
+                    ))
+                    .child(controls::card(p, "card", switching_rows(ui, p, &shortcuts))),
+            )
+            .child(
+                col()
                     .key("workspaces")
                     .gap(8.0)
                     .child(controls::heading(
@@ -98,7 +111,11 @@ fn modifier_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
             p,
             "base-modifier",
             "Base modifier",
-            Some(("Move shortcuts add ⇧.".into(), p.muted())),
+            Some((
+                "Move shortcuts add ⇧. On the ⌥ base, Switch to space uses ⌃1–0 instead of ⌥."
+                    .into(),
+                p.muted(),
+            )),
             picker,
         ));
     } else {
@@ -141,6 +158,59 @@ fn reset(ui: &mut Ui) {
     recorder::cancel(ui);
     ui.shortcut_capture = Capture::Idle;
     recorder::edit_shortcuts(ui, crate::rules::Doc::reset_shortcuts);
+}
+
+fn reset_switching(ui: &mut Ui) {
+    recorder::cancel(ui);
+    ui.shortcut_capture = Capture::Idle;
+    recorder::edit_shortcuts(ui, crate::rules::Doc::reset_switch_shortcuts);
+}
+
+/// One recorder per Switch to space 1–10, plus a way back to Control+number (or the base
+/// modifier, when that base is not Option).
+fn switching_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
+    let named = recorder::enabled_named_workspaces(ui);
+    let needs_layout = catalog::SWITCH_SPACES.iter().any(|action| {
+        action.chords(shortcuts, &named).iter().any(|chord| {
+            chord.modifiers.option && !chord.modifiers.control && !chord.modifiers.command
+        })
+    });
+    let glyphs = if needs_layout {
+        spaceman::current_layout_glyphs()
+    } else {
+        Vec::new()
+    };
+    let system = spaceman::mission_control_shortcuts();
+    let mut rows = catalog::SWITCH_SPACES
+        .iter()
+        .map(|action| {
+            let warning = action
+                .chords(shortcuts, &named)
+                .iter()
+                .find_map(|chord| shortcuts::switch_shortcut_warning(*chord, &glyphs, &system));
+            controls::setting_row(
+                p,
+                &format!("{}-row", action.id),
+                action.title,
+                warning.map(|text| (text, p.warning())),
+                shortcut_button(ui, p, shortcuts, &named, action),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.push(controls::setting_row(
+        p,
+        "reset-switching",
+        "Switch to space shortcuts",
+        None,
+        controls::button(
+            p,
+            "reset-switching-button",
+            "Reset to Defaults",
+            ButtonKind::Secondary,
+            |ui: &mut Ui, _| reset_switching(ui),
+        ),
+    ));
+    rows
 }
 
 /// The workspace shortcuts, reflecting `[shortcuts.bindings]`, `defaults`, and `modifier`.

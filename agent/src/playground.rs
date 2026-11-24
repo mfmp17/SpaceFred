@@ -26,7 +26,7 @@ pub fn attach(app: App<Ui>) -> App<Ui> {
         .enabled(true)
         .bar(false)
         .scenes(|name| name.contains('/'))
-        .sizes(&[("Spaceman window", WINDOW_SIZE)]);
+        .sizes(&[("SpaceFred window", WINDOW_SIZE)]);
     app.playground(hud::triggers(playground))
 }
 

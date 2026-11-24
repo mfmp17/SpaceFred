@@ -1,5 +1,6 @@
 //! Workspace rows in the status menu: a section per display, a check on each display's visible
-//! workspace, the icons of the apps on it, and its Option shortcut. Choosing a row switches to it.
+//! workspace, the icons of the apps on it, and its shortcut (Control+number, or Option+letter).
+//! Choosing a row switches to it.
 
 use objc2::{AnyThread, MainThreadMarker, rc::Retained, runtime::AnyObject, sel};
 use objc2_app_kit::{
@@ -72,7 +73,13 @@ fn item(
         &key_equivalent(workspace.workspace),
         marker,
     );
-    item.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
+    // Numbered spaces use Control; named workspaces stay on Option.
+    let modifiers = if workspace.workspace.number().is_some() {
+        NSEventModifierFlags::Control
+    } else {
+        NSEventModifierFlags::Option
+    };
+    item.setKeyEquivalentModifierMask(modifiers);
     item.setTag(isize::try_from(workspace.workspace.index()).unwrap_or_default());
     if workspace.current {
         item.setState(NSControlStateValueOn);
@@ -100,7 +107,8 @@ fn item(
     item
 }
 
-/// The key that, with Option, switches to `workspace` (the same as its global shortcut).
+/// The key that switches to `workspace`: Control plus this key for a number, Option plus
+/// this key for a named workspace.
 pub(crate) fn key_equivalent(workspace: WorkspaceId) -> String {
     match (workspace.number(), workspace.letter()) {
         (Some(number), _) => (number % 10).to_string(),

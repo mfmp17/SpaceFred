@@ -49,32 +49,34 @@ fn describe(status: &UiUpdateStatus, install_error: Option<&str>) -> String {
     match status {
         UiUpdateStatus::Idle => "Checks for updates automatically.".into(),
         UiUpdateStatus::Checking => "Checking for updates…".into(),
-        UiUpdateStatus::UpToDate => "Spaceman is up to date.".into(),
+        UiUpdateStatus::UpToDate => "SpaceFred is up to date.".into(),
         UiUpdateStatus::Downloading => "Downloading an update…".into(),
         UiUpdateStatus::Ready { version } => {
-            format!("Spaceman {version} is ready. Windows are restored before it restarts.")
+            format!("SpaceFred {version} is ready. Windows are restored before it restarts.")
         }
         UiUpdateStatus::Switch { channel, version } => format!(
-            "Switching to {} installs Spaceman {version}.",
+            "Switching to {} installs SpaceFred {version}.",
             channel_label(channel)
         ),
         UiUpdateStatus::Download { version } => format!(
-            "Spaceman {version} is out. This copy can't replace itself, so download it, \
-             or move Spaceman to Applications to update in place."
+            "SpaceFred {version} is out. This copy can't replace itself, so download it, \
+             or move SpaceFred to Applications to update in place."
         ),
         UiUpdateStatus::Installing => "Installing and restarting…".into(),
         UiUpdateStatus::Failed => install_error
             .map(str::to_owned)
             .unwrap_or_else(|| "Couldn't check for updates. It tries again soon.".into()),
-        UiUpdateStatus::SourceBuild => "Built from source; your checkout updates it.".into(),
-        UiUpdateStatus::Unavailable => "Updates are off for this copy of Spaceman.".into(),
+        UiUpdateStatus::SourceBuild => {
+            "Built from source. SpaceFred does not install Anomaly's Spaceman releases.".into()
+        }
+        UiUpdateStatus::Unavailable => "Updates are off for this copy of SpaceFred.".into(),
     }
 }
 
 fn sidebar_label(update: &UiUpdateStatus, install_error: Option<&str>) -> &'static str {
     match update {
         UiUpdateStatus::Checking => "Checking for updates…",
-        UiUpdateStatus::UpToDate => "Spaceman is up to date",
+        UiUpdateStatus::UpToDate => "SpaceFred is up to date",
         UiUpdateStatus::Downloading => "Downloading update…",
         UiUpdateStatus::Switch { .. } => "Channel switch ready",
         UiUpdateStatus::Download { .. } => "Update available",
@@ -183,7 +185,7 @@ pub fn section(ui: &Ui, p: Paint) -> El {
     let version = controls::setting_row(
         p,
         "version",
-        &format!("Spaceman {}", build_version()),
+        &format!("SpaceFred {}", build_version()),
         Some((describe(&update, install_failure(ui)), color)),
         control,
     );

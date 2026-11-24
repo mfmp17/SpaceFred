@@ -8,7 +8,8 @@ The source build requires:
 
 - Xcode command-line tools with `codesign` and `security`;
 - Rust 1.100.0 from `rust-toolchain.toml`;
-- a `Developer ID Application` signing identity.
+- a `Developer ID Application` signing identity, or an `Apple Development` identity for a local
+  build. Releases still require Developer ID (`scripts/validate-release.sh`).
 
 The documented numbered-workspace shortcuts assume an ANSI number row. Other keyboard layouts may
 not produce every required physical shortcut.

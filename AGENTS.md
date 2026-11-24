@@ -24,8 +24,9 @@ This file is the current engineering contract. README and `docs/` describe curre
   with that updater, `scripts/release-app.sh` on the release Mac (which holds the Sparkle key and
   `wrangler` auth) still puts each stable zip into the R2 appcast that older (Sparkle) builds read.
   See [docs/releasing.md](docs/releasing.md).
-- Bundle ID is `anomaly.spaceman` (was `com.kitlangton.spaceman` through 0.3.0). State and config
-  paths (`~/Library/Application Support/Spaceman`, `~/.config/spaceman`) don't depend on it.
+- Bundle ID is `one.frederico.spacefred` (upstream Spaceman is `anomaly.spaceman`). State and config
+  paths stay `~/Library/Application Support/Spaceman` and `~/.config/spaceman` so an existing
+  Spaceman config carries over. Source builds do not install Anomaly releases.
 - Code shape: keep Rust files under 800 non-test lines (1,500 hard cap, 1,000 for test files;
   `scripts/file-size.sh`) and move prefix families (`x.rs` + 2+ `x_*.rs`, or 3+ `x_*.rs`) into `x/`
   (`scripts/folder-shape.sh`).
@@ -182,6 +183,7 @@ CLI command, rule semantic, restart/recovery outcome, or covering test changes.
 - Build once from a clean reviewed revision, notarize and distribute that exact artifact, and verify
   signature, ticket, architecture, plist, archive contents, and checksum after packaging.
 - Keep the real app icon and add a concise demo before calling the preview broadly release-ready.
-- Never tell artifact users they need a Developer ID identity; that is a source-build requirement.
+- Never tell artifact users they need a Developer ID identity. A local source build accepts
+  Developer ID Application or Apple Development (`scripts/build-app.sh`); releases require Developer ID.
 - Never ship instructions to disable SIP, erase recovery metadata before restoration, or imply Mac App
   Store support.

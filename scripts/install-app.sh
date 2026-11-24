@@ -2,7 +2,7 @@
 set -eu
 
 # Usage: scripts/install-app.sh [--bundle PATH] [--wait-idle SECS]
-#   --bundle     install an already built Spaceman.app instead of building one
+#   --bundle     install an already built SpaceFred.app instead of building one
 #   --wait-idle  hold the restart until the keyboard and mouse have been idle for SECS seconds,
 #                because restarting restores and re-tiles every window
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -54,9 +54,9 @@ paths_overlap() {
 
 # build-app.sh prints the built bundle path on its last line.
 [ -n "$source_bundle" ] || source_bundle=$("$root/scripts/build-app.sh" | tail -n 1)
-[ -d "$source_bundle/Contents" ] || { echo "no Spaceman.app at $source_bundle" >&2; exit 1; }
+[ -d "$source_bundle/Contents" ] || { echo "no SpaceFred.app at $source_bundle" >&2; exit 1; }
 install_root="/Applications"
-installed_bundle="$install_root/Spaceman.app"
+installed_bundle="$install_root/SpaceFred.app"
 legacy_bundle="$install_root/Pane.app"
 cli_root="$HOME/.local/bin"
 was_automatic=false
@@ -94,7 +94,7 @@ for _ in $(seq 1 75); do
   sleep 0.2
 done
 if pgrep -x spaceman-agent >/dev/null 2>&1; then
-  echo "Spaceman did not finish restoring windows; installation aborted" >&2
+  echo "SpaceFred did not finish restoring windows; installation aborted" >&2
   exit 1
 fi
 rm -rf "$installed_bundle" "$install_root/Pane.app"

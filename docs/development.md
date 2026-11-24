@@ -11,7 +11,7 @@ scripts/dev          # build and install now, then again on every save
 scripts/dev --once   # build and install once
 ```
 
-Each install restores every window, swaps `/Applications/Spaceman.app`, and resumes tiling, so
+Each install restores every window, swaps `/Applications/SpaceFred.app`, and resumes tiling, so
 workspaces and layouts come back. `scripts/install-app.sh --bundle PATH --wait-idle SECS` installs a
 built bundle once the keyboard and mouse have been idle; the updater
 (`scripts/spaceman-updater`, set up with `scripts/install-updater`) uses it to keep the installed
@@ -61,7 +61,7 @@ AeroSpace to be enabled initially so they can capture a baseline, then they disa
 ./scripts/live-workspaces.sh
 ```
 
-`live-workspaces.sh` requires a current signed bundle at `target/Spaceman.app`; build it with
+`live-workspaces.sh` requires a current signed bundle at `target/SpaceFred.app`; build it with
 `./scripts/build-app.sh` first. It isolates control and recovery files with
 `SPACEMAN_APPLICATION_SUPPORT`. `live-ghostty-tabs.sh` instead uses `cargo run` to start a scoped,
 non-persistent `watch-window` process. Both restore their baseline but still exercise live
@@ -100,9 +100,9 @@ while another Spaceman, AeroSpace, yabai or Amethyst runs. Interrupting it quits
 restores parked windows) and closes the test windows.
 
 The target Mac needs a logged-in desktop and Accessibility granted to the Spaceman.app under test.
-The grant follows the Developer ID signature, so granting it once (System Settings › Privacy &
-Security › Accessibility) covers later builds. Windows appear on that Mac's main display. A
-disposable macOS VM is the best place to run it; `--host` copies both apps there over ssh and
+The grant follows the signing identity. A Developer ID grant covers later Developer ID builds;
+an Apple Development build needs its own grant and does not carry over. Windows appear on that
+Mac's main display. A disposable macOS VM is the best place to run it; `--host` copies both apps there over ssh and
 copies the receipt back, and `GAUNTLET_SSH` replaces the ssh command (a key, a jump host).
 The harness itself is `scripts/gauntlet/*.swift`, compiled by `gauntlet.sh` into
 `target/gauntlet/SpacemanGauntlet.app` with `swiftc`; the target Mac needs no developer tools.
@@ -115,7 +115,7 @@ and whitespace:
 
 ```sh
 rg -n '\[[^]]+\]\([^)]+' --glob '*.md'
-rg -n 'Pause Tiling|Resume Tiling|Settings\.\.\.|Quit Spaceman' --glob '*.md'
+rg -n 'Pause Tiling|Resume Tiling|Settings\.\.\.|Quit SpaceFred' --glob '*.md'
 rg -n 'Automatic Tiling|Retile Now|starts paused|paused startup' --glob '*.md' --glob '!docs/development.md'
 git diff --check
 ```

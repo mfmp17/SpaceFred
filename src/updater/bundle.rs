@@ -31,7 +31,27 @@ pub(super) struct Staged {
     pub(super) installed: PathBuf,
 }
 
-/// The running `Spaceman.app`, when this executable is inside one.
+/// Whether `bundle` is the Anomaly release this updater is allowed to replace.
+/// Any other identifier, including SpaceFred, never checks for those releases.
+pub(super) fn is_anomaly_release(bundle: &Path) -> bool {
+    bundle_identifier(bundle).as_deref() == Some(BUNDLE_ID)
+}
+
+fn bundle_identifier(bundle: &Path) -> Option<String> {
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleIdentifier"])
+        .arg(bundle.join("Contents/Info.plist"))
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())?
+        .map(|identifier| identifier.trim().to_owned())
+}
+
+/// The running app bundle, when this executable is inside one.
 pub(super) fn installed_bundle() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?.canonicalize().ok()?;
     let bundle = executable.parent()?.parent()?.parent()?;

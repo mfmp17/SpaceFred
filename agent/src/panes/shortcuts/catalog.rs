@@ -24,14 +24,19 @@ impl Action {
     }
 
     /// The built-in chord under `modifier`, if this shortcut has one.
+    ///
+    /// Switch to space 1–10 uses Control while `modifier` is Option, and `modifier` otherwise.
     pub fn default_chord(&self, modifier: Modifiers) -> Option<Chord> {
-        self.default.map(|(shift, key)| Chord {
-            modifiers: if shift {
-                modifier.with_shift()
+        self.default.map(|(shift, key)| {
+            let base = if is_numbered_switch(self.command, key) {
+                shortcuts::numbered_switch_modifiers(modifier)
             } else {
                 modifier
-            },
-            key,
+            };
+            Chord {
+                modifiers: if shift { base.with_shift() } else { base },
+                key,
+            }
         })
     }
 
@@ -86,6 +91,65 @@ const SPACE: Key = Key::Code(0x31);
 const fn letter(shift: bool, character: char) -> Option<(bool, Key)> {
     Some((shift, Key::Character(character)))
 }
+
+fn is_numbered_switch(command: &str, key: Key) -> bool {
+    matches!(key, Key::Number(1..=10)) && command.starts_with("switch ")
+}
+
+const fn switch_space(number: u8) -> Action {
+    action(
+        match number {
+            1 => "switch-space-1",
+            2 => "switch-space-2",
+            3 => "switch-space-3",
+            4 => "switch-space-4",
+            5 => "switch-space-5",
+            6 => "switch-space-6",
+            7 => "switch-space-7",
+            8 => "switch-space-8",
+            9 => "switch-space-9",
+            _ => "switch-space-10",
+        },
+        match number {
+            1 => "Switch to space 1",
+            2 => "Switch to space 2",
+            3 => "Switch to space 3",
+            4 => "Switch to space 4",
+            5 => "Switch to space 5",
+            6 => "Switch to space 6",
+            7 => "Switch to space 7",
+            8 => "Switch to space 8",
+            9 => "Switch to space 9",
+            _ => "Switch to space 10",
+        },
+        match number {
+            1 => "switch 1",
+            2 => "switch 2",
+            3 => "switch 3",
+            4 => "switch 4",
+            5 => "switch 5",
+            6 => "switch 6",
+            7 => "switch 7",
+            8 => "switch 8",
+            9 => "switch 9",
+            _ => "switch 10",
+        },
+        Some((false, Key::Number(number))),
+    )
+}
+
+pub const SWITCH_SPACES: [Action; 10] = [
+    switch_space(1),
+    switch_space(2),
+    switch_space(3),
+    switch_space(4),
+    switch_space(5),
+    switch_space(6),
+    switch_space(7),
+    switch_space(8),
+    switch_space(9),
+    switch_space(10),
+];
 
 pub const WORKSPACE_ACTIONS: &[Action] = &[
     action(
@@ -163,7 +227,10 @@ pub const LAYOUT_ACTIONS: &[Action] = &[
 ];
 
 pub fn all() -> impl Iterator<Item = &'static Action> {
-    WORKSPACE_ACTIONS.iter().chain(LAYOUT_ACTIONS)
+    SWITCH_SPACES
+        .iter()
+        .chain(WORKSPACE_ACTIONS)
+        .chain(LAYOUT_ACTIONS)
 }
 
 pub fn find(id: &str) -> Option<&'static Action> {
@@ -252,13 +319,14 @@ pub fn occupant(
     let Key::Number(number) = chord.key else {
         return None;
     };
-    if chord.modifiers == shortcuts.modifier {
-        Some(Occupant::Other(format!("Switch to workspace {number}")))
-    } else if chord.modifiers == shortcuts.modifier.with_shift() {
+    // Switch to space is a catalog action (Control+number by default). Only Move still
+    // falls through to the base modifier plus Shift.
+    if chord.modifiers == shortcuts.modifier.with_shift() {
         Some(Occupant::Other(format!(
             "Move window to workspace {number}"
         )))
     } else {
+        let _ = number;
         None
     }
 }
@@ -364,8 +432,13 @@ mod tests {
         assert_eq!(occupant(&bound, &[], chord("alt+l")), None);
         assert_eq!(
             occupant(&bound, &[], chord("ctrl+alt+v")).unwrap().title(),
-            "Switch workspace 4"
+            "Switch to space 4"
         );
+        assert_eq!(
+            occupant(&defaults, &[], chord("ctrl+2")).unwrap().title(),
+            "Switch to space 2"
+        );
+        assert_eq!(occupant(&defaults, &[], chord("alt+2")), None);
         let scratchpad = Shortcuts {
             scratchpad: true,
             ..Shortcuts::default()

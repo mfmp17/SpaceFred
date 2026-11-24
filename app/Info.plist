@@ -5,11 +5,11 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Spaceman</string>
+    <string>SpaceFred</string>
     <key>CFBundleExecutable</key>
     <string>spaceman-agent</string>
     <key>CFBundleIdentifier</key>
-    <string>anomaly.spaceman</string>
+    <string>one.frederico.spacefred</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>
@@ -17,17 +17,17 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Spaceman</string>
+    <string>SpaceFred</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>anomaly.spaceman.url</string>
+            <string>one.frederico.spacefred.url</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>spaceman</string>
+                <string>spacefred</string>
             </array>
         </dict>
     </array>
@@ -40,9 +40,9 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSAccessibilityUsageDescription</key>
-    <string>Spaceman uses Accessibility access to observe and tile application windows.</string>
+    <string>SpaceFred uses Accessibility access to observe and tile application windows.</string>
     <key>SUEnableAutomaticChecks</key>
-    <true/>
+    <false/>
     <key>SUAutomaticallyUpdate</key>
     <false/>
     <key>SUAllowsAutomaticUpdates</key>

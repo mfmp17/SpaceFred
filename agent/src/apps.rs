@@ -61,7 +61,9 @@ pub fn running() -> Vec<Running> {
                     name: app.localizedName()?.to_string(),
                 })
             })
-            .filter(|app| app.bundle_id != "anomaly.spaceman")
+            .filter(|app| {
+                app.bundle_id != "one.frederico.spacefred" && app.bundle_id != "anomaly.spaceman"
+            })
             .collect();
         running.sort_by_key(|app| app.name.to_lowercase());
         running.dedup_by(|a, b| a.bundle_id == b.bundle_id);

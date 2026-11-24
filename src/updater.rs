@@ -191,6 +191,13 @@ impl Updater {
         let installed = bundle::installed_bundle();
         let disabled = if option_env!("SPACEMAN_RELEASE_BUILD") != Some("1") {
             Some(UiUpdateStatus::SourceBuild)
+        } else if installed
+            .as_ref()
+            .is_some_and(|bundle| !bundle::is_anomaly_release(bundle))
+        {
+            // A fork such as SpaceFred must not download Anomaly's Spaceman.app
+            // and swap it over itself, even if a release stamp was set.
+            Some(UiUpdateStatus::Unavailable)
         } else if std::env::var_os("SPACEMAN_DISABLE_UPDATES").is_some_and(|value| value == "1")
             || installed.is_none()
         {

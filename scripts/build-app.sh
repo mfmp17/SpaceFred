@@ -1,6 +1,9 @@
 #!/bin/sh
-# Builds target/Spaceman.app and signs it with a Developer ID identity
-# (SPACEMAN_CODESIGN_IDENTITY, or the first one in the keychain).
+# Builds target/SpaceFred.app and signs it for a local install.
+# SPACEMAN_CODESIGN_IDENTITY, or the first matching identity in the keychain:
+# Developer ID Application is preferred, then Apple Development. Releases are
+# not this path; they are signed with Developer ID after an unsigned build
+# (scripts/validate-release.sh).
 # SPACEMAN_RELEASE_UNSIGNED=1 skips signing: the Release workflow's build job
 # makes the bundle that way and its sign job signs it (.github/release/).
 # With it, SPACEMAN_RELEASE_CHANNEL (stable or dev) and SPACEMAN_RELEASE_VERSION
@@ -9,7 +12,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-bundle="$root/target/Spaceman.app"
+bundle="$root/target/SpaceFred.app"
 icon_output="$root/target/AppIcon.assets"
 icon_info="$root/target/AppIcon-info.plist"
 identity=${SPACEMAN_CODESIGN_IDENTITY:-}
@@ -37,19 +40,27 @@ case "$unsigned" in
     ;;
 esac
 if [ -z "$unsigned" ]; then
+  # Prefer Developer ID when the keychain has one, so a machine that can ship
+  # still signs local builds that way. Apple Development is enough to run the
+  # app on this Mac; it is not a release signature.
   if [ -z "$identity" ]; then
     identity=$(security find-identity -v -p codesigning \
       | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
       | head -1)
   fi
   if [ -z "$identity" ]; then
-    echo "No Developer ID Application identity found; set SPACEMAN_CODESIGN_IDENTITY." >&2
+    identity=$(security find-identity -v -p codesigning \
+      | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' \
+      | head -1)
+  fi
+  if [ -z "$identity" ]; then
+    echo "No Developer ID Application or Apple Development identity found; set SPACEMAN_CODESIGN_IDENTITY." >&2
     exit 1
   fi
   case "$identity" in
-    "Developer ID Application:"*) ;;
+    "Developer ID Application:"*|"Apple Development:"*) ;;
     *)
-      echo "SPACEMAN_CODESIGN_IDENTITY must be a Developer ID Application identity, not '$identity'." >&2
+      echo "SPACEMAN_CODESIGN_IDENTITY must be a Developer ID Application or Apple Development identity, not '$identity'." >&2
       exit 1
       ;;
   esac
@@ -128,7 +139,7 @@ codesign --force --timestamp --options runtime --sign "$identity" \
 codesign --force --timestamp --options runtime --sign "$identity" \
   "$bundle/Contents/MacOS/spaceman"
 codesign --force --timestamp --options runtime --sign "$identity" \
-  --identifier anomaly.spaceman \
+  --identifier one.frederico.spacefred \
   "$bundle"
 codesign --verify --deep --strict "$bundle"
 

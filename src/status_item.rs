@@ -126,7 +126,7 @@ thread_local! {
 pub fn install(sender: Sender<Action>) -> Result<(), String> {
     let marker = MainThreadMarker::new().ok_or("status item requires the main thread")?;
     let target = Target::new(sender, marker);
-    let menu = NSMenu::initWithTitle(NSMenu::alloc(marker), &NSString::from_str("Spaceman"));
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(marker), &NSString::from_str("SpaceFred"));
     let status = plain_item("Starting...", marker);
     status.setEnabled(false);
     status.setHidden(true);
@@ -170,7 +170,7 @@ pub fn install(sender: Sender<Action>) -> Result<(), String> {
     menu.addItem(&update);
     menu.addItem(&NSMenuItem::separatorItem(marker));
     menu.addItem(&action_item(
-        "Quit Spaceman",
+        "Quit SpaceFred",
         &target,
         sel!(quit:),
         "q",
@@ -213,7 +213,7 @@ pub fn set_update(ready: Option<&str>) {
         if let Some(controller) = controller.borrow().as_ref() {
             let (title, action) = match ready {
                 Some(version) => (
-                    format!("Install Spaceman {version} and Restart"),
+                    format!("Install SpaceFred {version} and Restart"),
                     sel!(installUpdate:),
                 ),
                 None => (CHECK_FOR_UPDATES.to_owned(), sel!(checkForUpdates:)),
