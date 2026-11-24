@@ -13,7 +13,7 @@ use crate::shortcuts::{self, SymbolicHotkey, SystemChord};
 
 use super::ax::cf_array_items;
 
-pub(super) fn mission_control_shortcuts() -> Vec<SystemChord> {
+pub(crate) fn mission_control_shortcuts() -> Vec<SystemChord> {
     use std::sync::Mutex;
 
     static CACHE: Mutex<Option<(Instant, Vec<SystemChord>)>> = Mutex::new(None);

@@ -100,9 +100,9 @@ while another Spaceman, AeroSpace, yabai or Amethyst runs. Interrupting it quits
 restores parked windows) and closes the test windows.
 
 The target Mac needs a logged-in desktop and Accessibility granted to the Spaceman.app under test.
-The grant follows the Developer ID signature, so granting it once (System Settings › Privacy &
-Security › Accessibility) covers later builds. Windows appear on that Mac's main display. A
-disposable macOS VM is the best place to run it; `--host` copies both apps there over ssh and
+The grant follows the signing identity. A Developer ID grant covers later Developer ID builds;
+an Apple Development build needs its own grant and does not carry over. Windows appear on that
+Mac's main display. A disposable macOS VM is the best place to run it; `--host` copies both apps there over ssh and
 copies the receipt back, and `GAUNTLET_SSH` replaces the ssh command (a key, a jump host).
 The harness itself is `scripts/gauntlet/*.swift`, compiled by `gauntlet.sh` into
 `target/gauntlet/SpacemanGauntlet.app` with `swiftc`; the target Mac needs no developer tools.

@@ -46,7 +46,7 @@ pub use presenter::{
     WriteOutcome,
 };
 pub use swipes::SwipeMonitor;
-pub use symbolic_hotkeys::mission_control_shortcuts;
+pub(crate) use symbolic_hotkeys::mission_control_shortcuts;
 
 use apply::{cache_managed_window, evict_managed_app, prune_managed_app};
 use ax::{

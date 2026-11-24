@@ -182,6 +182,7 @@ CLI command, rule semantic, restart/recovery outcome, or covering test changes.
 - Build once from a clean reviewed revision, notarize and distribute that exact artifact, and verify
   signature, ticket, architecture, plist, archive contents, and checksum after packaging.
 - Keep the real app icon and add a concise demo before calling the preview broadly release-ready.
-- Never tell artifact users they need a Developer ID identity; that is a source-build requirement.
+- Never tell artifact users they need a Developer ID identity. A local source build accepts
+  Developer ID Application or Apple Development (`scripts/build-app.sh`); releases require Developer ID.
 - Never ship instructions to disable SIP, erase recovery metadata before restoration, or imply Mac App
   Store support.

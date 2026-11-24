@@ -73,10 +73,11 @@ window has returned before replacing its bundle.
 
 ## Install from source 🛠️
 
-Source builds are distinct from the notarized preview artifact and require your own `Developer ID
-Application` signing identity.
+Source builds are distinct from the notarized preview artifact. Sign a local build with your
+`Developer ID Application` identity, or with `Apple Development` if that is what the keychain has.
+Public releases stay on Developer ID.
 
-Requirements: macOS, Xcode command-line tools, Rust 1.100.0, and a Developer ID Application identity.
+Requirements: macOS, Xcode command-line tools, Rust 1.100.0, and one of those signing identities.
 
 From an existing repository checkout, first disable every other window manager, then run:
 

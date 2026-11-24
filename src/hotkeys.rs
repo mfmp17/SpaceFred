@@ -115,6 +115,7 @@ impl HotkeyPlan {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_layout(
         enabled: &[WorkspaceId],
         shortcuts: &Shortcuts,
