@@ -2,7 +2,7 @@ use super::*;
 
 /// How long a fresh park must settle before an on-screen observation of that
 /// window is trusted as a genuine reappearance rather than in-flight movement.
-const PARK_SETTLE_GRACE: Duration = Duration::from_secs(2);
+pub(super) const PARK_SETTLE_GRACE: Duration = Duration::from_secs(2);
 /// Accessibility lookups fail transiently, notably right after Spaceman or an
 /// application launches. A window the window server still lists keeps its
 /// slot for this long before an Accessibility "gone" is believed.
@@ -31,8 +31,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// A window observed on-screen while still recorded as parked was brought back by
     /// its app or the user. Accessibility frames can be stale right after a park, so
     /// the reappearance must be confirmed by the window server before trusting it.
-    /// Fighting a genuinely reappeared window back off-screen loses, so drop the
-    /// stale recovery frame and re-home the window to the workspace it reappeared on.
+    /// Re-home it when its app already has a window on screen; otherwise it keeps its
+    /// hidden workspace and focus follow switches there.
     pub(super) fn heal_reappeared_window(
         &mut self,
         window: &crate::ObservedWindow,
@@ -62,11 +62,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         else {
             return;
         };
-        if self.backend.frontmost_application().as_ref() != Some(&window.id.app) {
-            // A background reappearance is an app re-asserting its saved bounds
-            // (Electron does this on screen-parameter changes), not the user
-            // summoning the window. Keep the recovery frame; parking pushes it
-            // back off-screen instead of re-homing it.
+        // Background bounds re-assertions stay parked. So does a frontmost window
+        // whose home is a hidden workspace and whose app has nothing on screen.
+        if self.backend.frontmost_application().as_ref() != Some(&window.id.app)
+            || !self.rehome_reappearance(&window.id, visible)
+        {
             return;
         }
         self.honor_reappearance(&window.id, frame, original, target);
@@ -322,7 +322,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// A parked window observed on-screen in the background re-asserted its
     /// saved bounds (Electron does this on screen-parameter changes). Push it
     /// back to its parked spot; the recovery frame is already recorded. A
-    /// frontmost app's window is left for heal to re-home instead.
+    /// frontmost window is left for heal, unless its home is a hidden workspace.
     fn repark_drifted_window(
         &mut self,
         window: &crate::PhysicalWindowId,
@@ -348,7 +348,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             }
             return;
         }
-        if context.frontmost.as_ref() == Some(&window.app) {
+        if context.frontmost.as_ref() == Some(&window.app)
+            && self.rehome_reappearance(window, context.visible)
+        {
             return;
         }
         if self

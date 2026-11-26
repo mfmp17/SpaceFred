@@ -119,6 +119,21 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             focused
                 .as_ref()
                 .and_then(|focused| self.workspaces.workspace_of_any(focused))
+                .or_else(|| {
+                    // Dock and Cmd-Tab can focus a window this app just created
+                    // while the windows it already owns live on another workspace.
+                    // Follow that workspace. A new window of an app that was
+                    // already frontmost (Cmd-N) stays on the active workspace.
+                    let app = frontmost.as_ref()?;
+                    if self.suppressed_app.as_ref() == Some(app) {
+                        return None;
+                    }
+                    let workspace = self.workspaces.workspace_for_app(app)?;
+                    visible
+                        .iter()
+                        .all(|resolved| resolved.workspace != workspace)
+                        .then_some(workspace)
+                })
         } else {
             frontmost
                 .as_ref()
@@ -168,15 +183,44 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 self.record_focused_workspace(workspace);
             }
         }
-        for resolved in &visible {
-            self.foreground_lanes
-                .insert(resolved.display_id.clone(), resolved.selector.clone());
-        }
         // One window-server snapshot serves every authoritative-frame check in
         // this cycle; per-window queries would each copy the full window list.
         let server_snapshot = self.backend.window_server_frames();
         let empty_server_frames = HashMap::new();
         let server_frames = server_snapshot.as_ref().unwrap_or(&empty_server_frames);
+        // The app brought a parked window back on screen (a Dock click often
+        // does this before Accessibility reports that window). Switch to its
+        // workspace instead of letting heal tile it into the current layout.
+        // Runs even while focus is suppressed: the on-screen reappearance is
+        // the activation, and the park-settle grace stops a switch we just
+        // made from following a stale frame straight back.
+        if let Some(workspace) = self.workspace_summoned_on_screen(
+            &visible,
+            frontmost.as_ref(),
+            focused.as_ref(),
+            server_frames,
+        ) {
+            let input = self
+                .backend
+                .recent_input()
+                .map_or_else(|| "input unknown".into(), |input| input.to_string());
+            log_event!(
+                "focus follow: {:?} (frontmost {:?}) -> workspace {} ({})",
+                focused,
+                frontmost,
+                workspace,
+                input
+            );
+            let followed = self.switch(workspace, outputs, cancelled);
+            if matches!(&followed, Err(error) if error.ends_with("cancelled")) {
+                self.clear_suppressed_focus();
+            }
+            return followed;
+        }
+        for resolved in &visible {
+            self.foreground_lanes
+                .insert(resolved.display_id.clone(), resolved.selector.clone());
+        }
         self.recover_frontmost_stale_parked_window(
             &outputs,
             frontmost.as_ref(),
@@ -278,6 +322,93 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         status.close_recheck = close_recheck;
         status.missing_frontmost_window = missing_frontmost_window;
         Ok(status)
+    }
+
+    /// The hidden workspace a frontmost app just brought a parked window back
+    /// onto the screen from. `None` when the app already has a window on a
+    /// visible workspace, when the focused window is new and not yet owned
+    /// (focus follow switches for a fresh activation; a new window of the app
+    /// that was already frontmost stays here), or when those windows live on
+    /// more than one hidden workspace.
+    fn workspace_summoned_on_screen(
+        &self,
+        visible: &[ResolvedWorkspace],
+        frontmost: Option<&AppInstanceId>,
+        focused: Option<&crate::PhysicalWindowId>,
+        server_frames: &HashMap<u32, crate::Rect>,
+    ) -> Option<WorkspaceId> {
+        let app = frontmost?;
+        if self.app_has_visible_window(app, visible) {
+            return None;
+        }
+        // A new window of the app that was already frontmost is Cmd-N: it
+        // tiles here. Its parked siblings stay on their own workspace.
+        if focused.is_some_and(|focused| {
+            &focused.app == app && self.workspaces.workspace_of_any(focused).is_none()
+        }) {
+            return None;
+        }
+        let mut home = None;
+        for window in self.parked.keys() {
+            if &window.app != app
+                || self.awaiting_display_repark(window)
+                || self.recently_parked.get(window).is_some_and(|parked_at| {
+                    parked_at.elapsed() < super::parking::PARK_SETTLE_GRACE
+                })
+            {
+                continue;
+            }
+            let Some(frame) = server_frames.get(&window.window_id).copied() else {
+                continue;
+            };
+            if !visible
+                .iter()
+                .any(|resolved| resolved.output.contains_center(frame))
+            {
+                continue;
+            }
+            let Some(owner) = self.workspaces.workspace_of_any(window) else {
+                continue;
+            };
+            if visible.iter().any(|resolved| resolved.workspace == owner) {
+                continue;
+            }
+            if focused.is_some_and(|focused| focused == window) {
+                return Some(owner);
+            }
+            if home.is_some_and(|existing| existing != owner) {
+                return None;
+            }
+            home = Some(owner);
+        }
+        home
+    }
+
+    /// Whether a frontmost window that reappeared on screen should join the
+    /// workspace it appeared on. A window with no home (a scratchpad summon)
+    /// does. A window whose home is already showing does. A window that lives
+    /// on a hidden workspace joins the current one only when its app already
+    /// has something on screen; otherwise the view switches to its home.
+    pub(super) fn rehome_reappearance(
+        &self,
+        window: &crate::PhysicalWindowId,
+        visible: &[ResolvedWorkspace],
+    ) -> bool {
+        match self.workspaces.workspace_of_any(window) {
+            Some(owner) if visible.iter().all(|resolved| resolved.workspace != owner) => {
+                self.app_has_visible_window(&window.app, visible)
+            }
+            _ => true,
+        }
+    }
+
+    fn app_has_visible_window(&self, app: &AppInstanceId, visible: &[ResolvedWorkspace]) -> bool {
+        visible.iter().any(|resolved| {
+            self.workspaces
+                .windows(resolved.workspace)
+                .iter()
+                .any(|window| &window.app == app)
+        })
     }
 
     /// Bookkeeping shared by every path that moves a window between workspaces.
