@@ -56,17 +56,27 @@ fn overlap(a: Rect, b: Rect) -> (i64, i64) {
 /// display edge with its center outside while most of it stays visible.
 #[must_use]
 pub fn shows_on(frame: Rect, displays: &[Rect]) -> bool {
+    shows_wider_than(frame, displays, 1)
+}
+
+/// Whether a column of `frame` wider than `strip` pixels shows on any display.
+#[must_use]
+pub fn shows_wider_than(frame: Rect, displays: &[Rect], strip: i64) -> bool {
     displays.iter().any(|display| {
         let (width, height) = overlap(frame, *display);
-        width > 1 && height > 0
+        width > strip && height > 0
     })
 }
 
-/// `frame` itself while it shows on a display, otherwise moved (size kept) inside
-/// `fallback`: the display it was recorded on has been disconnected.
+/// `frame` itself while its center sits on a connected display, otherwise moved
+/// (size kept) inside `fallback`: the display it was recorded on has been
+/// disconnected or rearranged.
 #[must_use]
 pub fn onto_displays(frame: Rect, displays: &[Rect], fallback: Rect) -> Rect {
-    if shows_on(frame, displays) {
+    if displays
+        .iter()
+        .any(|display| display.contains_center(frame))
+    {
         return frame;
     }
     Rect {
@@ -208,6 +218,17 @@ mod tests {
         assert_eq!(onto_displays(on_main, &[main], main), on_main);
         assert_eq!(onto_displays(on_unplugged, &[main], main).x, 600);
         assert_eq!(onto_displays(on_unplugged, &[main], main).y, 20);
+
+        // A 2-px sliver overlaps `main` (`shows_on` is true), but its center
+        // sits off every display: `onto_displays` must clamp it squarely onto
+        // `fallback` instead of confirming a 99%-off-screen restore.
+        let two_px_sliver = Rect { x: 998, ..on_main };
+        assert!(shows_on(two_px_sliver, &[main]));
+        assert!(!main.contains_center(two_px_sliver));
+        let clamped = onto_displays(two_px_sliver, &[main], main);
+        assert_eq!(clamped.x, 600);
+        assert_eq!(clamped.y, 20);
+        assert!(main.contains_center(clamped));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::rules::Place;
 
 use super::{
     FRESH_MS, HOLD_MS, HudFlow, HudTick, HudTransition, LEAVE_MS, OVERLAY_MARGIN, OVERLAY_SIZE,
-    RESUME_HOLD_MS, assign_panels, grow, icons, menu, panel_edge, pill,
+    RESUME_HOLD_MS, TOAST_HOLD_MS, assign_panels, grow, icons, menu, panel_edge, pill,
 };
 
 #[test]
@@ -83,6 +83,7 @@ fn row(visible: u8, from: Option<u8>) -> UiHudDisplay {
         from: from.map(id),
         workspaces,
         order: Vec::new(),
+        portrait: false,
     }
 }
 
@@ -213,7 +214,7 @@ fn the_layouts_row_is_as_wide_as_the_prototype_s() {
         let entries: Vec<_> = (1..=count)
             .map(|number| workspace(number, &["a"]))
             .collect();
-        let (_, width) = grow::rest(&entries, Some(id(1)));
+        let (_, width) = grow::rest(&entries, Some(id(1)), false);
         let n = f32::from(count);
         // `24 + w * (1 + (n - 1) * small) + gap * (n - 1)`, inside the capsule's border.
         let expected =
@@ -364,6 +365,7 @@ fn visited_empty_workspaces_keep_the_configured_workspace_order() {
             },
         ],
         order: order.clone(),
+        portrait: false,
     };
     let mut flow = HudFlow::new(true);
     arrived(&mut flow, row('Q', None), 0);
@@ -382,63 +384,317 @@ fn visited_empty_workspaces_keep_the_configured_workspace_order() {
 }
 
 #[test]
-fn app_context_menu_reflects_float_tile_and_pin_state() {
+fn app_context_menu_names_route_rules_always_open_and_keeps_pin_for_the_pin_action() {
     let ws2 = id(2);
     let ws4 = id(4);
+    let title = |menu: &rune::PopupMenu, item: &str| menu.find(item).unwrap().title().to_owned();
 
-    // Default (tiled, unpinned): offers Float and Pin to Workspace 2.
-    let default_menu = menu::build_app_menu("Safari", ws2, None);
+    // No rule: Float, Pin on all workspaces, then where new windows open.
+    let default_menu = menu::build_app_menu("Safari", ws2, None, false);
+    assert_eq!(title(&default_menu, menu::ID_TOGGLE_FLOAT), "Float Safari");
     assert_eq!(
-        default_menu.find(menu::ID_TOGGLE_FLOAT).unwrap().title(),
-        "Float Safari"
+        title(&default_menu, menu::ID_TOGGLE_PIN),
+        "Pin Safari on all workspaces"
     );
     assert_eq!(
-        default_menu.find(menu::ID_TOGGLE_PIN).unwrap().title(),
-        "Pin Safari to Workspace 2"
+        title(&default_menu, menu::ID_TOGGLE_ROUTE),
+        "Always open Safari on Workspace 2"
     );
-    assert_eq!(
-        menu::resolve_app_menu_pick(menu::ID_TOGGLE_FLOAT, ws2, None),
-        Some(Some(Place::Float))
+    assert!(
+        !default_menu
+            .find(menu::ID_TOGGLE_ROUTE)
+            .unwrap()
+            .is_checked()
     );
+    assert!(default_menu.find(menu::ID_CLEAR_ROUTE).is_none());
+    let pick = |item, current| menu::resolve_app_menu_pick(item, ws2, current, false);
+    assert_eq!(pick(menu::ID_TOGGLE_FLOAT, None), Some(Some(Place::Float)));
+    // "Pin" writes the pin action, never a route.
+    assert_eq!(pick(menu::ID_TOGGLE_PIN, None), Some(Some(Place::Pin)));
     assert_eq!(
-        menu::resolve_app_menu_pick(menu::ID_TOGGLE_PIN, ws2, None),
+        pick(menu::ID_TOGGLE_ROUTE, None),
         Some(Some(Place::Workspace(ws2)))
     );
+    assert_eq!(pick("unknown", None), None);
 
-    // Currently floated: offers Tile and Pin to Workspace 2.
-    let float_menu = menu::build_app_menu("Safari", ws2, Some(Place::Float));
+    // No item of a route rule's menu says "Pin … Workspace".
+    for current in [
+        None,
+        Some(Place::Workspace(ws2)),
+        Some(Place::Workspace(ws4)),
+    ] {
+        let menu = menu::build_app_menu("Safari", ws2, current, false);
+        for item in [menu::ID_TOGGLE_ROUTE, menu::ID_CLEAR_ROUTE] {
+            if let Some(item) = menu.find(item) {
+                assert!(item.title().starts_with("Always open Safari on Workspace "));
+            }
+        }
+        assert_eq!(
+            title(&menu, menu::ID_TOGGLE_PIN),
+            "Pin Safari on all workspaces"
+        );
+    }
+
+    // Floating by rule: Tile removes the rule.
+    let float_menu = menu::build_app_menu("Safari", ws2, Some(Place::Float), false);
+    assert_eq!(title(&float_menu, menu::ID_TOGGLE_FLOAT), "Tile Safari");
+    assert_eq!(pick(menu::ID_TOGGLE_FLOAT, Some(Place::Float)), Some(None));
+
+    // Pinned: Unpin leaves it floating, Tile removes the rule.
+    let pinned_menu = menu::build_app_menu("Safari", ws2, Some(Place::Pin), false);
+    assert_eq!(title(&pinned_menu, menu::ID_TOGGLE_PIN), "Unpin Safari");
+    assert_eq!(title(&pinned_menu, menu::ID_TOGGLE_FLOAT), "Tile Safari");
     assert_eq!(
-        float_menu.find(menu::ID_TOGGLE_FLOAT).unwrap().title(),
-        "Tile Safari"
+        pick(menu::ID_TOGGLE_PIN, Some(Place::Pin)),
+        Some(Some(Place::Float))
     );
+    assert_eq!(pick(menu::ID_TOGGLE_FLOAT, Some(Place::Pin)), Some(None));
+
+    // Opening here: the item is checked, and picking it removes the rule.
+    let here = Some(Place::Workspace(ws2));
+    let here_menu = menu::build_app_menu("Safari", ws2, here, false);
+    assert!(here_menu.find(menu::ID_TOGGLE_ROUTE).unwrap().is_checked());
+    assert!(here_menu.find(menu::ID_CLEAR_ROUTE).is_none());
+    assert_eq!(pick(menu::ID_TOGGLE_ROUTE, here), Some(None));
+
+    // Opening on another workspace: move it here, or pick the checked one to remove it.
+    let other = Some(Place::Workspace(ws4));
+    let other_menu = menu::build_app_menu("Safari", ws2, other, false);
+    assert!(!other_menu.find(menu::ID_TOGGLE_ROUTE).unwrap().is_checked());
     assert_eq!(
-        menu::resolve_app_menu_pick(menu::ID_TOGGLE_FLOAT, ws2, Some(Place::Float)),
-        Some(None)
+        title(&other_menu, menu::ID_CLEAR_ROUTE),
+        "Always open Safari on Workspace 4"
+    );
+    assert!(other_menu.find(menu::ID_CLEAR_ROUTE).unwrap().is_checked());
+    assert_eq!(
+        pick(menu::ID_TOGGLE_ROUTE, other),
+        Some(Some(Place::Workspace(ws2)))
+    );
+    assert_eq!(pick(menu::ID_CLEAR_ROUTE, other), Some(None));
+}
+
+#[test]
+fn app_context_menu_respects_the_built_in_float_defaults() {
+    let ws1 = id(1);
+    let stickies = "com.apple.Stickies";
+    assert!(spaceman::defaults::floats_by_default(stickies));
+    let title = |current| {
+        menu::build_app_menu("Stickies", ws1, current, true)
+            .find(menu::ID_TOGGLE_FLOAT)
+            .unwrap()
+            .title()
+            .to_owned()
+    };
+    let pick = |item, current| menu::resolve_app_menu_pick(item, ws1, current, true);
+
+    // It floats with no rule, so the menu offers Tile, and Tile writes the override.
+    assert_eq!(title(None), "Tile Stickies");
+    assert_eq!(pick(menu::ID_TOGGLE_FLOAT, None), Some(Some(Place::Tile)));
+    // Tiled by that override: Float takes the rule away again instead of adding one.
+    assert_eq!(title(Some(Place::Tile)), "Float Stickies");
+    assert_eq!(pick(menu::ID_TOGGLE_FLOAT, Some(Place::Tile)), Some(None));
+    // Pinned, then unpinned: back to the built-in float, with no rule left behind.
+    assert_eq!(pick(menu::ID_TOGGLE_PIN, None), Some(Some(Place::Pin)));
+    assert_eq!(pick(menu::ID_TOGGLE_PIN, Some(Place::Pin)), Some(None));
+    assert_eq!(
+        pick(menu::ID_TOGGLE_FLOAT, Some(Place::Pin)),
+        Some(Some(Place::Tile))
     );
 
-    // Pinned to current workspace: offers Float and Unpin.
-    let pinned_menu = menu::build_app_menu("Safari", ws2, Some(Place::Workspace(ws2)));
-    assert_eq!(
-        pinned_menu.find(menu::ID_TOGGLE_PIN).unwrap().title(),
-        "Unpin Safari from Workspace 2"
+    // The picks write rules Spaceman's own parser reads back the same way.
+    let mut doc = crate::rules::Doc::parse("version = 1\n");
+    doc.set_app_place(stickies, pick(menu::ID_TOGGLE_FLOAT, None).unwrap());
+    assert!(
+        doc.source().contains("action = \"tile\""),
+        "{}",
+        doc.source()
     );
+    spaceman::config::Config::parse(&doc.source()).unwrap();
+    doc.set_app_place(
+        stickies,
+        pick(menu::ID_TOGGLE_PIN, Some(Place::Tile)).unwrap(),
+    );
+    assert!(
+        doc.source().contains("action = \"pin\""),
+        "{}",
+        doc.source()
+    );
+    assert!(!doc.source().contains("workspace"), "{}", doc.source());
+    spaceman::config::Config::parse(&doc.source()).unwrap();
+}
+
+// #419: an empty workspace moved to another display leaves this display's row.
+fn empty_display(id_: &str, visible: u8, from: Option<u8>) -> UiHudDisplay {
+    UiHudDisplay {
+        id: id_.into(),
+        visible: Some(id(visible)),
+        from: from.map(id),
+        workspaces: vec![workspace(visible, &[])],
+        order: WorkspaceId::all().collect(),
+        portrait: false,
+    }
+}
+
+fn rows(flows: &[HudFlow; 3]) -> [Vec<WorkspaceId>; 3] {
+    flows.each_ref().map(|flow| {
+        flow.view(false)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.workspace)
+            .collect()
+    })
+}
+
+#[test]
+fn moving_an_empty_workspace_away_retires_its_slot_on_the_old_display() {
+    let mut flows = [HudFlow::new(true), HudFlow::new(true), HudFlow::new(true)];
+    for (flow, row) in flows.iter_mut().zip([
+        empty_display("main-id", 2, Some(1)),
+        empty_display("secondary-id", 6, None),
+        empty_display("third-id", 9, None),
+    ]) {
+        arrived(flow, row, 0);
+    }
+
+    let mut control = flows.clone();
+    control[0].trigger(empty_display("main-id", 1, Some(2)), 100);
     assert_eq!(
-        menu::resolve_app_menu_pick(menu::ID_TOGGLE_PIN, ws2, Some(Place::Workspace(ws2))),
-        Some(None)
+        rows(&control),
+        [vec![id(1), id(2)], vec![id(6)], vec![id(9)]]
     );
 
-    // Pinned to another workspace: offers Float, Pin here, and Unpin from the other workspace.
-    let other_menu = menu::build_app_menu("Safari", ws2, Some(Place::Workspace(ws4)));
+    for (flow, row) in flows.iter_mut().zip([
+        empty_display("main-id", 1, None),
+        empty_display("secondary-id", 2, Some(6)),
+        empty_display("third-id", 9, None),
+    ]) {
+        assert_eq!(flow.trigger(row, 100), HudTransition::Update);
+    }
+    let observed = rows(&flows);
+    println!("rows after moving workspace 2: {observed:?}");
+    assert_eq!(observed, [vec![id(1)], vec![id(2), id(6)], vec![id(9)]]);
+}
+
+#[test]
+fn transient_status_toast_shows_even_when_workspace_hud_is_off_and_holds_for_toast_duration() {
+    use spaceman::app::UiHudToast;
+
+    let mut flow = HudFlow::new(false);
+    // Normal workspace HUD events stay ignored while HUD is off.
+    assert_eq!(flow.trigger(row(1, None), 1_000), HudTransition::Ignored);
+    assert!(flow.view(false).is_none());
+    assert!(flow.toast_view(false).is_none());
+
+    // A status toast still shows cleanly when Workspace HUD is off.
+    let paused = UiHudToast::paused("Tiling paused — built-in display");
     assert_eq!(
-        other_menu.find(menu::ID_TOGGLE_PIN).unwrap().title(),
-        "Pin Safari to Workspace 2"
+        flow.trigger_toast(paused.clone(), 1_000),
+        HudTransition::Show
     );
+    assert!(flow.view(false).is_none());
+    let view = flow.toast_view(false).expect("toast view");
+    assert!(view.shown);
+    assert_eq!(view.toast, &paused);
+    assert_eq!(flow.remaining_ms(1_000), Some(TOAST_HOLD_MS));
+
+    // Re-affirming HUD off does not prematurely dismiss an active status toast.
+    assert!(!flow.set_enabled(false, 1_500));
+    assert!(flow.toast_view(false).is_some_and(|v| v.shown));
+
+    // Still shown before TOAST_HOLD_MS, then leaves and hides cleanly.
+    assert_eq!(flow.tick(1_000 + TOAST_HOLD_MS - 1), HudTick::Idle);
+    assert_eq!(flow.tick(1_000 + TOAST_HOLD_MS), HudTick::Leave);
+    assert!(flow.toast_view(false).is_some_and(|v| !v.shown));
+    assert_eq!(flow.tick(1_000 + TOAST_HOLD_MS + LEAVE_MS), HudTick::Gone);
+    assert!(!flow.is_up());
+
+    // A resumed toast also renders and replaces an active toast in place.
+    let resumed = UiHudToast::resumed("Tiling resumed — external display");
+    assert_eq!(flow.trigger_toast(paused, 5_000), HudTransition::Show);
     assert_eq!(
-        other_menu.find(menu::ID_UNPIN_OTHER).unwrap().title(),
-        "Unpin Safari from Workspace 4"
+        flow.trigger_toast(resumed.clone(), 5_200),
+        HudTransition::Update
     );
-    assert_eq!(
-        menu::resolve_app_menu_pick(menu::ID_UNPIN_OTHER, ws2, Some(Place::Workspace(ws4))),
-        Some(None)
+    assert_eq!(flow.toast_view(false).unwrap().toast, &resumed);
+}
+
+#[test]
+fn secondary_click_is_inert_while_status_toast_is_shown_and_overlay_poll_uses_virtual_clock() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+
+    use rune::{Env, Runtime};
+    use spaceman::{
+        app::UiHudToast,
+        config::{HudPosition, HudStyle},
+    };
+
+    use super::{HudOverlay, HudSink, overlay_poll, overlay_view};
+
+    struct CountingSink {
+        app_place_calls: Arc<AtomicUsize>,
+    }
+
+    impl HudSink for CountingSink {
+        fn switch_workspace(&self, _workspace: WorkspaceId) {}
+
+        fn app_place(&self, _bundle_id: &str) -> Option<Place> {
+            self.app_place_calls.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+
+        fn set_app_place(&self, _bundle_id: &str, _place: Option<Place>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let app_place_calls = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let mut overlay = HudOverlay::new(
+        true,
+        HudStyle::Icons,
+        HudPosition::Bottom,
+        Arc::new(CountingSink {
+            app_place_calls: Arc::clone(&app_place_calls),
+        }),
     );
+    overlay.virtual_clock = Some(Arc::clone(&clock));
+    overlay.flow.trigger(row(1, None), 1_000);
+    // Simulate stale hover left over from the workspace capsule before the toast replaced it.
+    overlay.set_hovered_workspace(id(2), true);
+    overlay.set_hovered_app(id(1), "com.example.App", true);
+    overlay.flow.trigger_toast(
+        UiHudToast::paused("Tiling paused — built-in display"),
+        1_000,
+    );
+
+    let mut rt = Runtime::new(overlay, overlay_view, OVERLAY_SIZE, Env::new(true, 2.0));
+    rt.update_if(|overlay, tx| {
+        overlay.secondary_click_at(100.0, 20.0, tx);
+        // Right-clicking a toast must not query the sink, open a menu, or hold the toast.
+        assert!(!overlay.flow.is_held());
+        assert!(!overlay.flow.set_menu_open(true, 1_100));
+        false
+    });
+    assert_eq!(app_place_calls.load(Ordering::Relaxed), 0);
+
+    // overlay_poll honors overlay.now_ms() (the virtual clock), so advancing virtual time
+    // transitions the toast through Leave and Gone deterministically.
+    clock.store(1_000 + TOAST_HOLD_MS, Ordering::Relaxed);
+    rt.update_if(|overlay, tx| {
+        assert!(overlay_poll(overlay, 0.0, tx));
+        assert!(overlay.flow.toast_view(false).is_some_and(|v| !v.shown));
+        false
+    });
+    clock.store(1_000 + TOAST_HOLD_MS + LEAVE_MS, Ordering::Relaxed);
+    rt.update_if(|overlay, tx| {
+        assert!(!overlay_poll(overlay, 0.0, tx));
+        assert!(!overlay.flow.is_up());
+        assert!(overlay.hovered_app.is_none());
+        assert!(overlay.hovered_workspace.is_none());
+        false
+    });
 }

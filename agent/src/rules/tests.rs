@@ -184,7 +184,7 @@ fn hud_style_round_trips_and_leaves_the_default_out() {
 
 #[test]
 fn hud_position_round_trips_and_leaves_bottom_out() {
-    use spaceman::config::{Config, HudPosition};
+    use spaceman::config::{Config, HudPosition, HudStyle};
     let mut doc = Doc::parse(SOURCE);
     assert_eq!(doc.hud_position(), HudPosition::Bottom);
     doc.set_hud_position(HudPosition::Top);

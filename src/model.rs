@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Axis;
-
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct AppInstanceId {
     pub pid: i32,
@@ -30,10 +28,11 @@ pub enum BindingState {
     },
 }
 
+/// A tile's identity and the window bound to it. Its size lives only in the
+/// workspace's layout tree; the saved state projects it back out per slot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Slot {
     pub id: SlotId,
-    pub weight: u32,
     pub binding: BindingState,
 }
 
@@ -65,9 +64,10 @@ pub struct AppContinuity {
     pub previous_focused: Option<PhysicalWindowId>,
 }
 
+/// A workspace's tiles in slot order. Its split axis and weights live only in
+/// the engine's layout tree.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Workspace {
-    pub axis: Axis,
     pub slots: Vec<Slot>,
 }
 
@@ -99,9 +99,6 @@ impl Model {
         let mut slot_ids = std::collections::HashSet::new();
         let mut windows = std::collections::HashSet::new();
         for slot in &self.workspace.slots {
-            if slot.weight == 0 {
-                return Err(format!("slot {} has zero weight", slot.id.0));
-            }
             if !slot_ids.insert(slot.id) {
                 return Err(format!("duplicate slot ID {}", slot.id.0));
             }

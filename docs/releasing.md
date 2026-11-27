@@ -19,7 +19,7 @@ A release has two halves:
 
 ```text
 Release workflow (GitHub Actions)              installed Spaceman (src/updater.rs)
-build ─► sign + notarize ─► verify ─► publish ─► manifest ─► zip ─► SHA-256 + Developer ID ─► Install & Restart
+build ─► sign + notarize ─► verify ─► publish ─► manifest ─► zip ─► SHA-256 + Developer ID ─► Install & restart
          (Apple keys from AWS)       anoma.ly/release/spaceman
 
 scripts/release-app.sh (release Mac), for builds up to 0.3.2 only
@@ -78,7 +78,7 @@ When the channel's current release isn't the running build, it downloads the `ma
 against the manifest, unpacks it beside the installed bundle as `.Spaceman-update-<version>-<sha>`,
 and requires exactly `Spaceman.app`, bundle ID `anomaly.spaceman`, `codesign --verify --deep --strict`
 against `app/update-requirement.txt` (Anomaly's Developer ID, notarized) and `TeamIdentifier=5NZ4Q7NXJ4`.
-`Install & Restart` (Settings sidebar, `General > Updates`, or the menu) then runs the same exit as
+`Install & restart` (Settings sidebar, `General > Updates`, or the menu) then runs the same exit as
 quit: tiling stops and every parked window is restored, and only once restoration fully succeeds
 does Spaceman check the signature again, swap the bundles in one `renamex_np(RENAME_SWAP)` and open
 the new one after it exits. Quitting (or restarting, or a macOS logout) with an update ready installs

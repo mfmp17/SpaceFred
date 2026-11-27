@@ -50,6 +50,14 @@ cargo run --locked -- watch 20
 cargo run --locked -p spaceman-agent -- --size 1324x580 --playground Activity/activity --snap /tmp/activity.png
 ```
 
+Settings scenes render headless, so a UI change carries its before and after
+([Design system › Verification](design-system.md#verification)):
+
+```sh
+cargo run --locked -p spaceman-agent -- --list-scenes
+OUT=captures/after SIZES="860x580 920x660" THEMES="dark light" scripts/snap-set.sh general hud-customize
+```
+
 Commands with `--apply` and the menu-bar app move real windows. Disable every other window manager and
 use disposable windows before running them. The live harnesses below are the exception: they require
 AeroSpace to be enabled initially so they can capture a baseline, then they disable and restore it.

@@ -4,34 +4,57 @@
 //! those ten has its own recorder. Each change is saved to `config.toml` and registered live.
 
 mod catalog;
-mod keycap;
 mod recorder;
+#[cfg(test)]
+mod tests;
 mod workspaces;
 
 use rune::{El, Shadow, col, row, text};
 use rune_kit::SegmentedControl;
 use spaceman::{
     WorkspaceId,
+    config::LabFeature,
     shortcuts::{self, Chord, Modifiers, Shortcuts},
 };
 
 pub use recorder::Capture;
+pub(crate) use workspaces::switch_keys;
+
+/// The first chord that switches to `workspace`, as the setup tour asks for it.
+pub(crate) fn switch_chord(shortcuts: &Shortcuts, workspace: WorkspaceId) -> Option<Chord> {
+    workspaces::active_chords(shortcuts, workspaces::WorkspaceKind::Switch, workspace)
+        .into_iter()
+        .next()
+}
+
+/// The first chord that runs the catalog's action `id` ("float", "fullscreen").
+pub(crate) fn action_chord(
+    shortcuts: &Shortcuts,
+    named: &[WorkspaceId],
+    id: &str,
+) -> Option<Chord> {
+    catalog::find(id)?
+        .chords(shortcuts, named)
+        .into_iter()
+        .next()
+}
+
+/// A physical key press read as the recorder reads it: the modifiers held, and the chord it
+/// spells on the active keyboard layout.
+pub(crate) use catalog::PRESETS;
+pub(crate) use recorder::{modifiers as held_modifiers, pressed_chord};
 
 use crate::{
     Ui,
-    controls::{self, ButtonKind, Paint},
+    controls::{self, ButtonKind, KEYS, Paint, keycap, roll, tray},
     view::scroll_body,
 };
 use catalog::Action;
-use keycap::{KEY_GAP, keycap, roll, tray};
-
-/// The recorder is as tall as a tray of keys, so a row never jumps when it starts listening.
-const RECORDER_HEIGHT: f32 = keycap::KEY_HEIGHT + 2.0 * keycap::TRAY_PADDING;
 
 pub fn pane(ui: &Ui, p: Paint) -> El {
     let shortcuts = ui.doc.shortcuts();
-    let named = recorder::enabled_named_workspaces(ui);
-    let mut workspace_rows = family_rows(p, &shortcuts, &named);
+    let named = recorder::running_named_workspaces(ui);
+    let mut workspace_rows = family_rows(ui, p, &shortcuts, &named);
     workspace_rows.extend(action_rows(
         ui,
         p,
@@ -39,59 +62,57 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
         &named,
         catalog::WORKSPACE_ACTIONS,
     ));
-    workspace_rows.push(fixed_row(
-        p,
-        "swipe",
-        "Switch adjacent workspace",
-        vec!["3-finger swipe".into()],
-    ));
+    if shortcuts.workspace_steps {
+        workspace_rows.extend(action_rows(
+            ui,
+            p,
+            &shortcuts,
+            &named,
+            catalog::WORKSPACE_STEP_ACTIONS,
+        ));
+    }
+    workspace_rows.push(swipe_row(ui, p));
     scroll_body(
         "shortcuts-body",
-        col()
-            .key("sections")
-            .gap(24.0)
-            .child(controls::section(
-                p,
-                "modifier",
-                "Modifier",
-                modifier_rows(ui, p, &shortcuts),
-            ))
-            .child(
-                col()
-                    .key("switching")
-                    .gap(8.0)
-                    .child(controls::heading(
-                        p,
-                        "header",
-                        "Switching",
-                        Some("Click a shortcut to record · esc cancels · ⌫ clears"),
-                    ))
-                    .child(controls::card(p, "card", switching_rows(ui, p, &shortcuts))),
-            )
-            .child(
-                col()
-                    .key("workspaces")
-                    .gap(8.0)
-                    .child(controls::heading(
-                        p,
-                        "header",
-                        "Workspaces",
-                        Some("Click a shortcut to record · esc cancels · ⌫ clears"),
-                    ))
-                    .child(controls::card(p, "card", workspace_rows)),
-            )
-            .child(controls::section(
-                p,
-                "windows-layout",
-                "Windows & Layout",
-                action_rows(ui, p, &shortcuts, &named, catalog::LAYOUT_ACTIONS),
-            )),
+        controls::page(
+            "sections",
+            vec![
+                controls::section(p, "modifier", "Modifier", modifier_rows(ui, p, &shortcuts)),
+                controls::section(
+                    p,
+                    "switching",
+                    "Switching",
+                    switching_rows(ui, p, &shortcuts),
+                ),
+                controls::section(p, "workspaces", "Workspaces", workspace_rows),
+                controls::section(
+                    p,
+                    "windows-layout",
+                    "Windows & layout",
+                    action_rows(ui, p, &shortcuts, &named, catalog::LAYOUT_ACTIONS),
+                ),
+            ],
+        ),
     )
 }
 
 /// The base modifier every built-in shortcut holds, and a way back to the built-ins.
 fn modifier_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
     let mut rows = Vec::new();
+    let running = running_shortcuts(ui);
+    if running.is_some() {
+        rows.push(controls::setting_row(
+            p,
+            "not-applied",
+            "Previous shortcuts still run",
+            Some((
+                "These rows show config.toml, which wasn't applied".into(),
+                p.muted(),
+            )),
+            row().key("none"),
+        ));
+    }
+    let modifier_note = running.and_then(|running| modifier_running_note(running, shortcuts));
     if shortcuts.defaults {
         let labels = catalog::PRESETS.map(|(label, _)| label);
         let selected = catalog::PRESETS
@@ -107,26 +128,28 @@ fn modifier_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
             })
             .build(p.k)
             .key("picker");
+        let base_note = "Moves add ⇧. On the ⌥ base, Switch to space uses ⌃1–0 instead of ⌥.";
+        let description = match modifier_note {
+            Some(note) => format!("{base_note} · {note}"),
+            None => base_note.into(),
+        };
         rows.push(controls::setting_row(
             p,
             "base-modifier",
             "Base modifier",
-            Some((
-                "Move shortcuts add ⇧. On the ⌥ base, Switch to space uses ⌃1–0 instead of ⌥."
-                    .into(),
-                p.muted(),
-            )),
+            Some((description, p.muted())),
             picker,
         ));
     } else {
+        let description = match modifier_note {
+            Some(note) => format!("defaults = false in config.toml · {note}"),
+            None => "defaults = false in config.toml: only your bindings run".into(),
+        };
         rows.push(controls::setting_row(
             p,
             "defaults-off",
             "Built-in shortcuts are off",
-            Some((
-                "defaults = false in config.toml: only your bindings run.".into(),
-                p.muted(),
-            )),
+            Some((description, p.muted())),
             row().key("none"),
         ));
     }
@@ -139,7 +162,7 @@ fn modifier_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
             controls::button(
                 p,
                 "reset-button",
-                "Reset to Defaults",
+                "Reset to defaults",
                 ButtonKind::Secondary,
                 |ui: &mut Ui, _| reset(ui),
             ),
@@ -148,7 +171,163 @@ fn modifier_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
     rows
 }
 
-fn set_modifier(ui: &mut Ui, modifier: Modifiers) {
+/// The previous table, while it still runs because the saved one (which the rows show) was
+/// rejected. The agent publishes it only while those shortcuts are registered.
+fn running_shortcuts(ui: &Ui) -> Option<&Shortcuts> {
+    ui.agent.as_ref()?.running_shortcuts.as_ref()
+}
+
+/// What the base modifier or `defaults` row runs as while a rejected table leaves the previous
+/// one running; `None` when the two agree.
+fn modifier_running_note(running: &Shortcuts, saved: &Shortcuts) -> Option<String> {
+    if running.defaults == saved.defaults && (!saved.defaults || running.modifier == saved.modifier)
+    {
+        return None;
+    }
+    Some(if running.defaults {
+        format!("Still runs {}", running.modifier.keycaps().concat())
+    } else {
+        "Built-in shortcuts not running".to_owned()
+    })
+}
+
+/// What a shortcut runs as instead of its saved chords, while a rejected table leaves the
+/// previous one running; `None` when the two agree.
+fn running_note(
+    running: &Shortcuts,
+    saved: &Shortcuts,
+    named: &[WorkspaceId],
+    action: &Action,
+) -> Option<String> {
+    let chords = action.chords(running, named);
+    if chords == action.chords(saved, named) {
+        return None;
+    }
+    Some(chords.first().map_or_else(
+        || "Not running yet".to_owned(),
+        |chord| format!("Still runs {}", chord.keycaps().concat()),
+    ))
+}
+
+/// What a workspace row runs as while a rejected table leaves the previous one running; `None`
+/// when the workspaces represented by `entry` still run their saved chords.
+fn workspace_running_note(
+    running: &Shortcuts,
+    saved: &Shortcuts,
+    named: &[WorkspaceId],
+    running_rows: &[workspaces::WorkspaceRow],
+    entry: &workspaces::WorkspaceRow,
+) -> Option<String> {
+    let (kind, rest) = if let Some(rest) = entry.key.strip_prefix("switch") {
+        (workspaces::WorkspaceKind::Switch, rest)
+    } else {
+        let rest = entry.key.strip_prefix("move")?;
+        (workspaces::WorkspaceKind::Move, rest)
+    };
+    match rest {
+        "" => range_running_note(
+            running,
+            saved,
+            kind,
+            WorkspaceId::numbered().collect(),
+            running_rows,
+            entry,
+        ),
+        "-named" => {
+            if named.is_empty() {
+                if running.defaults == saved.defaults
+                    && (!saved.defaults || running.modifier == saved.modifier)
+                {
+                    return None;
+                }
+                return Some(if running.defaults {
+                    let mods = match kind {
+                        workspaces::WorkspaceKind::Switch => running.modifier,
+                        workspaces::WorkspaceKind::Move => running.modifier.with_shift(),
+                    };
+                    format!("Still runs {}A…Z", mods.keycaps().concat())
+                } else {
+                    "Not running yet".to_owned()
+                });
+            }
+            range_running_note(running, saved, kind, named.to_vec(), running_rows, entry)
+        }
+        suffix => {
+            let workspace = suffix
+                .strip_prefix('-')
+                .and_then(|id| WorkspaceId::parse(id).ok())?;
+            let chords = workspaces::active_chords(running, kind, workspace);
+            if chords == workspaces::active_chords(saved, kind, workspace) {
+                return None;
+            }
+            Some(chords.first().map_or_else(
+                || "Not running yet".to_owned(),
+                |chord| format!("Still runs {}", chord.keycaps().concat()),
+            ))
+        }
+    }
+}
+
+fn range_running_note(
+    running: &Shortcuts,
+    saved: &Shortcuts,
+    kind: workspaces::WorkspaceKind,
+    candidates: Vec<WorkspaceId>,
+    running_rows: &[workspaces::WorkspaceRow],
+    entry: &workspaces::WorkspaceRow,
+) -> Option<String> {
+    let default_mods = match kind {
+        workspaces::WorkspaceKind::Switch => saved.modifier,
+        workspaces::WorkspaceKind::Move => saved.modifier.with_shift(),
+    };
+    let mut any_differ = false;
+    let mut any_running = false;
+    for workspace in candidates {
+        let saved_chords = workspaces::active_chords(saved, kind, workspace);
+        let in_saved_range = saved.defaults
+            && saved_chords.len() == 1
+            && saved_chords[0].modifiers == default_mods
+            && match (workspace.number(), workspace.letter()) {
+                (Some(number), _) => {
+                    saved_chords[0].key == spaceman::shortcuts::Key::Number(number)
+                }
+                (_, Some(letter)) => {
+                    saved_chords[0].key
+                        == spaceman::shortcuts::Key::Character(letter.to_ascii_lowercase())
+                }
+                _ => false,
+            };
+        if !in_saved_range {
+            continue;
+        }
+        let running_chords = workspaces::active_chords(running, kind, workspace);
+        if !running_chords.is_empty() {
+            any_running = true;
+        }
+        if running_chords != saved_chords {
+            any_differ = true;
+        }
+    }
+    if !any_differ {
+        return None;
+    }
+    if !any_running {
+        return Some("Not running yet".to_owned());
+    }
+    if let Some(workspaces::WorkspaceRow {
+        keys: workspaces::RowKeys::Range(caps),
+        ..
+    }) = running_rows
+        .iter()
+        .find(|row| row.key == entry.key && row.title == entry.title)
+    {
+        return Some(format!("Still runs {}", caps.concat()));
+    }
+    Some("Still runs previous shortcuts".to_owned())
+}
+
+/// Saves the base modifier every built-in shortcut holds.
+pub(crate) fn set_modifier(ui: &mut Ui, modifier: Modifiers) {
     recorder::cancel(ui);
     ui.shortcut_capture = Capture::Idle;
     recorder::edit_shortcuts(ui, |doc| doc.set_shortcut_modifier(modifier));
@@ -181,6 +360,7 @@ fn switching_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
         Vec::new()
     };
     let system = spaceman::mission_control_shortcuts();
+    let running = running_shortcuts(ui);
     let mut rows = catalog::SWITCH_SPACES
         .iter()
         .map(|action| {
@@ -188,11 +368,16 @@ fn switching_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
                 .chords(shortcuts, &named)
                 .iter()
                 .find_map(|chord| shortcuts::switch_shortcut_warning(*chord, &glyphs, &system));
+            let note = warning.map(|text| (text, p.warning())).or_else(|| {
+                running
+                    .and_then(|running| running_note(running, shortcuts, &named, action))
+                    .map(|text| (text, p.muted()))
+            });
             controls::setting_row(
                 p,
                 &format!("{}-row", action.id),
                 action.title,
-                warning.map(|text| (text, p.warning())),
+                note,
                 shortcut_button(ui, p, shortcuts, &named, action),
             )
         })
@@ -214,31 +399,146 @@ fn switching_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts) -> Vec<El> {
 }
 
 /// The workspace shortcuts, reflecting `[shortcuts.bindings]`, `defaults`, and `modifier`.
-fn family_rows(p: Paint, shortcuts: &Shortcuts, named: &[WorkspaceId]) -> Vec<El> {
+fn family_rows(ui: &Ui, p: Paint, shortcuts: &Shortcuts, named: &[WorkspaceId]) -> Vec<El> {
+    let running = running_shortcuts(ui);
+    let running_rows = running.map(|running| workspaces::rows(running, named));
     workspaces::rows(shortcuts, named)
         .into_iter()
-        .map(|entry| match entry.keys {
-            workspaces::RowKeys::Range(caps) => fixed_row(p, &entry.key, &entry.title, caps),
-            workspaces::RowKeys::Chords(chords) => {
-                let keys = row()
-                    .key("keys")
-                    .padding(2.0)
-                    .mr(-3.0)
-                    .child(keys_face(p, &chords, false));
-                controls::setting_row(p, &format!("{}-row", entry.key), &entry.title, None, keys)
+        .map(|entry| {
+            let note = running
+                .and_then(|running| {
+                    workspace_running_note(
+                        running,
+                        shortcuts,
+                        named,
+                        running_rows.as_deref().unwrap_or(&[]),
+                        &entry,
+                    )
+                })
+                .map(|note| (note, p.muted()));
+            match entry.keys {
+                workspaces::RowKeys::Range(caps) => controls::setting_row(
+                    p,
+                    &format!("{}-row", entry.key),
+                    &entry.title,
+                    note,
+                    tray(p, "tray", &caps),
+                ),
+                workspaces::RowKeys::Chords(chords) => controls::setting_row(
+                    p,
+                    &format!("{}-row", entry.key),
+                    &entry.title,
+                    note,
+                    keys_face(p, &chords, false),
+                ),
             }
+        })
+        .chain(
+            running
+                .into_iter()
+                .flat_map(|running| running_only_rows(p, running, shortcuts, named)),
+        )
+        .collect()
+}
+
+/// Workspaces the saved table has no row for (it turned the built-ins off and binds nothing to
+/// them) but the previous table still runs: shown unset, with the chord that still runs.
+fn running_only_rows(
+    p: Paint,
+    running: &Shortcuts,
+    saved: &Shortcuts,
+    named: &[WorkspaceId],
+) -> Vec<El> {
+    workspaces::running_only_rows(running, saved, named)
+        .into_iter()
+        .map(|entry| {
+            let note = format!("Still runs {}", workspace_row_caps(&entry.keys));
+            controls::setting_row(
+                p,
+                &format!("{}-row", entry.key),
+                &entry.title,
+                Some((note, p.muted())),
+                keys_face(p, &[], false),
+            )
         })
         .collect()
 }
 
+/// A workspace row's keys as one run of keycaps: the whole range, or its first chord.
+fn workspace_row_caps(keys: &workspaces::RowKeys) -> String {
+    match keys {
+        workspaces::RowKeys::Range(caps) => caps.concat(),
+        workspaces::RowKeys::Chords(chords) => chords
+            .first()
+            .map(|chord| chord.keycaps().concat())
+            .unwrap_or_default(),
+    }
+}
+
 fn fixed_row(p: Paint, key: &str, title: &str, caps: Vec<String>) -> El {
-    // Inset like a shortcut button, so every tray lines up at the card's edge.
-    let keys = row()
-        .key("keys")
-        .padding(2.0)
-        .mr(-3.0)
-        .child(tray(p, "tray", &caps));
-    controls::setting_row(p, &format!("{key}-row"), title, None, keys)
+    controls::setting_row(
+        p,
+        &format!("{key}-row"),
+        title,
+        None,
+        tray(p, "tray", &caps),
+    )
+}
+
+/// What the workspace swipe's row shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SwipeRow {
+    /// The fixed keycap tray, as always while `[labs] swipe_switch` is off.
+    Fixed,
+    /// With the Lab on, a switch for `settings.trackpad_swipe`.
+    Switch { on: bool },
+}
+
+impl SwipeRow {
+    fn of(doc: &crate::rules::Doc) -> Self {
+        if doc.lab(LabFeature::SwipeSwitch) {
+            Self::Switch {
+                on: doc.trackpad_swipe(),
+            }
+        } else {
+            Self::Fixed
+        }
+    }
+}
+
+/// The workspace swipe's row: a fixed keycap tray, or with `[labs] swipe_switch` on, a
+/// switch for `settings.trackpad_swipe` (off leaves the gesture to macOS alone). It names
+/// four fingers while `[labs] four_finger_swipe` is on.
+fn swipe_row(ui: &Ui, p: Paint) -> El {
+    let fingers = if ui.doc.lab(LabFeature::FourFingerSwipe) {
+        4
+    } else {
+        3
+    };
+    let on = match SwipeRow::of(&ui.doc) {
+        SwipeRow::Fixed => {
+            return fixed_row(
+                p,
+                "swipe",
+                "Switch adjacent workspace",
+                vec![format!("{fingers}-finger swipe")],
+            );
+        }
+        SwipeRow::Switch { on } => on,
+    };
+    let description = if on {
+        format!("{fingers}-finger swipe left or right")
+    } else {
+        format!("Off: {fingers}-finger swipes are left to macOS")
+    };
+    controls::toggle_row(
+        p,
+        "swipe-row",
+        "Swipe to switch workspace",
+        Some((description, p.muted())),
+        on,
+        move |ui| ui.edit(|doc| doc.set_trackpad_swipe(!on)),
+    )
 }
 
 fn action_rows(
@@ -251,11 +551,14 @@ fn action_rows(
     actions
         .iter()
         .map(|action| {
+            let note = running_shortcuts(ui)
+                .and_then(|running| running_note(running, shortcuts, named, action))
+                .map(|note| (note, p.muted()));
             controls::setting_row(
                 p,
                 &format!("{}-row", action.id),
                 action.title,
-                None,
+                note,
                 shortcut_button(ui, p, shortcuts, named, action),
             )
         })
@@ -300,9 +603,11 @@ fn shortcut_button(
         .role("button")
         .label(label)
         .center_y()
-        .padding(2.0)
-        .mr(-3.0)
-        .radius(p.k.radius.md)
+        // The tray, not the pad round it, lands on the control rail; the pad's corner is the
+        // tray's plus the pad, so the hover fill is concentric with it.
+        .padding(KEYS.focus_pad)
+        .mr(-KEYS.focus_pad)
+        .radius(KEYS.button_radius())
         .focusable(true)
         .focus_ring(2.0, 0.0, c.border_focus)
         .on_press(move |ui: &mut Ui| recorder::begin(ui, id))
@@ -322,23 +627,7 @@ fn shortcut_button(
 }
 
 fn keys_face(p: Paint, chords: &[Chord], saved: bool) -> El {
-    let mut keys = row().key("keys").gap(6.0).center_y();
-    if chords.is_empty() {
-        keys = keys.child(
-            row().key("off").h(RECORDER_HEIGHT).px(8.0).center().child(
-                text("Not set")
-                    .key("label")
-                    .font(p.k.ty.ui)
-                    .color(p.faint()),
-            ),
-        );
-    }
-    for (index, chord) in chords.iter().take(2).enumerate() {
-        if index > 0 {
-            keys = keys.child(text("or").key("or").font(p.k.ty.small).color(p.faint()));
-        }
-        keys = keys.child(tray(p, &format!("tray{index}"), &chord.keycaps()));
-    }
+    let keys = controls::chords(p, chords);
     row()
         .key("face")
         .gap(4.0)
@@ -352,9 +641,9 @@ fn keys_face(p: Paint, chords: &[Chord], saved: bool) -> El {
 }
 
 /// Listening: a breathing dot, then the held modifiers sunk into their keys (or why the last
-/// chord was refused), then Esc.
+/// chord was refused), then the two keys that end it: ⌫ clears the shortcut, esc keeps it.
 fn recorder_face(p: Paint, held: Modifiers, message: Option<&str>) -> El {
-    let style = p.k.ty.ui_medium.lh(16.0);
+    let style = p.label();
     let held = held.keycaps();
     let prompt = match message {
         Some(message) => text(message.to_owned())
@@ -370,7 +659,7 @@ fn recorder_face(p: Paint, held: Modifiers, message: Option<&str>) -> El {
             .gap(4.0)
             .center_y()
             .child(
-                row().key("keys").gap(KEY_GAP).children(
+                row().key("keys").gap(KEYS.gap).children(
                     held.iter()
                         .enumerate()
                         .map(|(index, cap)| keycap(p, index, cap, true)),
@@ -380,19 +669,29 @@ fn recorder_face(p: Paint, held: Modifiers, message: Option<&str>) -> El {
     };
     row()
         .key("listening")
-        .h(RECORDER_HEIGHT)
+        .h(KEYS.tray_h())
         .gap(8.0)
         .center_y()
-        .pl(11.0)
-        .pr(keycap::TRAY_PADDING)
+        .pl(12.0)
+        .pr(KEYS.tray_pad)
         // The prompt rolls in from below and out through the top, inside the recorder.
-        .clip_rounded(p.k.radius.md)
+        .clip_rounded(KEYS.tray_radius())
         .child(controls::pulsing_dot(p.danger()))
         .child(prompt.transition(roll()))
         .child(
-            keycap(p, 0, "esc", false)
-                .key("escape")
-                .label("Esc to cancel"),
+            row()
+                .key("ends")
+                .gap(KEYS.gap)
+                .child(
+                    keycap(p, 0, "⌫", false)
+                        .key("clear")
+                        .label("Delete to clear"),
+                )
+                .child(
+                    keycap(p, 1, "esc", false)
+                        .key("escape")
+                        .label("Esc to cancel"),
+                ),
         )
 }
 
@@ -423,4 +722,88 @@ pub(crate) fn fixture_custom(ui: &mut Ui) {
     ui.shortcut_capture = Capture::Saved {
         action: "back-and-forth",
     };
+}
+
+#[cfg(test)]
+mod running_note_tests {
+    use spaceman::config::Config;
+
+    use super::*;
+
+    fn shortcuts(source: &str) -> Shortcuts {
+        Config::parse(source).unwrap().shortcuts().clone()
+    }
+
+    #[test]
+    fn modifier_row_notes_when_running_modifier_or_defaults_differ() {
+        let default = shortcuts("version = 1\n");
+        let ctrl_alt = shortcuts("version = 1\n[shortcuts]\nmodifier = \"ctrl+alt\"\n");
+        let no_defaults = shortcuts(
+            "version = 1\n[shortcuts]\ndefaults = false\n[shortcuts.bindings]\n\"ctrl+alt+y\" = \"float\"\n",
+        );
+
+        assert_eq!(modifier_running_note(&default, &default), None);
+        assert_eq!(
+            modifier_running_note(&default, &ctrl_alt).as_deref(),
+            Some("Still runs ⌥")
+        );
+        assert_eq!(
+            modifier_running_note(&ctrl_alt, &no_defaults).as_deref(),
+            Some("Still runs ⌃⌥")
+        );
+        assert_eq!(
+            modifier_running_note(&no_defaults, &default).as_deref(),
+            Some("Built-in shortcuts not running")
+        );
+        assert_eq!(modifier_running_note(&no_defaults, &no_defaults), None);
+    }
+
+    #[test]
+    fn workspace_rows_note_only_rows_whose_running_shortcuts_differ() {
+        let default = shortcuts("version = 1\n");
+        let ctrl_alt = shortcuts("version = 1\n[shortcuts]\nmodifier = \"ctrl+alt\"\n");
+        let rebound_two =
+            shortcuts("version = 1\n[shortcuts.bindings]\n\"ctrl+alt+2\" = \"switch 2\"\n");
+        let no_defaults = shortcuts(
+            "version = 1\n[shortcuts]\ndefaults = false\n[shortcuts.bindings]\n\"ctrl+alt+y\" = \"float\"\n",
+        );
+
+        // Changing base modifier marks every range row with what still runs.
+        let running_rows = workspaces::rows(&default, &[]);
+        for row in workspaces::rows(&ctrl_alt, &[]) {
+            let note = workspace_running_note(&default, &ctrl_alt, &[], &running_rows, &row);
+            assert!(
+                note.as_deref()
+                    .is_some_and(|n| n.starts_with("Still runs ⌥")),
+                "{}: {note:?}",
+                row.key
+            );
+        }
+
+        // Rebinding only workspace 2 marks switch-2, while unchanged range rows stay quiet.
+        let saved_rows = workspaces::rows(&rebound_two, &[]);
+        let switch_two = saved_rows.iter().find(|r| r.key == "switch-2").unwrap();
+        assert_eq!(
+            workspace_running_note(&default, &rebound_two, &[], &running_rows, switch_two)
+                .as_deref(),
+            Some("Still runs ⌥2")
+        );
+        let switch_rest = saved_rows.iter().find(|r| r.key == "switch").unwrap();
+        assert_eq!(
+            workspace_running_note(&default, &rebound_two, &[], &running_rows, switch_rest),
+            None
+        );
+
+        // When previous table had defaults = false with no workspace chords, new defaults say not running yet.
+        let no_default_rows = workspaces::rows(&no_defaults, &[]);
+        for row in workspaces::rows(&default, &[]) {
+            assert_eq!(
+                workspace_running_note(&no_defaults, &default, &[], &no_default_rows, &row)
+                    .as_deref(),
+                Some("Not running yet"),
+                "{}",
+                row.key
+            );
+        }
+    }
 }

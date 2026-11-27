@@ -19,7 +19,7 @@ fn moved_first(occupied: u8, empty: u8, x: i32) -> Option<WorkspaceId> {
     for n in [occupied, empty] {
         rt.switch(ws(n), three_outputs(), &cancelled).unwrap();
     }
-    assert_eq!(rt.last_focused_workspace, Some(ws(empty)));
+    assert_eq!(rt.focus.history().current, Some(ws(empty)));
     rt.move_workspace_to_display(DisplayTarget::Next, three_outputs(), &cancelled)
         .unwrap();
     rt.backend.persisted_monitors.first().map(|moved| moved.0)
@@ -52,9 +52,7 @@ fn a_focused_window_on_a_visible_workspace_still_wins() {
     let cancelled = AtomicBool::new(false);
     rt.switch(ws(6), three_outputs(), &cancelled).unwrap();
     // Simulate focus settling on ws(6) before the user clicks main on ws(1).
-    if let Some(pending) = rt.pending_focus.as_mut() {
-        pending.at -= super::super::commands::FOCUS_SETTLE;
-    }
+    rt.focus.age_request(super::super::focus::FOCUS_SETTLE);
     rt.backend.focused = Some(main.clone());
     rt.move_workspace_to_display(DisplayTarget::Next, three_outputs(), &cancelled)
         .unwrap();

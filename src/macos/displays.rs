@@ -3,7 +3,7 @@
 use std::{collections::HashMap, ptr::NonNull};
 
 use objc2::{MainThreadMarker, rc::autoreleasepool};
-use objc2_app_kit::NSScreen;
+use objc2_app_kit::{NSApplication, NSScreen};
 use objc2_core_foundation::{CFRetained, CFUUID};
 use objc2_foundation::{NSNumber, ns_string};
 
@@ -14,6 +14,13 @@ use super::SnapshotError;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const CFUUID;
+    fn CGDisplayIsBuiltin(display: u32) -> u32;
+    fn CGDisplayIsAsleep(display: u32) -> u32;
+    fn CGGetOnlineDisplayList(
+        max_displays: u32,
+        online_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
 }
 
 pub(super) fn main_output() -> Result<Rect, SnapshotError> {
@@ -26,6 +33,43 @@ pub struct DisplayOutput {
     pub name: String,
     pub frame: Rect,
     pub is_main: bool,
+}
+
+/// Summary of connected built-in vs external displays, used for
+/// `settings.pause_on_builtin_display`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DisplayTopology {
+    pub builtin: usize,
+    pub external: usize,
+}
+
+impl DisplayTopology {
+    /// Builds a topology from each connected display's `is_builtin` flag.
+    #[must_use]
+    pub fn from_builtin_flags(displays: impl IntoIterator<Item = bool>) -> Self {
+        let mut topology = Self::default();
+        for is_builtin in displays {
+            if is_builtin {
+                topology.builtin += 1;
+            } else {
+                topology.external += 1;
+            }
+        }
+        topology
+    }
+
+    /// True when at least one built-in display is connected and zero external displays are attached.
+    /// Desktop Macs (0 built-in displays) return `false`.
+    #[must_use]
+    pub const fn is_builtin_only(self) -> bool {
+        self.builtin > 0 && self.external == 0
+    }
+
+    /// True when at least one external display is connected.
+    #[must_use]
+    pub const fn has_external(self) -> bool {
+        self.external > 0
+    }
 }
 
 /// Maximum distance outside a display's visible tiling frame (in points) that a
@@ -128,6 +172,43 @@ impl DisplayOutputs {
         displays
     }
 
+    /// `display`'s name for people: its product name, and when another connected display
+    /// shares that name, where it sits among them in place of the "(1)" / "(2)" macOS appends.
+    /// Twins whose horizontal ranges all overlap are a stack ("top", "bottom", "2 from top");
+    /// any others go left to right ("left", "right", "2 from left").
+    #[must_use]
+    pub fn label(&self, display: &DisplayOutput) -> String {
+        let base = product_name(&display.name);
+        let mut twins: Vec<&DisplayOutput> = self
+            .ordered()
+            .into_iter()
+            .filter(|other| product_name(&other.name) == base)
+            .collect();
+        if twins.len() < 2 || !twins.iter().any(|other| other.id == display.id) {
+            return display.name.clone();
+        }
+        let stacked = twins.iter().enumerate().all(|(index, first)| {
+            twins[index + 1..]
+                .iter()
+                .all(|second| overlap_horizontally(first.frame, second.frame))
+        });
+        if stacked {
+            twins.sort_by_key(|twin| (twin.frame.y, twin.frame.x, twin.id.as_str()));
+        }
+        let Some(index) = twins.iter().position(|other| other.id == display.id) else {
+            return display.name.clone();
+        };
+        let position = match (twins.len(), stacked, index) {
+            (2, true, 0) => "top".to_owned(),
+            (2, true, _) => "bottom".to_owned(),
+            (2, false, 0) => "left".to_owned(),
+            (2, false, _) => "right".to_owned(),
+            (_, true, _) => format!("{} from top", index + 1),
+            (_, false, _) => format!("{} from left", index + 1),
+        };
+        format!("{base} ({position})")
+    }
+
     pub fn frames(&self) -> impl Iterator<Item = Rect> + '_ {
         self.displays.iter().map(|display| display.frame)
     }
@@ -144,6 +225,17 @@ impl DisplayOutputs {
     #[must_use]
     pub fn union(&self) -> Rect {
         self.frames().fold(self.main().frame, union_rect)
+    }
+
+    /// The smallest rectangle around every display's full bounds, menu bar and Dock strips
+    /// included: where observation looks for windows (#586).
+    #[must_use]
+    pub fn screen_union(&self) -> Rect {
+        let screens = self.screens();
+        screens
+            .iter()
+            .copied()
+            .fold(screens[self.main_index], union_rect)
     }
 
     /// Physical display containing `point`, including its menu-bar and Dock strips.
@@ -214,6 +306,10 @@ impl DisplayOutputs {
 pub fn outputs() -> Result<DisplayOutputs, SnapshotError> {
     autoreleasepool(|_| {
         let marker = MainThreadMarker::new().ok_or(SnapshotError::MainThreadRequired)?;
+        // Without an initialized `NSApplication` (e.g. in the standalone `spaceman displays`
+        // CLI), AppKit reports `screensHaveSeparateSpaces == false` and includes secondary
+        // displays' menu bars inside `NSScreen::visibleFrame` (#357).
+        let _ = NSApplication::sharedApplication(marker);
         let screens = NSScreen::screens(marker);
         let primary_height = (0..screens.count())
             .map(|index| screens.objectAtIndex(index).frame())
@@ -237,6 +333,57 @@ pub fn outputs() -> Result<DisplayOutputs, SnapshotError> {
         }
         DisplayOutputs::with_bounds(displays, bounds)
     })
+}
+
+/// Counts online built-in and external displays via `CGGetOnlineDisplayList` and
+/// `CGDisplayIsBuiltin`, including displays in a hardware mirror set that `NSScreen::screens`
+/// collapses into one screen. Returns `None` when Core Graphics reports no online displays.
+#[must_use]
+pub fn display_topology() -> Option<DisplayTopology> {
+    let displays = online_displays()?;
+    let flags = displays.iter().map(|&display_id| {
+        // SAFETY: `CGDisplayIsBuiltin` queries Core Graphics display metadata for a display ID
+        // and returns a `boolean_t` (0 = false, non-zero = true) without taking pointers.
+        unsafe { CGDisplayIsBuiltin(display_id) != 0 }
+    });
+    Some(DisplayTopology::from_builtin_flags(flags))
+}
+
+/// Whether no online display is awake: the lid is closed with no external display, or every
+/// display sleeps (including a background "dark" wake). Accessibility can stop reaching windows
+/// then, so its failures prove nothing about them (#739).
+#[must_use]
+pub fn displays_asleep() -> bool {
+    online_displays().is_none_or(|displays| {
+        displays.iter().all(|&display_id| {
+            // SAFETY: `CGDisplayIsAsleep` queries Core Graphics display state for a display ID
+            // and returns a `boolean_t` (0 = false, non-zero = true) without taking pointers.
+            unsafe { CGDisplayIsAsleep(display_id) != 0 }
+        })
+    })
+}
+
+/// Core Graphics IDs of the online displays, including hardware mirror set members;
+/// `None` when it reports none.
+fn online_displays() -> Option<Vec<u32>> {
+    let mut count: u32 = 0;
+    // SAFETY: Passing a null buffer with `max_displays = 0` queries the number of online
+    // displays without writing through the buffer pointer; `count` is a valid out-pointer.
+    let status = unsafe { CGGetOnlineDisplayList(0, std::ptr::null_mut(), &mut count) };
+    if status != 0 || count == 0 {
+        return None;
+    }
+    let capacity = count.saturating_add(4);
+    let mut displays = vec![0u32; usize::try_from(capacity).ok()?];
+    let mut filled: u32 = 0;
+    // SAFETY: `displays` holds `capacity` elements and `filled` is a valid out-pointer;
+    // Core Graphics writes at most `capacity` online display IDs.
+    let status = unsafe { CGGetOnlineDisplayList(capacity, displays.as_mut_ptr(), &mut filled) };
+    if status != 0 || filled == 0 {
+        return None;
+    }
+    displays.truncate(usize::try_from(filled).ok()?);
+    Some(displays)
 }
 
 /// Each connected display's Core Graphics ID, keyed by the ID `outputs` gives it. Main thread
@@ -322,6 +469,22 @@ fn union_rect(left: Rect, right: Rect) -> Rect {
     }
 }
 
+/// Whether `first` and `second` share some horizontal span, as stacked displays do.
+const fn overlap_horizontally(first: Rect, second: Rect) -> bool {
+    first.x < second.x + second.width && second.x < first.x + first.width
+}
+
+/// `name` without the " (1)" / " (2)" macOS appends to tell same-model displays apart.
+fn product_name(name: &str) -> &str {
+    name.rsplit_once(" (")
+        .filter(|(_, suffix)| {
+            suffix.strip_suffix(')').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .map_or(name, |(base, _)| base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +521,91 @@ mod tests {
             .map(|display| outputs.selector_for(display).as_str().to_owned())
             .collect();
         assert_eq!(selectors, ["main", "secondary", "studio-b"]);
+    }
+
+    #[test]
+    fn label_tells_same_named_displays_apart_by_position() {
+        let outputs = DisplayOutputs::new(vec![
+            display("built-in", "Built-in Retina Display", 0, true),
+            display("dell-a", "DELL U2720Q (1)", -100, false),
+            display("dell-b", "DELL U2720Q (2)", 100, false),
+        ])
+        .unwrap();
+        let labels: Vec<String> = outputs
+            .displays()
+            .iter()
+            .map(|display| outputs.label(display))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Built-in Retina Display",
+                "DELL U2720Q (left)",
+                "DELL U2720Q (right)"
+            ]
+        );
+        let stacked = DisplayOutputs::new(vec![
+            display("upper", "Studio Display", 0, true),
+            DisplayOutput {
+                frame: Rect {
+                    y: 100,
+                    ..display("lower", "Studio Display", 0, false).frame
+                },
+                ..display("lower", "Studio Display", 0, false)
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            stacked.label(&stacked.displays()[1]),
+            "Studio Display (bottom)"
+        );
+        // Offset sideways but still above one another: a stack, not left and right.
+        let offset = DisplayOutputs::new(vec![
+            display("upper", "Studio Display", 0, true),
+            DisplayOutput {
+                frame: Rect {
+                    x: 40,
+                    y: 100,
+                    ..display("lower", "Studio Display", 0, false).frame
+                },
+                ..display("lower", "Studio Display", 0, false)
+            },
+        ])
+        .unwrap();
+        assert_eq!(offset.label(&offset.displays()[0]), "Studio Display (top)");
+        assert_eq!(
+            offset.label(&offset.displays()[1]),
+            "Studio Display (bottom)"
+        );
+        let tower = DisplayOutputs::new(
+            [(0, 0), (10, 100), (-10, 200)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (x, y))| DisplayOutput {
+                    frame: Rect {
+                        x,
+                        y,
+                        ..display("", "LG", 0, false).frame
+                    },
+                    ..display(
+                        &format!("t{index}"),
+                        &format!("LG ({})", index + 1),
+                        0,
+                        index == 0,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(tower.label(&tower.displays()[2]), "LG (3 from top)");
+        let three = DisplayOutputs::new(vec![
+            display("a", "LG (1)", 0, true),
+            display("b", "LG (2)", 100, false),
+            display("c", "LG (3)", 200, false),
+        ])
+        .unwrap();
+        assert_eq!(three.label(&three.displays()[1]), "LG (2 from left)");
+        assert_eq!(product_name("Display (Work)"), "Display (Work)");
     }
 
     #[test]
@@ -470,5 +718,76 @@ mod tests {
             Some("second")
         );
         assert_eq!(with_bounds.display_at((2010, 800)), None);
+    }
+
+    #[test]
+    fn screen_rect_converts_visible_frames_excluding_menu_bars_on_side_displays() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        // Main 2560x1440 with 30pt menu bar flanked by two 1440x2560 portrait displays (#357).
+        let primary_height = 1440.0;
+        let rect = |x, y, width, height| {
+            screen_rect(
+                NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
+                primary_height,
+            )
+        };
+        assert_eq!(
+            rect(0.0, 0.0, 2560.0, 1410.0),
+            Rect {
+                x: 0,
+                y: 30,
+                width: 2560,
+                height: 1410,
+            }
+        );
+        // Side displays' visible frames exclude their 30pt menu bars just like main.
+        assert_eq!(
+            rect(-1440.0, -507.0, 1440.0, 2530.0),
+            Rect {
+                x: -1440,
+                y: -583,
+                width: 1440,
+                height: 2530,
+            }
+        );
+        assert_eq!(
+            rect(2560.0, -551.0, 1440.0, 2530.0),
+            Rect {
+                x: 2560,
+                y: -539,
+                width: 1440,
+                height: 2530,
+            }
+        );
+    }
+
+    #[test]
+    fn display_topology_distinguishes_laptop_builtin_clamshell_and_desktop_macs() {
+        // MacBook alone: built-in only.
+        let laptop_only = DisplayTopology::from_builtin_flags([true]);
+        assert!(laptop_only.is_builtin_only());
+        assert!(!laptop_only.has_external());
+
+        // MacBook + external monitor: not built-in only, has external.
+        let laptop_docked = DisplayTopology::from_builtin_flags([true, false]);
+        assert!(!laptop_docked.is_builtin_only());
+        assert!(laptop_docked.has_external());
+
+        // MacBook in clamshell mode with one external monitor.
+        let clamshell = DisplayTopology::from_builtin_flags([false]);
+        assert!(!clamshell.is_builtin_only());
+        assert!(clamshell.has_external());
+
+        // Mac Studio / Mac mini with 1 or 2 external monitors: 0 built-in displays.
+        let studio_single = DisplayTopology::from_builtin_flags([false]);
+        let studio_dual = DisplayTopology::from_builtin_flags([false, false]);
+        assert!(!studio_single.is_builtin_only());
+        assert!(!studio_dual.is_builtin_only());
+
+        // Empty / headless: neither built-in only nor external.
+        let empty = DisplayTopology::from_builtin_flags([]);
+        assert!(!empty.is_builtin_only());
+        assert!(!empty.has_external());
     }
 }

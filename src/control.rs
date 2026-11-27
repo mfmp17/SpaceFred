@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    DisplaySelector, DisplayTarget, ResizeDirection, WorkspaceId,
+    DisplaySelector, DisplayTarget, ResizeDirection, WorkspaceId, WorkspaceStep,
     app::{Action, WorkerAction},
     deep_link::{self, DeepLink},
     scratchpad::ScratchpadCommand,
@@ -23,7 +23,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(6);
 
-pub const COMMAND_USAGE: &str = "status|debug|settings|open TARGET|open-settings|open-accessibility|check-for-updates|toggle-launch-at-login|switch WORKSPACE|back-and-forth|move-workspace [next|prev|DISPLAY]|move WORKSPACE [--follow]|move-app ID WORKSPACE|focus DIR|focus next|focus prev|move-direction DIR|layout|fullscreen|float|resize shrink|resize grow|resize width|height POINTS|balance|scratchpad toggle|scratchpad mark|pause|resume|retile|wrong|restart|quit";
+pub const COMMAND_USAGE: &str = "status|debug|settings|open TARGET|open-settings|open-accessibility|check-for-updates|toggle-launch-at-login|switch WORKSPACE|switch next|prev|back-and-forth|move-workspace [next|prev|DISPLAY]|move WORKSPACE [--follow]|move next|prev [--follow]|move-tab WORKSPACE [--follow]|move-app ID WORKSPACE|focus DIR|focus next|focus prev|move-direction DIR|layout|fullscreen|float|pin|resize shrink|resize grow|resize width|height POINTS|balance|scratchpad toggle|scratchpad mark|pause|resume|retile|wrong|restart|quit";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
@@ -213,11 +213,33 @@ fn parse_line(line: &str) -> Result<Command, String> {
         ["resume"] => return Ok(Command::Resume),
         ["restart"] => return Ok(Command::Restart),
         ["quit"] => return Ok(Command::Quit),
-        ["switch", workspace] => WorkerAction::SwitchWorkspace(WorkspaceId::parse(workspace)?),
+        ["switch", target] => match WorkspaceStep::parse(target) {
+            Some(step) => WorkerAction::StepWorkspace(step),
+            None => WorkerAction::SwitchWorkspace(WorkspaceId::parse(target)?),
+        },
         ["back-and-forth"] => WorkerAction::WorkspaceBackAndForth,
-        ["move", workspace] => WorkerAction::MoveFocused(WorkspaceId::parse(workspace)?),
-        ["move", workspace, "--follow"] | ["move", "--follow", workspace] => {
-            WorkerAction::MoveFocusedFollow(WorkspaceId::parse(workspace)?)
+        ["move", target] => match WorkspaceStep::parse(target) {
+            Some(step) => WorkerAction::MoveFocusedStep {
+                step,
+                follow: false,
+            },
+            None => WorkerAction::MoveFocused(WorkspaceId::parse(target)?),
+        },
+        ["move", target, "--follow"] | ["move", "--follow", target] => {
+            match WorkspaceStep::parse(target) {
+                Some(step) => WorkerAction::MoveFocusedStep { step, follow: true },
+                None => WorkerAction::MoveFocusedFollow(WorkspaceId::parse(target)?),
+            }
+        }
+        ["move-tab", workspace] => WorkerAction::MoveTab {
+            target: WorkspaceId::parse(workspace)?,
+            follow: false,
+        },
+        ["move-tab", workspace, "--follow"] | ["move-tab", "--follow", workspace] => {
+            WorkerAction::MoveTab {
+                target: WorkspaceId::parse(workspace)?,
+                follow: true,
+            }
         }
         ["move-app", bundle_id, workspace] => {
             WorkerAction::MoveApp((*bundle_id).into(), WorkspaceId::parse(workspace)?)
@@ -229,6 +251,7 @@ fn parse_line(line: &str) -> Result<Command, String> {
         ["layout"] => WorkerAction::ToggleLayout,
         ["fullscreen"] => WorkerAction::ToggleFullscreenLayout,
         ["float"] => WorkerAction::ToggleFloat,
+        ["pin"] => WorkerAction::TogglePin,
         ["resize", "shrink"] => WorkerAction::Resize(ResizeDirection::Shrink),
         ["resize", "grow"] => WorkerAction::Resize(ResizeDirection::Grow),
         ["resize", dimension, points] => {
@@ -240,7 +263,7 @@ fn parse_line(line: &str) -> Result<Command, String> {
             ScratchpadCommand::parse(command).ok_or("expected scratchpad toggle|mark")?,
         ),
         ["retile"] => WorkerAction::Retile,
-        ["wrong"] => WorkerAction::MarkWrong,
+        ["wrong"] => WorkerAction::MarkWrong(None),
         _ => return Err(format!("expected {COMMAND_USAGE}")),
     };
     Ok(Command::Queue(action))
@@ -258,7 +281,7 @@ mod tests {
             command => panic!("{line:?} parsed as {command:?}"),
         };
         assert_eq!(parse_line("status").unwrap(), Command::Status);
-        assert_eq!(queued("wrong"), WorkerAction::MarkWrong);
+        assert_eq!(queued("wrong"), WorkerAction::MarkWrong(None));
         assert_eq!(
             queued("back-and-forth"),
             WorkerAction::WorkspaceBackAndForth
@@ -298,6 +321,30 @@ mod tests {
         );
         assert!(parse_line("move 11").is_err());
         assert_eq!(
+            queued("switch next"),
+            WorkerAction::StepWorkspace(WorkspaceStep::Next)
+        );
+        assert_eq!(
+            queued("switch prev"),
+            WorkerAction::StepWorkspace(WorkspaceStep::Prev)
+        );
+        assert_eq!(
+            queued("move next"),
+            WorkerAction::MoveFocusedStep {
+                step: WorkspaceStep::Next,
+                follow: false,
+            }
+        );
+        assert_eq!(
+            queued("move --follow prev"),
+            WorkerAction::MoveFocusedStep {
+                step: WorkspaceStep::Prev,
+                follow: true,
+            }
+        );
+        assert!(parse_line("switch previous").is_err());
+        assert!(parse_line("move-tab next").is_err());
+        assert_eq!(
             queued("move 2 --follow"),
             WorkerAction::MoveFocusedFollow(WorkspaceId::new(2).unwrap())
         );
@@ -309,6 +356,29 @@ mod tests {
             queued("switch D"),
             WorkerAction::SwitchWorkspace(WorkspaceId::named('D').unwrap())
         );
+        assert_eq!(
+            queued("move-tab 2"),
+            WorkerAction::MoveTab {
+                target: WorkspaceId::new(2).unwrap(),
+                follow: false,
+            }
+        );
+        assert_eq!(
+            queued("move-tab 2 --follow"),
+            WorkerAction::MoveTab {
+                target: WorkspaceId::TWO,
+                follow: true,
+            }
+        );
+        assert_eq!(
+            queued("move-tab --follow D"),
+            WorkerAction::MoveTab {
+                target: WorkspaceId::named('D').unwrap(),
+                follow: true,
+            }
+        );
+        assert!(parse_line("move-tab 11").is_err());
+        assert!(parse_line("move-tab").is_err());
         assert_eq!(
             queued("move-app com.example.App 3"),
             WorkerAction::MoveApp("com.example.App".into(), WorkspaceId::new(3).unwrap())
@@ -347,6 +417,7 @@ mod tests {
         assert_eq!(queued("focus prev"), WorkerAction::CycleFocusPrevious);
         assert_eq!(queued("fullscreen"), WorkerAction::ToggleFullscreenLayout);
         assert_eq!(queued("float"), WorkerAction::ToggleFloat);
+        assert_eq!(queued("pin"), WorkerAction::TogglePin);
         assert_eq!(
             queued("scratchpad toggle"),
             WorkerAction::Scratchpad(ScratchpadCommand::Toggle)

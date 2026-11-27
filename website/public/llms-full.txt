@@ -1,7 +1,7 @@
 # Spaceman
 
 > Spaceman is a macOS tiling window manager for Apple silicon built around stable logical windows.
-> Version 0.3.3, bundle ID `anomaly.spaceman`, signed with Anomaly's Developer ID and notarized.
+> Version 0.3.7, bundle ID `anomaly.spaceman`, signed with Anomaly's Developer ID and notarized.
 > Source, issues and releases: <https://github.com/anomalyco/spaceman>.
 
 Spaceman treats a logical tile slot as product identity rather than tying layout state to a single physical `AXWindow`. When a native tabbed window (such as Ghostty) replaces its physical Accessibility window identity on tab switch, Spaceman keeps the logical slot, split tree weight, workspace, and focus intent intact.
@@ -17,11 +17,11 @@ Spaceman treats a logical tile slot as product identity rather than tying layout
     && ditto -x -k /tmp/Spaceman.zip /Applications && open /Applications/Spaceman.app
   ```
 
-- **Setup:** Move `Spaceman.app` to `/Applications` and open it. A three-step tour runs: `Welcome`, `Give Spaceman window access`, then `You're all set`. Grant Accessibility in **System Settings > Privacy & Security**, optionally enable `Launch at Login`, and press `Start Tiling`. Tiling stays paused while the tour is open, so granting permission never rearranges windows behind it.
+- **Setup:** Move `Spaceman.app` to `/Applications` and open it. A four-step tour runs: `Welcome`, `Give Spaceman window access`, `Your workspaces`, then `Try it`. Grant Accessibility in **System Settings > Privacy & Security**. `Your workspaces` shows the windows open now as miniature workspaces and suggests where each app would tile; click or drag an icon to move it, or `Skip`. Tiling stays paused while the tour is open, so granting permission never rearranges windows behind it; `Arrange & start` moves them, and `Undo & restore` on `Try it` puts them back. `Try it` teaches the shortcuts on a miniature desktop and holds `Launch at login`.
 
   The permission list is named **Accessibility** through macOS 26, **Device Control and Data Access** on macOS 27.0 through 27.2, and **System & App Protection Override** on macOS 27.3 and later. On 27.3 and later System Settings refuses dragged app tiles: click the Privacy & Security notification, or use the list's `+` button. Optionally link `/Applications/Spaceman.app/Contents/MacOS/spaceman` to `~/.local/bin/spaceman`.
 
-- **Updates:** Release builds check Anomaly's release service (`https://anoma.ly/release/spaceman/desktop/<channel>.json`), verify the zip's size, SHA-256, bundle ID and Developer ID, and offer `Install & Restart` in the menu bar and Spaceman Settings. Installing restores every parked window first, then swaps the bundle and relaunches.
+- **Updates:** Release builds check Anomaly's release service (`https://anoma.ly/release/spaceman/desktop/<channel>.json`), verify the zip's size, SHA-256, bundle ID and Developer ID, and offer `Install & restart` in the menu bar and Spaceman Settings. Installing restores every parked window first, then swaps the bundle and relaunches.
 
 ## Keyboard Shortcuts
 
@@ -85,7 +85,7 @@ Validate a config file with `spaceman config-check "$HOME/Library/Application Su
 
 The bundled `spaceman` CLI communicates with the running agent over an owner-only (`0600`) Unix domain socket in `~/Library/Application Support/Spaceman/control.sock`:
 
-- `spaceman ctl status`: print active workspaces, tiling state, and window counts
+- `spaceman ctl status`: print the agent's mode, whether it is busy, its last error, and the active workspaces (no window counts; `spaceman ctl debug` lists the visible tiles and floating windows)
 - `spaceman ctl switch <workspace>` / `spaceman ctl move <workspace>`: switch workspaces or move the focused window
 - `spaceman ctl focus <left|down|up|right|next|prev>` / `spaceman ctl move-direction <left|down|up|right>`
 - `spaceman ctl layout` / `spaceman ctl fullscreen` / `spaceman ctl balance` / `spaceman ctl resize <shrink|grow>`

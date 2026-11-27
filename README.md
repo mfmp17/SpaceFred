@@ -21,8 +21,8 @@ SpaceFred currently:
 - persists active workspaces, nested split layouts, tile order and weights, and parked-window recovery
   metadata across restarts, and remembers each application's window placements by bundle
   identifier so reboots and startup recovery return windows to their workspaces;
-- journals window arrangements and model/screen disagreements locally, summarized in Settings (`Activity`)
-  and by `spaceman doctor`;
+- journals window arrangements and model/screen disagreements locally, summarized by
+  `spaceman doctor` and, with the `[labs] activity` switch on, in Settings (`Activity`);
 - shows a non-activating Workspace HUD capsule on each display on workspace switches,
   cross-workspace moves, and layout toggles (`[settings] hud = true`): a row of that display's
   workspaces, drawn as numbers and app icons by default or (`hud_style = "layouts"`) as their layouts with app
@@ -33,8 +33,11 @@ SpaceFred currently:
 - can register its signed app bundle with macOS to launch automatically at login;
 - supports directional focus and movement across displays, drag-to-reorder/nest, mouse and keyboard
   resizing, balancing, and a workspace-wide Fullscreen Layout;
+- sends a browser, Finder, or terminal tab to another workspace as its own window
+  (`spaceman ctl move-tab 2`) through the app's own `Move Tab to New Window`;
 - keeps movable non-resizable and rule-floated windows with their logical workspace without tiling
-  or resizing them;
+  or resizing them, floats small utilities such as Stickies and Calculator by default, and can pin
+  a floating window on every workspace of its display (`action = "pin"` or `spaceman ctl pin`);
 - exposes a local CLI over a user-only Unix socket.
 
 SpaceFred uses Accessibility APIs to observe, focus, move, and resize eligible windows. It requires no
@@ -55,7 +58,7 @@ installing it. It updates itself from Anomaly and uses bundle ID `anomaly.spacem
      && ditto -x -k /tmp/Spaceman.zip /Applications && open /Applications/Spaceman.app
    ```
 
-3. Follow the setup tour: grant Accessibility access, then press `Start Tiling`.
+3. Follow the setup tour: grant Accessibility access, then press `Arrange & start`.
 4. Optionally link the bundled CLI: `mkdir -p "$HOME/.local/bin" && ln -sf "/Applications/Spaceman.app/Contents/MacOS/spaceman" "$HOME/.local/bin/spaceman"`.
 
 To check the download first, get
@@ -65,7 +68,7 @@ run `shasum -a 256 -c Spaceman.zip.sha256`, then unzip it and move `Spaceman.app
 to `/Applications`.
 
 Spaceman updates itself from Anomaly's release service: when an update is ready, choose
-`Install & Restart` in Settings or the menu, or just quit and it installs for the next launch.
+`Install & restart` in Settings or the menu's install item, or just quit and it installs for the next launch.
 Spaceman restores every window first.
 Builds after 0.3.0 are signed by Anomaly with the bundle ID `anomaly.spaceman`, so macOS asks for
 Accessibility access once more after that update; your config, workspaces and parked-window recovery
@@ -104,23 +107,41 @@ maintainer workflow.
 
 1. Disable every other window manager. For AeroSpace: `aerospace enable off`.
 2. Open SpaceFred: `open "/Applications/SpaceFred.app"`.
-3. On a fresh install, SpaceFred opens its three-step setup tour when Accessibility access is missing.
+3. On a fresh install, SpaceFred opens its four-step setup tour when Accessibility access is missing.
    Choose `Allow` and grant SpaceFred access in **System Settings > Privacy & Security** (the
-   Accessibility list, named System & App Protection Override on macOS 27.3 and later), optionally
-   enable `Launch at Login`, then press `Start Tiling`.
-4. Confirm operation with `spaceman ctl status`.
+   Accessibility list, named System & App Protection Override on macOS 27.3 and later). If Stage
+   Manager or macOS edge tiling is on, or another window manager is running, that step lists it
+   with `Turn off` or `Quit`.
+4. `Your workspaces` shows where the windows open now would go: browsers on workspace 1, editors
+   and terminals on 2, chat and mail on 3, documents on 4, media on 5, at most two tiles a workspace
+   on a laptop display, with small utilities left floating. Click or drag an app's icon to move it,
+   then press `Arrange & start`, or `Skip` to leave every window where it is.
+5. `Try it` is a miniature desktop that teaches four shortcuts, one prompt at a time: `⌃2` and
+   `⌃1` switch workspaces, `⌥⇧Space` floats a window and tiles it again, `⌥⇧F` turns
+   Fullscreen Layout on and off, and `⌃1` again brings the window behind forward. Only the
+   keyboard moves it, and while the setup window has the keyboard those presses move the miniature
+   and none of your windows. `Modifier` under the prompt changes the base modifier; while that
+   base is Option, Switch to space stays on Control. `Launch at login` is here too, and
+   `Undo & restore` pauses tiling and puts every window back where it was.
+6. Confirm operation with `spaceman ctl status`.
 
-Automatic tiling starts when the setup tour finishes. A fresh install holds it while the tour is
-open, so granting Accessibility never rearranges your windows behind the setup window. Without
+Automatic tiling starts with `Arrange & start`. A fresh install holds it until then, so granting
+Accessibility never rearranges your windows behind the setup window; `Skip`, or closing the tour
+once Accessibility is granted, leaves SpaceFred paused until you choose `Resume Tiling` or it next
+launches. The arrangement moves the windows that are open and writes no `route` rule. Small
+utilities such as Calculator and Stickies float by default with no rule; it saves a `float` rule
+only for another app you float on the board, and a `tile` rule for a utility you tile. Without
 Accessibility permission, the menu reports the permission error and tiling remains paused. While
 tiling, the menu lists each display's workspaces (the visible one checked, plus any holding windows,
 with their apps' icons); choosing one switches to it. The menu actions are `Setup Tour…` (while
 Accessibility is missing), `Pause Tiling` (or `Resume Tiling` while paused), `Workspace HUD`,
 `Launch at Login`, `Settings...` (`⌘,`), `Check for Updates...`, and `Quit SpaceFred` (`⌘Q`). Settings
-includes `General`, `Layout` (window gaps, screen-edge padding, and a single-window width for wide
-displays, over a live preview), `Rules`, `Workspaces`, `Shortcuts`, and `Activity` (title-free arrangement
-diagnostics and process vitals). If macOS requires approval, the login item action opens **System
-Settings > General > Login Items & Extensions**.
+includes `General`, `Layout` (Dwindle or Columns new-window tiling, window gaps, screen-edge padding,
+and a single-window width for wide displays, over a live preview), `Rules`, `Workspaces`,
+`Shortcuts` (a Switching section records each space's shortcut), with `[labs] activity = true`,
+`Activity` (title-free arrangement diagnostics and process vitals), and `Labs` (a switch for each
+experimental feature, all off by default). If macOS requires approval, the login item action opens
+**System Settings > General > Login Items & Extensions**.
 
 ## Everyday use ⌨️
 
@@ -158,7 +179,11 @@ looks at which of those are enabled, and when one already uses a chord, Spaceman
 alone and the row tells you.
 
 The swipe shares three fingers with macOS's "Swipe between full-screen applications"; set that to
-four fingers or off in Trackpad settings so only one of them moves.
+four fingers or off in Trackpad settings so only one of them moves, or keep it: turn on **Swipe switch** in
+Settings › Labs, then turn off **Swipe to switch workspace** in Settings › Shortcuts. If you use
+Accessibility's three-finger drag, macOS moves its own swipes to four fingers; turn on **Four-finger
+swipe** in Settings › Labs to move SpaceFred's swipe to four fingers too. Like macOS Spaces, the swipe follows
+Natural scrolling: with it off, swiping right goes to the next workspace.
 
 Every shortcut can be rebound in `config.toml`'s `[shortcuts]` table, for example to match a Linux
 tiling setup; see [Configuration › Shortcuts](docs/configuration.md#shortcuts). While the base
@@ -169,9 +194,12 @@ Character shortcuts follow the active macOS keyboard layout. Workspace digits re
 ANSI number row, and Tab remains physical Tab. See [Controls](docs/controls.md) for drag, resize,
 balance, CLI, and socket behavior.
 
-New windows join the most recently focused tile’s split. When an app closes its last window,
+By default (`settings.layout = "dwindle"`), each new window splits the focused (or most recently
+added) tile along its longer side—side by side then alternating vertically on landscape displays,
+and top-to-bottom first on portrait monitors. Set `settings.layout = "columns"` (or pick
+`Columns` in **Settings › Layout**) to add new windows as equal siblings instead. When an app closes its last window,
 neighboring tiles can expand as soon as the app confirms the close. When apps refuse to fit side by side,
-Spaceman can temporarily stack adjacent tiles and restore the requested split when space allows.
+SpaceFred can temporarily stack adjacent tiles and restore the requested split when space allows.
 
 Commands and completed gestures wait in arrival order when the worker is busy; repeated resize or
 focus commands are not collapsed into one. Workspace switches keep the outgoing windows visible if
@@ -182,8 +210,10 @@ display, including middle displays in three-display arrangements.
 spaceman ctl status
 spaceman ctl switch 2
 spaceman ctl move 7
+spaceman ctl move-tab 2
 spaceman ctl layout
 spaceman ctl float
+spaceman ctl pin
 spaceman ctl balance
 spaceman ctl pause
 spaceman ctl resume
@@ -233,6 +263,11 @@ Public experimental preview. The arm64 artifact is signed, notarized, stapled, c
 through Anomaly's release service, which the app's own updater checks. Broad release readiness is not proven: minimum-OS runtime validation,
 clean-machine install/upgrade/recovery/uninstall qualification, wider architecture support, and a
 concise product demo remain outstanding.
+
+## Contributing
+
+SpaceFred is a personal fork. Upstream Spaceman does not take pull requests; ideas for the
+official app go to [an issue there](https://github.com/anomalyco/spaceman/issues).
 
 ## License
 

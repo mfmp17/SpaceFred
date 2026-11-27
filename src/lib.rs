@@ -4,6 +4,7 @@ pub mod config;
 #[cfg(target_os = "macos")]
 pub mod control;
 pub mod deep_link;
+pub mod defaults;
 pub mod geometry;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
@@ -25,6 +26,7 @@ pub mod model;
 pub mod motion;
 pub mod navigation;
 pub mod observation;
+pub mod onboarding_plan;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub mod permission_guide;
@@ -50,6 +52,7 @@ pub use updater::build_version;
 #[allow(unsafe_code)]
 mod url_handler;
 pub mod window_memory;
+pub mod window_overlay;
 pub mod workspace;
 
 pub use geometry::{Axis, Rect};
@@ -60,7 +63,7 @@ pub use reconcile::{
     Decision, Placement, Reconciliation, ReconciliationEvidence, Settings, reconcile,
 };
 pub use runtime::{CycleTicket, Engine, StaleCycle};
-pub use workspace::{DisplaySelector, DisplayTarget, WorkspaceId, Workspaces};
+pub use workspace::{DisplaySelector, DisplayTarget, WorkspaceId, WorkspaceStep, Workspaces};
 
 /// Characters the active keyboard layout types, including Option combinations, so Settings
 /// can warn when a shortcut collides with one. Empty when the layout can't be read.

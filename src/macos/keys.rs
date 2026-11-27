@@ -24,6 +24,13 @@ struct Context {
     tap: RefCell<Option<CFRetained<CFMachPort>>>,
 }
 
+/// The virtual key and Carbon modifiers a [`KeyMonitor`] reports when `chord` is pressed on the
+/// active keyboard layout, or `None` when the layout has no key for it.
+#[must_use]
+pub fn key_press(chord: crate::shortcuts::Chord) -> Option<(u32, u32)> {
+    crate::hotkeys::key_press(chord)
+}
+
 impl KeyMonitor {
     /// Installs on the main run loop. Fails without Accessibility.
     pub fn install(report: impl Fn(u32, u32) + 'static) -> Result<Self, String> {

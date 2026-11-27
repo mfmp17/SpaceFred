@@ -11,6 +11,14 @@ struct ParkedWindowsRef<'a>(
 );
 
 pub(super) trait WorkspaceBackend {
+    /// The worker's clock. Parking's settle, retry and exemption windows read
+    /// time only through it, so tests can step it instead of sleeping.
+    fn now(&self) -> Instant;
+    /// Waits `duration` on the worker's clock: a real sleep on the Mac, a step
+    /// of virtual time in tests.
+    fn pause(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
     fn snapshot(
         &mut self,
         cycle: u64,
@@ -21,6 +29,10 @@ pub(super) trait WorkspaceBackend {
     fn confirms_no_windows(&mut self, app: &AppInstanceId) -> bool;
     /// True only when the window's app is hidden or the window is minimized.
     fn confirms_set_aside(&mut self, window: &crate::PhysicalWindowId) -> bool;
+    /// True only when the window is in macOS native fullscreen.
+    fn confirms_native_fullscreen(&mut self, _window: &crate::PhysicalWindowId) -> bool {
+        false
+    }
     fn apply_observed(
         &mut self,
         placements: &[crate::Placement],
@@ -43,11 +55,31 @@ pub(super) trait WorkspaceBackend {
     fn onscreen_window_frames(&mut self) -> Option<HashMap<u32, crate::Rect>>;
     /// On-screen window-server IDs, front-most first.
     fn onscreen_window_order(&mut self) -> Option<Vec<u32>>;
+    /// The running application instance owning each of `window_ids`, per the window server.
+    /// For the rare window no observation covers; windows it cannot attribute, and windows off
+    /// the normal layer (always-on-top windows observation ignores), are left out.
+    fn window_owners(&mut self, window_ids: &HashSet<u32>) -> HashMap<u32, AppInstanceId>;
+    /// The bundle ID and title rules match `window` by, for a window no observation lists.
+    fn window_rule_probe(
+        &mut self,
+        _window: &crate::PhysicalWindowId,
+    ) -> Option<macos::WindowRuleProbe> {
+        None
+    }
     fn set_position(
         &mut self,
         window: &crate::PhysicalWindowId,
         target: crate::Rect,
     ) -> macos::ApplyOutcome;
+    /// Move a parked `window` back to its recovery frame, size included; see
+    /// [`macos::set_restore_frame`].
+    fn set_restore_frame(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        target: crate::Rect,
+    ) -> macos::ApplyOutcome {
+        self.set_position(window, target)
+    }
     /// Move `window` to a parked position; see [`macos::set_parked_position`].
     fn set_parked_position(
         &mut self,
@@ -58,17 +90,42 @@ pub(super) trait WorkspaceBackend {
     }
     fn focused_window(&mut self) -> Option<crate::PhysicalWindowId>;
     fn frontmost_application(&mut self) -> Option<AppInstanceId>;
-    /// Diagnostics only: recent user input timing for focus-follow logs.
+    /// Recent user input timing, for focus-follow logs and to tell a late app
+    /// handoff from the user's own focus change (#737).
     fn recent_input(&mut self) -> Option<macos::RecentInput> {
+        None
+    }
+    /// When macOS last changed the active Space (a desktop or fullscreen slide).
+    fn active_space_changed_at(&mut self) -> Option<Instant> {
+        None
+    }
+    /// Whether every display is asleep (closed lid, display sleep, background wake).
+    fn displays_asleep(&mut self) -> bool {
+        false
+    }
+    /// When three or four fingers last touched the trackpad: a desktop swipe
+    /// shows the arriving Space before macOS reports a change (#513).
+    fn space_gesture_at(&mut self) -> Option<Instant> {
         None
     }
     fn raise_window(&mut self, window: &crate::PhysicalWindowId) -> bool;
     fn focus_window(&mut self, window: &crate::PhysicalWindowId) -> bool;
+    /// Presses the app's "Move Tab to New Window" for its focused `window`.
+    fn detach_tab(&mut self, window: &crate::PhysicalWindowId) -> macos::TabDetachResult;
     fn pointer_location(&mut self) -> Option<(i32, i32)> {
+        None
+    }
+    /// The window focus follows mouse may focus at `point` now (the front-most
+    /// ordinary window there); see [`macos::hover_window_at`].
+    fn hover_window_at(&mut self, _point: (i32, i32)) -> Option<u32> {
         None
     }
     fn mouse_down(&mut self) -> bool {
         false
+    }
+    /// Whether any mouse button (not only the left) is held; a pointer warp waits for none.
+    fn any_mouse_button_down(&mut self) -> bool {
+        self.mouse_down()
     }
     fn warp_pointer(&mut self, _point: (i32, i32)) -> bool {
         false
@@ -125,16 +182,25 @@ impl MacWorkspaceBackend {
         path: Option<PathBuf>,
         value: &impl serde::Serialize,
         state: &'static str,
+        owner_only: bool,
     ) -> Result<(), String> {
         let path = path.ok_or("HOME is unavailable")?;
         let bytes = serde_json::to_vec(value)
             .map_err(|error| format!("failed to serialize {state} state: {error}"))?;
-        self.writer.write(path, bytes, state);
+        if owner_only {
+            self.writer.write_owner_only(path, bytes, state);
+        } else {
+            self.writer.write(path, bytes, state);
+        }
         Ok(())
     }
 }
 
 impl WorkspaceBackend for MacWorkspaceBackend {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
     fn snapshot(
         &mut self,
         cycle: u64,
@@ -149,6 +215,10 @@ impl WorkspaceBackend for MacWorkspaceBackend {
 
     fn confirms_set_aside(&mut self, window: &crate::PhysicalWindowId) -> bool {
         macos::confirms_set_aside(window)
+    }
+
+    fn confirms_native_fullscreen(&mut self, window: &crate::PhysicalWindowId) -> bool {
+        macos::confirms_native_fullscreen(window)
     }
 
     fn is_process_running(&mut self, app: &AppInstanceId) -> bool {
@@ -178,12 +248,31 @@ impl WorkspaceBackend for MacWorkspaceBackend {
         macos::onscreen_window_order()
     }
 
+    fn window_owners(&mut self, window_ids: &HashSet<u32>) -> HashMap<u32, AppInstanceId> {
+        macos::window_owners(window_ids)
+    }
+
+    fn window_rule_probe(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+    ) -> Option<macos::WindowRuleProbe> {
+        macos::window_rule_probe(window)
+    }
+
     fn set_position(
         &mut self,
         window: &crate::PhysicalWindowId,
         target: crate::Rect,
     ) -> macos::ApplyOutcome {
         macos::set_position_only(window, target)
+    }
+
+    fn set_restore_frame(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        target: crate::Rect,
+    ) -> macos::ApplyOutcome {
+        macos::set_restore_frame(window, target)
     }
 
     fn set_parked_position(
@@ -206,6 +295,18 @@ impl WorkspaceBackend for MacWorkspaceBackend {
         Some(macos::recent_input())
     }
 
+    fn active_space_changed_at(&mut self) -> Option<Instant> {
+        macos::last_active_space_change()
+    }
+
+    fn displays_asleep(&mut self) -> bool {
+        macos::displays_asleep()
+    }
+
+    fn space_gesture_at(&mut self) -> Option<Instant> {
+        macos::last_space_gesture()
+    }
+
     fn raise_window(&mut self, window: &crate::PhysicalWindowId) -> bool {
         macos::raise_window(window)
     }
@@ -214,12 +315,24 @@ impl WorkspaceBackend for MacWorkspaceBackend {
         macos::focus_window(window)
     }
 
+    fn detach_tab(&mut self, window: &crate::PhysicalWindowId) -> macos::TabDetachResult {
+        macos::detach_tab(window)
+    }
+
     fn pointer_location(&mut self) -> Option<(i32, i32)> {
         macos::mouse_position()
     }
 
+    fn hover_window_at(&mut self, point: (i32, i32)) -> Option<u32> {
+        macos::hover_window_at(point)
+    }
+
     fn mouse_down(&mut self) -> bool {
         macos::mouse_down()
+    }
+
+    fn any_mouse_button_down(&mut self) -> bool {
+        macos::any_mouse_button_down()
     }
 
     fn warp_pointer(&mut self, point: (i32, i32)) -> bool {
@@ -260,14 +373,14 @@ impl WorkspaceBackend for MacWorkspaceBackend {
         &mut self,
         state: &crate::workspace::WorkspaceState,
     ) -> Result<(), String> {
-        self.write_later(workspace_state_path(), state, "workspace")
+        self.write_later(workspace_state_path(), state, "workspace", false)
     }
 
     fn persist_window_memory(
         &mut self,
         memory: &crate::window_memory::WindowMemory,
     ) -> Result<(), String> {
-        self.write_later(window_memory_path(), memory, "window memory")
+        self.write_later(window_memory_path(), memory, "window memory", true)
     }
 
     fn persist_workspace_monitor(

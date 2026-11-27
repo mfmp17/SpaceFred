@@ -10,6 +10,8 @@ use spaceman::{
     config::{Config, HudPosition, HudStyle, MouseFollowsFocus, WindowDisposition},
 };
 
+mod builtin_display;
+mod labs;
 mod regressions;
 
 use super::{Outcome, try_run_with_config_path};
@@ -69,6 +71,7 @@ fn sample_window(title: Option<&str>) -> ObservedWindow {
         frame: Rect::default(),
         resizable: true,
         title: title.map(std::sync::Arc::from),
+        document: None,
     }
 }
 
@@ -367,6 +370,8 @@ fn config_gets_sets_and_shows_spacing() {
         ("settings.gaps.top", "32"),
         ("gaps.right", "12"),
         ("single_window_max_width", "1600"),
+        ("single_window_max_height", "1050"),
+        ("labs.single_window_height", "true"),
     ] {
         let set = temp.run(&["config", "set", key, value]);
         assert_eq!(set.exit_code, 0, "{:?}", set.stderr);
@@ -377,6 +382,7 @@ fn config_gets_sets_and_shows_spacing() {
         (8, 32, 12, 0)
     );
     assert_eq!(spacing.single_window_max_width, 1600);
+    assert_eq!(spacing.single_window_max_height, 1050);
     assert!(!Config::parse(&temp.read()).unwrap().hud());
     assert_eq!(
         temp.run(&["config", "get", "gaps.top"]).stdout.as_deref(),
@@ -393,6 +399,7 @@ fn config_gets_sets_and_shows_spacing() {
     assert_eq!(show["settings"]["gaps"]["inner"], 8);
     assert_eq!(show["settings"]["gaps"]["left"], 0);
     assert_eq!(show["settings"]["single_window_max_width"], 1600);
+    assert_eq!(show["settings"]["single_window_max_height"], 1050);
     let shown = temp.run(&["config", "show"]).stdout.unwrap();
     assert_eq!(Config::parse(&shown).unwrap().spacing(), spacing);
 

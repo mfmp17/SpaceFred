@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
     io::{self, Write},
     process::ExitCode,
@@ -14,6 +14,8 @@ use std::{
 mod cli;
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use spaceman::live::window_scope::WindowScope;
 use spaceman::{
     Engine, Model, NativeObservation, Reconciliation, ReconciliationEvidence, Settings, reconcile,
 };
@@ -292,10 +294,19 @@ fn configured_spacing() -> spaceman::spacing::Spacing {
 }
 
 #[cfg(target_os = "macos")]
+fn configured_layout() -> spaceman::config::LayoutMode {
+    spaceman::config::Config::load()
+        .map(|config| config.layout())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
 fn run_retile(should_apply: bool) -> Result<SnapshotOutput, String> {
     let (observation, settings) =
         spaceman::macos::snapshot(1).map_err(|error| error.to_string())?;
-    let settings = settings.spaced(configured_spacing());
+    let settings = settings
+        .spaced(configured_spacing())
+        .with_layout(configured_layout());
     if should_apply
         && observation
             .applications
@@ -344,6 +355,7 @@ fn run_watch(
         }
         .map_err(|error| error.to_string())?;
         settings.spacing = configured_spacing();
+        settings.layout = configured_layout();
         if let Some(initial_window_id) = initial_window_id {
             let active_scope = match &mut scope {
                 Some(scope) => scope,
@@ -388,6 +400,7 @@ fn run_persistent(should_apply: bool) -> Result<String, String> {
     let mut engine = Engine::default();
     let mut known_apps = HashMap::new();
     let spacing = configured_spacing();
+    let layout = configured_layout();
     let mut output = io::BufWriter::new(io::stdout().lock());
     let mut completed_cycles = 0_u64;
 
@@ -420,6 +433,7 @@ fn run_persistent(should_apply: bool) -> Result<String, String> {
         }
         spaceman::live::add_absent_applications(&mut observation, &mut known_apps);
         settings.spacing = spacing;
+        settings.layout = layout;
         let reconciliation = engine
             .accept(ticket, &observation, &settings)
             .map_err(|error| format!("stale synchronous cycle: {error:?}"))?;
@@ -460,102 +474,6 @@ fn run_persistent(should_apply: bool) -> Result<String, String> {
     .to_string())
 }
 
-#[cfg(target_os = "macos")]
-struct WindowScope {
-    app: spaceman::AppInstanceId,
-    bundle_id: String,
-    frame: spaceman::Rect,
-    output: spaceman::Rect,
-    excluded_window_ids: HashSet<u32>,
-    authorized_window_ids: HashSet<u32>,
-    missing_cycles: u8,
-}
-
-#[cfg(target_os = "macos")]
-impl WindowScope {
-    fn discover(
-        observation: &NativeObservation,
-        window_id: u32,
-        output: spaceman::Rect,
-    ) -> Result<Self, String> {
-        observation
-            .applications
-            .iter()
-            .find_map(|app| match app {
-                spaceman::AppObservation::Complete { app, windows, .. } => windows
-                    .iter()
-                    .find(|window| window.id.window_id == window_id)
-                    .map(|window| Self {
-                        app: app.id.clone(),
-                        bundle_id: app.bundle_id.clone(),
-                        frame: window.frame,
-                        output,
-                        excluded_window_ids: windows
-                            .iter()
-                            .filter(|existing| existing.id.window_id != window_id)
-                            .map(|existing| existing.id.window_id)
-                            .collect(),
-                        authorized_window_ids: HashSet::from([window_id]),
-                        missing_cycles: 0,
-                    }),
-                _ => None,
-            })
-            .ok_or_else(|| format!("window {window_id} is not currently eligible"))
-    }
-
-    fn filter(&mut self, observation: &mut NativeObservation) {
-        let mut scoped = observation
-            .applications
-            .drain(..)
-            .find(|app| app.app_id() == &self.app);
-        if let Some(spaceman::AppObservation::Complete {
-            focused, windows, ..
-        }) = &mut scoped
-        {
-            windows.retain(|window| {
-                !self.excluded_window_ids.contains(&window.id.window_id)
-                    && window.frame.approximately_equals(self.frame, 100)
-            });
-            let selected = focused
-                .as_ref()
-                .and_then(|focused| windows.iter().find(|window| window.id == *focused))
-                .or_else(|| {
-                    windows
-                        .iter()
-                        .find(|window| self.authorized_window_ids.contains(&window.id.window_id))
-                })
-                .or_else(|| (windows.len() == 1).then(|| &windows[0]))
-                .map(|window| window.id.clone());
-            windows.retain(|window| selected.as_ref() == Some(&window.id));
-            if let Some(selected) = selected {
-                self.authorized_window_ids.insert(selected.window_id);
-                *focused = focused.take().filter(|focused| focused == &selected);
-                self.missing_cycles = 0;
-                if let Some(scoped) = scoped {
-                    observation.applications = vec![scoped];
-                }
-                return;
-            }
-        }
-        self.missing_cycles = self.missing_cycles.saturating_add(1);
-        observation.applications = vec![if self.missing_cycles <= 8 {
-            spaceman::AppObservation::Unavailable {
-                app: self.app.clone(),
-                error: "scoped window is settling or absent".into(),
-            }
-        } else {
-            spaceman::AppObservation::Complete {
-                app: spaceman::ObservedApplication {
-                    id: self.app.clone(),
-                    bundle_id: self.bundle_id.clone(),
-                },
-                focused: None,
-                windows: Vec::new(),
-            }
-        }];
-    }
-}
-
 fn run_replay(path: &str) -> Result<ReplayOutput, String> {
     let input =
         fs::read_to_string(path).map_err(|error| format!("failed to read {path}: {error}"))?;
@@ -577,11 +495,7 @@ fn run_replay(path: &str) -> Result<ReplayOutput, String> {
 
     for observation in replay.observations {
         let result = reconcile(&model, &observation, &evidence, &replay.settings);
-        evidence.previous_placements = result
-            .placements
-            .iter()
-            .map(|placement| (placement.slot, placement.frame))
-            .collect();
+        evidence.record(&observation, &result);
         model = result.model.clone();
         steps.push(result);
     }

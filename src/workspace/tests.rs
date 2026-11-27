@@ -1,5 +1,7 @@
 use crate::{AppInstanceId, BindingState, Slot, SlotId};
 
+use super::SavedSlot;
+
 use super::*;
 
 fn window(id: u32) -> PhysicalWindowId {
@@ -20,7 +22,6 @@ fn unresolved_affinity_reserves_candidates_without_owning_them() {
     let mut workspaces = Workspaces::default();
     workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Unresolved {
             previous: old.clone(),
             candidates: vec![replacement.clone()],
@@ -40,7 +41,6 @@ fn unresolved_affinity_reserves_candidates_without_owning_them() {
     );
     workspaces.engine_mut(WorkspaceId::SIX).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Bound(other),
     });
     assert_eq!(workspaces.workspace_for_app(&old.app), None);
@@ -176,12 +176,10 @@ fn persisted_state_restores_active_workspaces_and_tile_order() {
     let mut workspaces = Workspaces::default();
     workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Bound(first.clone()),
     });
     workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
         id: SlotId(2),
-        weight: 1,
         binding: BindingState::Bound(second.clone()),
     });
     workspaces.engine_mut(WorkspaceId::ONE).toggle_axis();
@@ -199,7 +197,7 @@ fn persisted_state_restores_active_workspaces_and_tile_order() {
         Some(WorkspaceId::ONE)
     );
     assert_eq!(
-        restored.engine(WorkspaceId::ONE).model().workspace.axis,
+        restored.engine(WorkspaceId::ONE).layout().root_axis(),
         crate::Axis::Vertical
     );
     assert_eq!(
@@ -217,12 +215,11 @@ fn persisted_state_restores_focus_and_fullscreen_layout() {
     for (id, window) in [(1, &first), (2, &second)] {
         workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
             id: SlotId(id),
-            weight: 1,
             binding: BindingState::Bound(window.clone()),
         });
     }
     workspaces.remember_focus(WorkspaceId::ONE, &second);
-    workspaces.set_fullscreen_layout(WorkspaceId::ONE, true);
+    workspaces.set_deck(WorkspaceId::ONE, crate::workspace::DeckMode::Monocle);
 
     let encoded = serde_json::to_value(workspaces.state()).unwrap();
     assert_eq!(encoded["fullscreen_layout"], serde_json::json!([true]));
@@ -236,7 +233,7 @@ fn persisted_state_restores_focus_and_fullscreen_layout() {
         restored.preferred_focus(WorkspaceId::ONE),
         Some(second.clone())
     );
-    assert!(restored.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(restored.deck(WorkspaceId::ONE).is_monocle());
 }
 
 #[test]
@@ -247,7 +244,7 @@ fn persisted_empty_workspace_cannot_restore_fullscreen_layout() {
 
     restored.restore(state);
 
-    assert!(!restored.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(!restored.deck(WorkspaceId::ONE).is_monocle());
 }
 
 #[test]
@@ -258,17 +255,16 @@ fn fullscreen_layout_survives_until_the_final_slot_is_removed() {
     for (id, window) in [(1, &first), (2, &second)] {
         workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
             id: SlotId(id),
-            weight: 1,
             binding: BindingState::Bound(window.clone()),
         });
     }
-    workspaces.set_fullscreen_layout(WorkspaceId::ONE, true);
+    workspaces.set_deck(WorkspaceId::ONE, crate::workspace::DeckMode::Monocle);
 
     workspaces.forget_window(WorkspaceId::ONE, &first);
-    assert!(workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(workspaces.deck(WorkspaceId::ONE).is_monocle());
     workspaces.forget_window(WorkspaceId::ONE, &second);
 
-    assert!(!workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(!workspaces.deck(WorkspaceId::ONE).is_monocle());
 }
 
 #[test]
@@ -303,7 +299,7 @@ fn legacy_maximize_intent_migrates_to_fullscreen_layout() {
 
     workspaces.restore(serde_json::from_value(state).unwrap());
 
-    assert!(workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(workspaces.deck(WorkspaceId::ONE).is_monocle());
     assert_eq!(workspaces.preferred_focus(WorkspaceId::ONE), Some(first));
 }
 
@@ -315,7 +311,6 @@ fn persisted_state_round_trips_a_named_workspace() {
     workspaces.enable(named);
     workspaces.engine_mut(named).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Bound(owned.clone()),
     });
     workspaces.switch(named);
@@ -357,7 +352,6 @@ fn nested_layout_round_trips_without_flattening() {
     for (id, window) in [(1, &first), (2, &second), (3, &third)] {
         workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
             id: SlotId(id),
-            weight: 1,
             binding: BindingState::Bound(window.clone()),
         });
     }
@@ -393,7 +387,7 @@ fn nested_layout_round_trips_without_flattening() {
 #[test]
 fn persisted_state_rejects_layout_with_wrong_slot_membership() {
     let mut state = Workspaces::default().state();
-    state.slots[0].push(Slot {
+    state.slots[0].push(SavedSlot {
         id: SlotId(1),
         weight: 1,
         binding: BindingState::Bound(window(10)),
@@ -405,7 +399,7 @@ fn persisted_state_rejects_layout_with_wrong_slot_membership() {
 #[test]
 fn persisted_state_rejects_zero_weight_slots() {
     let mut state = Workspaces::default().state();
-    state.slots[0].push(Slot {
+    state.slots[0].push(SavedSlot {
         id: SlotId(1),
         weight: 0,
         binding: BindingState::Bound(window(10)),
@@ -418,12 +412,12 @@ fn persisted_state_rejects_zero_weight_slots() {
 #[test]
 fn persisted_state_rejects_a_window_owned_by_multiple_workspaces() {
     let mut state = Workspaces::default().state();
-    state.slots[0].push(Slot {
+    state.slots[0].push(SavedSlot {
         id: SlotId(1),
         weight: 1,
         binding: BindingState::Bound(window(10)),
     });
-    state.slots[1].push(Slot {
+    state.slots[1].push(SavedSlot {
         id: SlotId(1),
         weight: 1,
         binding: BindingState::Unresolved {
@@ -446,7 +440,7 @@ fn persisted_state_rejects_a_window_owned_by_multiple_workspaces() {
 #[test]
 fn restoring_unresolved_state_restarts_its_settling_window() {
     let mut state = Workspaces::default().state();
-    state.slots[0].push(Slot {
+    state.slots[0].push(SavedSlot {
         id: SlotId(1),
         weight: 1,
         binding: BindingState::Unresolved {
@@ -531,11 +525,10 @@ fn moving_preserves_the_logical_slot() {
     let window = window(10);
     let slot = Slot {
         id: SlotId(7),
-        weight: 3,
         binding: BindingState::Bound(window.clone()),
     };
     workspaces.engine_mut(WorkspaceId::ONE).insert_slot(slot);
-    workspaces.set_fullscreen_layout(WorkspaceId::ONE, true);
+    workspaces.set_deck(WorkspaceId::ONE, crate::workspace::DeckMode::Monocle);
 
     assert_eq!(
         workspaces.move_window(&window, WorkspaceId::new(3).unwrap()),
@@ -549,13 +542,13 @@ fn moving_preserves_the_logical_slot() {
             .slots
             .is_empty()
     );
-    assert!(!workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(!workspaces.deck(WorkspaceId::ONE).is_monocle());
     let moved = &workspaces
         .engine(WorkspaceId::new(3).unwrap())
         .model()
         .workspace
         .slots[0];
-    assert_eq!((moved.id, moved.weight), (SlotId(7), 3));
+    assert_eq!(moved.id, SlotId(7));
     assert_eq!(moved.bound_window(), Some(&window));
 }
 
@@ -598,13 +591,11 @@ fn moving_into_a_populated_workspace_avoids_slot_id_collisions() {
     let existing = window(20);
     workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Bound(source.clone()),
     });
     let target = WorkspaceId::new(2).unwrap();
     workspaces.engine_mut(target).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Bound(existing),
     });
 
@@ -619,4 +610,87 @@ fn moving_into_a_populated_workspace_avoids_slot_id_collisions() {
         .collect();
     assert_eq!(ids.len(), 2);
     workspaces.engine(target).model().validate().unwrap();
+}
+
+#[test]
+fn hand_pins_persist_for_floating_windows_and_rule_pins_do_not() {
+    let note = window(30);
+    let ruled = window(31);
+    let mut workspaces = Workspaces::default();
+    assert!(!workspaces.pin(note.clone()), "only a float can be pinned");
+    workspaces.own_floating(note.clone(), WorkspaceId::TWO);
+    workspaces.own_floating(ruled.clone(), WorkspaceId::ONE);
+    assert!(workspaces.pin(note.clone()));
+    workspaces.set_rule_pinned(&ruled, true);
+    assert!(workspaces.is_pinned(&ruled));
+
+    let state = workspaces.state();
+    state.validate().unwrap();
+    assert_eq!(state.pinned, vec![note.clone()]);
+    let json = serde_json::to_string(&state).unwrap();
+    let mut restored = Workspaces::default();
+    restored.restore(serde_json::from_str(&json).unwrap());
+    assert!(restored.is_pinned_by_hand(&note));
+    assert!(!restored.is_pinned(&ruled));
+
+    // Tiling or forgetting the float drops its pin.
+    restored.forget_floating(&note);
+    assert!(!restored.is_pinned(&note));
+    assert!(restored.state().pinned.is_empty());
+
+    let mut orphaned = state;
+    orphaned.floating.clear();
+    assert_eq!(
+        orphaned.validate().err().as_deref(),
+        Some("pinned window is not floating")
+    );
+    // State with no pins (as written before pins existed) has no `pinned` key and still loads.
+    let older = serde_json::to_string(&Workspaces::default().state()).unwrap();
+    assert!(!older.contains("pinned"), "{older}");
+    let older: WorkspaceState = serde_json::from_str(&older).unwrap();
+    older.validate().unwrap();
+}
+
+#[test]
+fn workspace_steps_stop_at_either_end_of_the_list() {
+    let id = |number| WorkspaceId::new(number).unwrap();
+    let listed = [id(1), id(3), id(5)];
+    assert_eq!(WorkspaceStep::Next.target(&listed, id(1)), Some(id(3)));
+    assert_eq!(WorkspaceStep::Next.target(&listed, id(3)), Some(id(5)));
+    assert_eq!(WorkspaceStep::Next.target(&listed, id(5)), None);
+    assert_eq!(WorkspaceStep::Prev.target(&listed, id(5)), Some(id(3)));
+    assert_eq!(WorkspaceStep::Prev.target(&listed, id(1)), None);
+    assert_eq!(WorkspaceStep::Next.target(&listed, id(2)), None);
+    assert_eq!(WorkspaceStep::parse("next"), Some(WorkspaceStep::Next));
+    assert_eq!(WorkspaceStep::parse("prev"), Some(WorkspaceStep::Prev));
+    assert_eq!(WorkspaceStep::parse("previous"), None);
+}
+
+#[test]
+fn pinned_floats_do_not_place_their_app_on_a_workspace() {
+    let pinned = window(40);
+    let mut workspaces = Workspaces::default();
+    workspaces.own_floating(pinned.clone(), WorkspaceId::TWO);
+    assert_eq!(
+        workspaces.workspace_for_app(&pinned.app),
+        Some(WorkspaceId::TWO)
+    );
+    // A pinned window shows on every workspace, so activating its app never
+    // follows it to its home workspace (#465).
+    workspaces.set_rule_pinned(&pinned, true);
+    assert_eq!(workspaces.workspace_for_app(&pinned.app), None);
+
+    // The app's other, unpinned windows still place it.
+    let tiled = PhysicalWindowId {
+        window_id: 41,
+        ..pinned.clone()
+    };
+    workspaces.engine_mut(WorkspaceId::SIX).insert_slot(Slot {
+        id: SlotId(1),
+        binding: BindingState::Bound(tiled),
+    });
+    assert_eq!(
+        workspaces.workspace_for_app(&pinned.app),
+        Some(WorkspaceId::SIX)
+    );
 }

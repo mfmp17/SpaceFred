@@ -166,6 +166,35 @@ pub const WORKSPACE_ACTIONS: &[Action] = &[
     ),
 ];
 
+/// The Workspace Steps Lab's shortcuts, listed while `[labs] workspace_steps` is on. None has
+/// a built-in chord.
+pub const WORKSPACE_STEP_ACTIONS: &[Action] = &[
+    action(
+        "switch-next",
+        "Step to next workspace on display",
+        "switch next",
+        None,
+    ),
+    action(
+        "switch-prev",
+        "Step to previous workspace on display",
+        "switch prev",
+        None,
+    ),
+    action(
+        "move-next",
+        "Move window to next workspace on display",
+        "move next",
+        None,
+    ),
+    action(
+        "move-prev",
+        "Move window to previous workspace on display",
+        "move prev",
+        None,
+    ),
+];
+
 pub const LAYOUT_ACTIONS: &[Action] = &[
     action(
         "focus-next",
@@ -230,6 +259,7 @@ pub fn all() -> impl Iterator<Item = &'static Action> {
     SWITCH_SPACES
         .iter()
         .chain(WORKSPACE_ACTIONS)
+        .chain(WORKSPACE_STEP_ACTIONS)
         .chain(LAYOUT_ACTIONS)
 }
 
@@ -342,7 +372,7 @@ fn sentence(description: &str) -> String {
 pub const PRESETS: [(&str, Modifiers); 3] = [
     ("⌥ Option", Modifiers::OPTION),
     (
-        "⌃⌥ Control",
+        "⌃⌥ Control-Option",
         Modifiers {
             command: false,
             control: true,
@@ -448,6 +478,42 @@ mod tests {
             "Show or hide the scratchpad"
         );
         assert_eq!(occupant(&defaults, &[], chord("alt+\\")), None);
+    }
+
+    #[test]
+    fn workspace_steps_have_no_built_in_chord_and_name_their_bindings() {
+        for action in WORKSPACE_STEP_ACTIONS {
+            assert_eq!(action.default, None, "{}", action.id);
+        }
+        let bound = parse("\"ctrl+alt+n\" = \"switch next\"");
+        let switch_next = find("switch-next").unwrap();
+        assert_eq!(
+            occupant(&bound, &[], chord("ctrl+alt+n")),
+            Some(Occupant::Action(switch_next))
+        );
+        assert_eq!(switch_next.chords(&bound, &[]), [chord("ctrl+alt+n")]);
+        // Option+Tab's row is "Previous workspace": no step row may read like it, or like
+        // another row.
+        let back_and_forth = find("back-and-forth").unwrap().title;
+        for action in WORKSPACE_STEP_ACTIONS {
+            assert!(action.title.ends_with(" on display"), "{}", action.title);
+            assert!(
+                !action.title.eq_ignore_ascii_case(back_and_forth)
+                    && !action.title.starts_with(back_and_forth),
+                "{}",
+                action.title
+            );
+            assert_eq!(
+                all().filter(|other| other.title == action.title).count(),
+                1,
+                "{}",
+                action.title
+            );
+        }
+        assert_eq!(
+            find("switch-prev").unwrap().title,
+            "Step to previous workspace on display"
+        );
     }
 
     #[test]

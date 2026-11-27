@@ -36,17 +36,30 @@ This file is the current engineering contract. README and `docs/` describe curre
 - `agent/`, `src/app.rs`, `src/app/app_loop.rs`, `src/app/app_loop/`, `src/app/worker.rs`,
   `src/app/bridge.rs`: single-process Rune host (`spaceman-agent`), owner-only capped logging, 25 ms
   `NSTimer` foreground pump, action queue, status, restore-before-exit coordination, in-process
-  Settings window (`General`, `Layout`, `Rules`, `Workspaces`, `Shortcuts`, `Activity`), first-run onboarding
-  tour (`agent/src/onboarding.rs`), non-activating Workspace HUD overlay (`agent/src/hud.rs`),
+  Settings window (`General`, `Layout`, `Rules`, `Workspaces`, `Shortcuts`, `Activity`, `Labs`), first-run onboarding
+  tour (`agent/src/onboarding.rs`, `agent/src/onboarding/`), non-activating Workspace HUD overlay (`agent/src/hud.rs`),
   Playground (`⇧⌘D` / `--playground`), and the worker boundary.
+- `agent/src/controls.rs`, `agent/src/controls/`, `agent/src/design_tokens.rs`: the Settings design
+  system — layout tokens (`METRICS`, `WINDOW`, `MODAL`, `KEYS`), `Paint` type roles, cards and
+  rows, `modal_panel`, shortcut keycaps, and the ratchet test that keeps hand-typed measurements
+  out of the panes. Rules, tables and how to render scenes: [docs/design-system.md](docs/design-system.md).
 - `src/app/runtime.rs`, `src/app/cycle.rs`, `src/app/cycle/affinity.rs`, `src/app/switching.rs`,
   `src/app/parking.rs`, `src/app/commands.rs`, `src/app/backend.rs`: the worker-thread
-  `WorkspaceRuntime` — observation cycles and affinity, workspace switches, durable
-  parking/restoration, focused-window commands, and the native/persistence backend seam. Tests live
-  in `src/app/tests.rs` and `src/app/tests/`.
-- `src/window_memory.rs`, `src/app/memory.rs`: advisory, title-free per-bundle placement memory and
-  relaunch recall. `src/journal.rs`, `src/journal/doctor.rs`, `src/app/journal.rs`: bounded
-  arrangement/anomaly journal and the `spaceman doctor` summary.
+  `WorkspaceRuntime` — observation cycles and affinity (new windows bound for another workspace
+  join it in `src/app/cycle/routing.rs` before any display reconciles), workspace switches, durable
+  parking/restoration, focused-window commands, and the native/persistence/clock backend seam.
+  `src/app/parking/table.rs` is the one record per parked window (recovery frame, its display,
+  settle/restore/summon phase, display re-park epoch) plus parking exemptions; parking reads time
+  only through `WorkspaceBackend::now`, which tests step. Tests live in `src/app/tests.rs` and
+  `src/app/tests/`.
+- `src/onboarding_plan.rs`, `src/app/arrange.rs`, `src/app/app_loop/setup.rs`: the setup tour's
+  suggested arrangement — a pure, title-free classifier over the open windows (bundle ID, Launch
+  Services category, size, resizability, display width), and the worker's one-shot move of those
+  windows, its inventory, and its undo. It never writes a `route` rule.
+- `src/window_memory.rs`, `src/app/memory.rs`: advisory per-bundle placement memory and relaunch
+  recall (storing local `title` and `AXDocument` in mode-`0600` `window-memory.json`).
+  `src/journal.rs`, `src/journal/doctor.rs`, `src/app/journal.rs`: bounded arrangement/anomaly
+  journal and the `spaceman doctor` summary.
 - `src/app/input.rs`: bounded ordered user input and geometry-based gesture tracking, independent
   of preview-worker availability. Main-thread pointer sampling must not make synchronous AX calls.
 - `src/status_item.rs`, `src/login_item.rs`, `src/termination.rs`: main-thread
@@ -61,9 +74,13 @@ This file is the current engineering contract. README and `docs/` describe curre
   and conservative physical-window reconciliation.
 - `src/workspace.rs`, `src/runtime.rs`, `src/layout_tree.rs`, `src/layout_tree/`, `src/navigation.rs`:
   ten default numbered workspaces, opt-in named workspaces A-Z, ownership, nested weighted layouts,
-  directional operations, and persistence representation.
-- `src/config.rs`, `src/serde_map.rs`: strict version-1 TOML parsing, first-match window disposition,
-  state-path selection, and deterministic persisted-map serialization.
+  directional operations, and persistence representation. `src/workspace/residency.rs` holds each
+  untiled window's one `Residency` (floating with its cause and pins, or Scratchpad); tiles live in
+  the engines, and the two never overlap.
+- `src/config.rs`, `src/config/disposition.rs`, `src/defaults.rs`, `src/serde_map.rs`: strict version-1
+  TOML parsing, window disposition as a left-biased `DispositionPatch` (first matching rule over
+  built-in default over window traits), state-path selection, and deterministic persisted-map
+  serialization.
 - `src/control.rs`, `src/main.rs`: mode-`0600` local Unix control protocol, CLI, dry-run/live probes,
   fixture replay, and HUD.
 - `src/motion.rs`, `src/macos/display_link.rs`, `src/macos/presenter.rs`: the motion engine's
@@ -110,9 +127,11 @@ This file is the current engineering contract. README and `docs/` describe curre
 ## Privacy And Security Invariants
 
 - Accessibility is used only for window observation, focus, movement, resizing, and required input/
-  display context. Never require SIP to be disabled.
-- Window titles may be used for matching in memory but must never enter persistence, serialized
-  snapshots, debug output, HUD output, fixtures, logs, or control responses.
+  display context, plus pressing the focused app's own "Move Tab to New Window" menu item when the
+  user runs `move-tab`. Never require SIP to be disabled.
+- Window titles and `AXDocument` paths may be stored locally in mode-`0600` `window-memory.json`
+  solely for matching multi-window apps across restarts, and must never enter logs, `spaceman
+  doctor`, debug output, HUD output, fixtures, serialized snapshots, or control responses.
 - No telemetry, network access, or update checks without explicit product and security review.
   The updater (`src/updater.rs`) is the one reviewed network path: release builds only, the
   release service's manifest and `files/` only, nothing about the install beyond the User-Agent.
@@ -154,6 +173,9 @@ This file is the current engineering contract. README and `docs/` describe curre
 scripts/check            # fmt, file-size, folder-shape, metadata, clippy, tests, audit, CA roots, replay, config, website
 scripts/check --no-web   # the same without the website
 ```
+
+A Settings UI change also renders its scenes before and after with `scripts/snap-set.sh` (see
+[docs/design-system.md](docs/design-system.md#verification)); look at every image.
 
 Run `./scripts/live-ghostty-tabs.sh` and `./scripts/live-workspaces.sh` only when the change reaches
 their live behavior, AeroSpace is initially enabled, and the other safety conditions above are

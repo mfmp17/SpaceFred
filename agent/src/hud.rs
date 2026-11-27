@@ -29,32 +29,34 @@ use rune::{
 };
 use spaceman::{
     WorkspaceId,
-    app::{UiHudDisplay, UiHudEvent},
+    app::{UiHudDisplay, UiHudEvent, UiHudToast},
     config::{HudPosition, HudStyle},
 };
 
 use flow::FRESH_MS;
 #[cfg(test)]
-use flow::{HOLD_MS, RESUME_HOLD_MS};
+use flow::{HOLD_MS, RESUME_HOLD_MS, TOAST_HOLD_MS};
 pub use flow::{HudFlow, HudTick, HudTransition, LEAVE_MS};
+pub use icons::{MARKER_INSET, MARKER_RADIUS};
 pub use menu::HudSink;
 #[cfg(target_os = "macos")]
 pub use menu::LiveHudSink;
 #[cfg(test)]
 use menu::NoopHudSink;
-pub use pill::Icons;
-pub(crate) use stage::{HudPreview, SCENES, stage, triggers};
+pub use pill::{Icons, PILL_HEIGHT};
+pub(crate) use pill::{rgba, srgb};
+pub(crate) use stage::{HudPreview, SCENES, miniature, stage, triggers};
 
 use crate::{apps, controls::Paint};
 
 /// While a panel is up, how often it checks its display is still connected.
 const DISPLAY_CHECK_MS: u64 = 250;
-/// Only the first show fades the panel itself over 150 ms: nothing has been drawn to enter from yet.
-const FIRST_FADE: Duration = Duration::from_millis(150);
+/// Only the first show fades the panel itself over 100 ms: nothing has been drawn to enter from yet.
+const FIRST_FADE: Duration = Duration::from_millis(100);
 /// Subsequent reveals use a brief fade (>= 33 ms) instead of `show()` so AppKit marks the
 /// panel visible before Rune's occlusion check runs, avoiding its 250 ms retry
 /// (anomalyco/rune#1714) while letting the capsule's own entry spring carry the motion.
-const REVEAL_FADE: Duration = Duration::from_millis(40);
+const REVEAL_FADE: Duration = Duration::from_millis(33);
 /// Room on every side of the capsule for its shadow, which the panel's edge would cut, and
 /// for ten or so workspaces before the row scrolls.
 const OVERLAY_SIZE: (f32, f32) = (860.0, pill::PILL_HEIGHT + 2.0 * pill::SHADOW_REACH);
@@ -140,12 +142,16 @@ impl HudOverlay {
         }
     }
 
+    fn clear_hover(&mut self) {
+        self.hovered_app = None;
+        self.hovered_workspace = None;
+    }
+
     pub(super) fn set_hovered(&mut self, inside: bool, tx: &mut Tx) {
         let now_ms = self.now_ms();
         self.flow.set_hovered(inside, now_ms);
         if !inside && !self.flow.is_held() {
-            self.hovered_app = None;
-            self.hovered_workspace = None;
+            self.clear_hover();
         }
         self.schedule_wake(now_ms, tx);
     }
@@ -189,13 +195,15 @@ impl HudOverlay {
             .cloned()
             .unwrap_or_else(|| apps::fallback_name(bundle));
         let current = self.sink.app_place(bundle);
-        let popup = menu::build_app_menu(&app_name, workspace, current);
+        let floats_by_default = spaceman::defaults::floats_by_default(bundle);
+        let popup = menu::build_app_menu(&app_name, workspace, current, floats_by_default);
         self.flow.set_menu_open(true, now_ms);
         let bundle_id = bundle.to_owned();
         tx.popup_menu(popup, at, move |overlay: &mut HudOverlay, picked, tx| {
             let close_ms = overlay.now_ms();
             if let Some(picked) = picked
-                && let Some(new_place) = menu::resolve_app_menu_pick(picked, workspace, current)
+                && let Some(new_place) =
+                    menu::resolve_app_menu_pick(picked, workspace, current, floats_by_default)
             {
                 drop(overlay.sink.set_app_place(&bundle_id, new_place));
             }
@@ -208,9 +216,11 @@ impl HudOverlay {
         if !self.flow.is_up() {
             return;
         }
+        let Some(row) = self.flow.current() else {
+            return;
+        };
         let target = self.hovered_app.clone().or_else(|| {
             let workspace = self.hovered_workspace?;
-            let row = self.flow.current()?;
             let entry = row
                 .workspaces
                 .iter()
@@ -362,11 +372,61 @@ impl HudDriver {
         }
     }
 
+    /// Shows a brief non-activating status toast (~2.5 s) on the primary display, even when
+    /// the Workspace HUD is turned off.
+    pub fn trigger_toast(&self, toast: UiHudToast) {
+        let reduce_motion = reduce_motion();
+        let Ok(mut panels) = self.panels.lock() else {
+            return;
+        };
+        for panel in panels.panels.iter_mut().skip(1) {
+            panel.display = None;
+            panel.handle.update_if(|overlay, _| {
+                overlay.flow.dismiss();
+                overlay.clear_hover();
+                if let Some(handle) = &overlay.handle {
+                    handle.hide();
+                }
+                false
+            });
+        }
+        let Some(panel) = panels.panels.first_mut() else {
+            return;
+        };
+        panel.display = None;
+        panel.handle.update_if(move |overlay, tx| {
+            if let Some(handle) = &overlay.handle {
+                handle.set_display(DisplayTarget::Primary);
+            }
+            overlay.display = None;
+            overlay.clear_hover();
+            let now_ms = overlay.now_ms();
+            let handle = overlay.handle.clone();
+            match overlay.flow.trigger_toast(toast, now_ms) {
+                HudTransition::Ignored => return false,
+                HudTransition::Show if overlay.primed => {
+                    if let Some(handle) = handle {
+                        handle.fade_in(REVEAL_FADE);
+                    }
+                }
+                HudTransition::Show => {
+                    overlay.primed = true;
+                    if let Some(handle) = handle {
+                        handle.fade_in(FIRST_FADE);
+                    }
+                }
+                HudTransition::Update => {}
+            }
+            overlay.reduce_motion = reduce_motion;
+            overlay.schedule_wake(now_ms, tx);
+            true
+        });
+    }
+
     pub fn set_enabled(&self, enabled: bool) {
         self.each(move |overlay, tx| {
-            let left = overlay
-                .flow
-                .set_enabled(enabled, spaceman::journal::unix_millis());
+            let now_ms = overlay.now_ms();
+            let left = overlay.flow.set_enabled(enabled, now_ms);
             if left {
                 tx.wake_after(Duration::from_millis(LEAVE_MS));
             }
@@ -408,24 +468,18 @@ impl HudDriver {
 impl Panels {
     /// Every app in `event`: its cached icon (when installed) and display name, looked up once.
     fn metadata_for(&mut self, event: &UiHudEvent) -> (Icons, HashMap<String, String>) {
-        let mut icons = Icons::new();
-        let mut names = HashMap::new();
-        for workspace in event.displays.iter().flat_map(|row| &row.workspaces) {
-            let tiles = workspace
-                .tiles
-                .iter()
-                .filter_map(|tile| tile.bundle.as_ref());
-            for bundle in tiles.chain(&workspace.floating) {
-                if !names.contains_key(bundle) {
-                    let app = self.apps.get(bundle);
-                    names.insert(bundle.clone(), app.name);
-                    if let Some(pixels) = app.icon {
-                        icons.insert(bundle.clone(), pixels);
-                    }
-                }
-            }
-        }
-        (icons, names)
+        let bundles = event
+            .displays
+            .iter()
+            .flat_map(|row| &row.workspaces)
+            .flat_map(|workspace| {
+                let tiles = workspace
+                    .tiles
+                    .iter()
+                    .filter_map(|tile| tile.bundle.as_ref());
+                tiles.chain(&workspace.floating)
+            });
+        self.apps.icons_and_names(bundles)
     }
 
     /// Gives each display in `rows` a panel, and hides the panels of displays it leaves out.
@@ -440,6 +494,7 @@ impl Panels {
             if panel.display.is_some() && panel.display != display {
                 panel.handle.update_if(|overlay, _| {
                     overlay.flow.dismiss();
+                    overlay.clear_hover();
                     if let Some(handle) = &overlay.handle {
                         handle.hide();
                     }
@@ -476,27 +531,27 @@ const fn native(id: u32) -> DisplayTarget {
 }
 
 #[cfg(target_os = "macos")]
-fn display_ids() -> std::collections::HashMap<String, u32> {
+pub(crate) fn display_ids() -> std::collections::HashMap<String, u32> {
     spaceman::macos::display_ids()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn display_ids() -> std::collections::HashMap<String, u32> {
+pub(crate) fn display_ids() -> std::collections::HashMap<String, u32> {
     std::collections::HashMap::new()
 }
 
 #[cfg(target_os = "macos")]
-fn reduce_motion() -> bool {
+pub(crate) fn reduce_motion() -> bool {
     objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn reduce_motion() -> bool {
+pub(crate) fn reduce_motion() -> bool {
     false
 }
 
 fn overlay_poll(overlay: &mut HudOverlay, _clock: f64, tx: &mut Tx) -> bool {
-    let now_ms = spaceman::journal::unix_millis();
+    let now_ms = overlay.now_ms();
     if overlay.flow.is_up()
         && let Some(display) = overlay.display
         && !display_ids().values().any(|id| *id == display)
@@ -504,6 +559,7 @@ fn overlay_poll(overlay: &mut HudOverlay, _clock: f64, tx: &mut Tx) -> bool {
         // Its display went away: Rune would move the panel to the main display, over that
         // display's own capsule.
         overlay.flow.dismiss();
+        overlay.clear_hover();
         if let Some(handle) = &overlay.handle {
             handle.hide();
         }
@@ -511,8 +567,7 @@ fn overlay_poll(overlay: &mut HudOverlay, _clock: f64, tx: &mut Tx) -> bool {
     }
     let tick = overlay.flow.tick(now_ms);
     if tick == HudTick::Gone {
-        overlay.hovered_app = None;
-        overlay.hovered_workspace = None;
+        overlay.clear_hover();
         if let Some(handle) = &overlay.handle {
             handle.hide();
         }
@@ -526,9 +581,12 @@ fn overlay_view(overlay: &HudOverlay, cx: &mut Cx<HudOverlay>) -> El {
         cx.reduced_motion(true);
     }
     let p = Paint::new(true, cx.env().scale);
+    let still = cx.is_reduced_motion();
     overlay.flow.mark_drawn();
-    row().key("hud-root").w_full().h_full().center().children(
-        overlay.flow.view(cx.is_reduced_motion()).map(|view| {
+    let content = overlay
+        .flow
+        .view(still)
+        .map(|view| {
             pill::interactive_slot(
                 &view,
                 overlay.position,
@@ -537,6 +595,17 @@ fn overlay_view(overlay: &HudOverlay, cx: &mut Cx<HudOverlay>) -> El {
                 OVERLAY_SIZE.0,
                 p,
             )
-        }),
-    )
+        })
+        .or_else(|| {
+            overlay
+                .flow
+                .toast_view(still)
+                .map(|view| pill::toast_slot(&view, overlay.position, p))
+        });
+    row()
+        .key("hud-root")
+        .w_full()
+        .h_full()
+        .center()
+        .children(content)
 }

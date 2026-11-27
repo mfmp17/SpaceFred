@@ -45,7 +45,7 @@ fn toggling_a_tiled_window_floats_it_and_retiles_the_rest() {
         runtime.workspaces.floating_workspace_of(&floated),
         Some(WorkspaceId::ONE)
     );
-    assert!(runtime.manual_floating.contains(&floated));
+    assert!(runtime.workspaces.is_manual_float(&floated));
     assert_eq!(
         runtime.workspaces.engine(WorkspaceId::ONE).bound_windows(),
         vec![window(20)]
@@ -88,6 +88,47 @@ fn a_floating_window_survives_later_cycles_without_being_retiled() {
     );
     assert_eq!(runtime.backend.frames[&floated], original);
     assert_eq!(runtime.backend.frames[&window(20)], outputs().main().frame);
+}
+
+fn debug_parked_frame(
+    debug: &RuntimeDebug,
+    floating: &crate::PhysicalWindowId,
+) -> serde_json::Value {
+    let debug = serde_json::to_value(debug).unwrap();
+    let id = serde_json::to_value(floating).unwrap();
+    debug["floating"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["window"] == id)
+        .expect("the float is listed")["parked_original_frame"]
+        .clone()
+}
+
+#[test]
+fn pause_reports_debug_without_the_restored_floats_recovery_frame() {
+    // #548: paused `debug` kept the last tiling snapshot, so a float Pause had
+    // put back still showed its parked recovery frame.
+    let mut runtime = two_tiled_windows();
+    let cancelled = AtomicBool::new(false);
+    let floated = window(10);
+    runtime.toggle_float(outputs(), &cancelled).unwrap();
+    runtime
+        .switch(WorkspaceId::TWO, outputs(), &cancelled)
+        .unwrap();
+    let parked = runtime.debug_state(&outputs());
+    assert!(!debug_parked_frame(&parked, &floated).is_null());
+
+    let Some(WorkerResult::Restored {
+        failed: 0,
+        debug: Some(debug),
+    }) = runtime.execute(WorkerCommand::RestoreAll(Some(outputs())), &cancelled)
+    else {
+        panic!("expected a restore carrying debug state");
+    };
+
+    assert!(runtime.parked.is_empty());
+    assert!(debug_parked_frame(&debug, &floated).is_null());
 }
 
 #[test]
@@ -142,7 +183,7 @@ fn toggling_a_floating_window_tiles_it_again() {
         Some(WorkspaceId::ONE)
     );
     assert_eq!(runtime.workspaces.floating_workspace_of(&tiled), None);
-    assert!(!runtime.manual_floating.contains(&tiled));
+    assert!(!runtime.workspaces.is_manual_float(&tiled));
 
     let bound = runtime.workspaces.engine(WorkspaceId::ONE).bound_windows();
     assert_eq!(bound.len(), 2);
@@ -211,7 +252,7 @@ action = 'float'",
         Some(WorkspaceId::ONE)
     );
     assert!(
-        !runtime.manual_floating.contains(&floating),
+        !runtime.workspaces.is_manual_float(&floating),
         "a rule-floated window is not a manual float"
     );
 }
@@ -279,7 +320,7 @@ fn workspace_layout_commands_accept_a_focused_floating_window() {
     runtime
         .toggle_fullscreen_layout(outputs(), &cancelled)
         .unwrap();
-    assert!(runtime.workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(runtime.workspaces.deck(WorkspaceId::ONE).is_monocle());
     assert_ne!(
         runtime.workspaces.preferred_focus(WorkspaceId::ONE),
         Some(dialog.clone()),
@@ -290,14 +331,14 @@ fn workspace_layout_commands_accept_a_focused_floating_window() {
     runtime
         .toggle_fullscreen_layout(outputs(), &cancelled)
         .unwrap();
-    assert!(!runtime.workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(!runtime.workspaces.deck(WorkspaceId::ONE).is_monocle());
 
     runtime
         .toggle_fullscreen_layout(outputs(), &cancelled)
         .unwrap();
     let axis = runtime.workspaces.engine(WorkspaceId::ONE).root_axis();
     runtime.toggle_layout(outputs(), &cancelled).unwrap();
-    assert!(!runtime.workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(!runtime.workspaces.deck(WorkspaceId::ONE).is_monocle());
     assert_ne!(
         runtime.workspaces.engine(WorkspaceId::ONE).root_axis(),
         axis
@@ -380,4 +421,149 @@ fn floats_only_workspace_refocuses_the_float_that_had_focus_before_leaving() {
         .switch(WorkspaceId::ONE, outputs(), &cancelled)
         .unwrap();
     assert_eq!(runtime.backend.focused, Some(second));
+}
+
+/// #527: workspace 1 on Main and 6 on Secondary, both on screen. Focus sits
+/// on workspace 6's float, whose tile is remembered from an earlier visit.
+fn float_focused_beside_a_visible_workspace() -> (
+    WorkspaceRuntime<FakeBackend>,
+    crate::PhysicalWindowId,
+    crate::PhysicalWindowId,
+) {
+    let (main, tile, floating) = (window(10), window(20), window(30));
+    let mut backend = FakeBackend {
+        focused: Some(main.clone()),
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(main.clone(), frame(50));
+    backend.frames.insert(tile.clone(), frame(1050));
+    backend.frames.insert(floating.clone(), frame(1100));
+    let mut runtime = runtime(backend);
+    bind(&mut runtime, WorkspaceId::ONE, &main);
+    bind(&mut runtime, WorkspaceId::SIX, &tile);
+    runtime
+        .workspaces
+        .own_floating(floating.clone(), WorkspaceId::SIX);
+    let cancelled = AtomicBool::new(false);
+
+    runtime
+        .switch(WorkspaceId::ONE, outputs(), &cancelled)
+        .unwrap();
+    runtime
+        .switch(WorkspaceId::SIX, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(tile.clone()));
+    // Seed the tile memory as an earlier hide/show of workspace 6 would.
+    runtime.workspaces.remember_focus(WorkspaceId::SIX, &tile);
+    assert_eq!(
+        runtime.workspaces.preferred_focus(WorkspaceId::SIX),
+        Some(tile)
+    );
+    assert_eq!(
+        runtime.workspaces.preferred_float_focus(WorkspaceId::SIX),
+        None
+    );
+    // Option+Backtick moved focus to the float.
+    runtime.backend.focused = Some(floating.clone());
+    (runtime, main, floating)
+}
+
+fn assert_both_workspaces_stayed(runtime: &WorkspaceRuntime<FakeBackend>) {
+    assert_eq!(
+        runtime.workspaces.active_for(&DisplaySelector::Secondary),
+        Some(WorkspaceId::SIX)
+    );
+    assert_eq!(
+        runtime.workspaces.active_for(&DisplaySelector::Main),
+        Some(WorkspaceId::ONE)
+    );
+}
+
+/// #527: Option+Tab away from a float to a workspace already on another
+/// display, then back, refocuses that float rather than the remembered tile.
+#[test]
+fn visible_back_and_forth_returns_to_the_float_it_left() {
+    let (mut runtime, main, floating) = float_focused_beside_a_visible_workspace();
+    let cancelled = AtomicBool::new(false);
+
+    runtime
+        .workspace_back_and_forth(outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(main));
+    runtime
+        .workspace_back_and_forth(outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(floating));
+    assert_both_workspaces_stayed(&runtime);
+}
+
+/// #527: the same round trip through the workspace shortcuts of two visible
+/// workspaces (Option+1, then Option+6) also comes back to the float.
+#[test]
+fn visible_workspace_shortcuts_return_to_the_float_they_left() {
+    let (mut runtime, main, floating) = float_focused_beside_a_visible_workspace();
+    let cancelled = AtomicBool::new(false);
+
+    runtime
+        .switch(WorkspaceId::ONE, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(main));
+    runtime
+        .switch(WorkspaceId::SIX, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(floating));
+    assert_both_workspaces_stayed(&runtime);
+}
+
+/// #639: directional focus from the float to the other display's workspace,
+/// then Option+Tab back, refocuses that float rather than the remembered tile.
+#[test]
+fn directional_focus_then_back_and_forth_returns_to_the_float_it_left() {
+    let (mut runtime, main, floating) = float_focused_beside_a_visible_workspace();
+    let cancelled = AtomicBool::new(false);
+
+    runtime
+        .focus_relative(Direction::Left, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(main));
+    runtime
+        .workspace_back_and_forth(outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(floating));
+    assert_both_workspaces_stayed(&runtime);
+}
+
+/// #633: the remembered float of a workspace still on screen was minimized
+/// (⌘M) or its app hidden (⌘H) after focus left it. Its shortcut focuses the
+/// workspace's tile and leaves the float set aside.
+#[test]
+fn visible_workspace_shortcut_skips_a_minimized_remembered_float() {
+    let (mut runtime, main, floating) = float_focused_beside_a_visible_workspace();
+    let tile = runtime
+        .workspaces
+        .preferred_focus(WorkspaceId::SIX)
+        .unwrap();
+    let cancelled = AtomicBool::new(false);
+
+    runtime
+        .switch(WorkspaceId::ONE, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(main));
+    assert_eq!(
+        runtime.workspaces.preferred_float_focus(WorkspaceId::SIX),
+        Some(floating.clone())
+    );
+    runtime.backend.set_aside.insert(floating.clone());
+    runtime.backend.ordered_out.insert(floating.window_id);
+    runtime.backend.calls.clear();
+
+    runtime
+        .switch(WorkspaceId::SIX, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(runtime.backend.focused, Some(tile));
+    assert!(runtime.backend.calls.iter().all(|call| !matches!(
+        call,
+        BackendCall::Focus(window) | BackendCall::Raise(window) if window == &floating
+    )));
+    assert_both_workspaces_stayed(&runtime);
 }

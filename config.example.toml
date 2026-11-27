@@ -10,13 +10,31 @@ version = 1
 hud = true
 hud_style = "icons"
 hud_position = "bottom"
+# How new windows split the workspace: "dwindle" (default, binary space partition along each
+# tile's longer side) or "columns" (side-by-side siblings).
+layout = "dwindle"
 update_channel = "stable"
-# Move the mouse pointer on explicit keyboard/ctl focus changes: "off" (default),
-# "display" (only when focus lands on another display), or "window" (every focus change).
+# Whether explicit keyboard/ctl focus actions move the mouse pointer: "off" (default) leaves
+# it alone, "display" warps it when it is not on the target's display, and "window" warps it
+# when it is outside the newly focused window (on an empty target workspace, the display).
 # mouse_follows_focus = "off"
+# Whether a three-finger horizontal swipe steps through workspaces (default: true). Read only
+# with [labs] swipe_switch = true; then false makes Spaceman ignore the gesture for macOS.
+# trackpad_swipe = true
+# How the menu bar icon looks: "full" (default) draws a glyph for each display, "compact"
+# one glyph for the focused workspace, and "off" hides it (open Spaceman again for Settings).
+# Read only with [labs] menu_bar_icon_style = true.
+# menu_bar_icon = "full"
+# Automatically pause tiling (and restore windows) when only a built-in laptop display is
+# connected, and resume automatically when an external display reconnects (default: false).
+# Desktop Macs with no built-in display are never auto-paused.
+pause_on_builtin_display = false
 # Center a window that is alone on its display (or in Fullscreen Layout) at this width;
 # 0 (the default) lets it fill the display. 320 through 16384 points.
 single_window_max_width = 0
+# The same for its height, read only with [labs] single_window_height = true; with both,
+# the window is centered on both axes. 0 (the default) or 320 through 16384 points.
+single_window_max_height = 0
 # The order the Workspace HUD, the menu bar menu and three-finger swipes list workspaces in.
 # Listed workspaces come first; the rest follow as 1-10, then A-Z. It never enables a letter.
 # workspace_order = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"]
@@ -33,11 +51,27 @@ outer = 0
 # right = 0
 
 # Rules are optional, ordered, and first-match wins. Every matcher present in a
-# rule must match exactly. Valid actions are "float", "tile", "route", and
-# "ignore". "tile" tiles a window Spaceman would otherwise float as a dialog.
+# rule must match: bundle_id and title exactly, title_contains as a
+# case-insensitive part of the title. Valid actions are "float", "pin",
+# "tile", "route", and "ignore". "tile" tiles a window Spaceman would otherwise
+# float as a dialog or a built-in floating utility; "pin" floats a window and
+# shows it on every workspace.
+#
+# Without a rule, a short list of utilities (Stickies, Calculator, System
+# Settings, 1Password and others in src/defaults.rs) floats at its own size.
 [[rules]]
-bundle_id = "com.apple.systempreferences"
-action = "float"
+bundle_id = "com.apple.Stickies"
+action = "tile"
+
+[[rules]]
+bundle_id = "pl.maketheweb.cleanshotx"
+action = "pin"
+
+[[rules]]
+bundle_id = "com.apple.Safari"
+title_contains = "Work —"
+action = "route"
+workspace = 3
 
 # Applications that insist on positioning their own windows are best ignored:
 # never tiled, never owned by a workspace, never moved or parked.
@@ -54,6 +88,8 @@ action = "float"
 bundle_id = "com.tinyspeck.slackmacgap"
 action = "route"
 workspace = 2
+# windows = "all" routes every new Slack window here, not only the first one;
+# read only with [labs] route_all_windows = true.
 
 # Named workspaces A-Z are opt-in. Configuring one registers Option+letter to
 # switch and Option+Shift+letter to move the focused window there.
@@ -93,6 +129,55 @@ monitor = "main"
 # Labs are experimental features, each off by default. scratchpad = true adds an
 # i3/sway-style Scratchpad: Option+Shift+\ hides the focused window in it and
 # Option+\ summons it centred on the focused display (or hides it again).
+# activity = true adds Settings › Activity, the live arrangement log and
+# doctor diagnostics; with it off the pane stays out of Settings.
+# portrait_edge_rows = true makes the top and bottom edges of a display taller
+# than it is wide drop targets: drag a tiled window there for a half-height row.
+# physical_displays = true lists the menu bar's workspaces and the menu's
+# display sections left to right, draws a portrait display's glyph and HUD
+# Layouts previews tall, and tells same-named displays apart ("left", "right").
+# recent_focus = true makes Option+H/J/K/L go to the most recently focused of
+# several tiles bordering the focused one on that side, so pressing one way and
+# back returns where you were.
+# swipe_switch = true lets settings.trackpad_swipe turn the three-finger swipe
+# off, and adds its switch to Settings › Shortcuts. Settings › Labs has a switch
+# for each.
+# empty_workspace_focus = true makes an empty workspace chosen on another display
+# the focused one for commands such as Option+Shift+Tab, until another window
+# takes focus.
+# float_follows_display = true makes a floating window dragged to another
+# display join the workspace showing there, as a dragged tile already does.
+# workspace_steps = true turns on "switch next|prev" and "move next|prev [--follow]",
+# which step through the focused display's workspaces (bind them under
+# [shortcuts.bindings]; none has a built-in chord).
+# four_finger_swipe = true makes the workspace swipe take four fingers instead of
+# three (for Accessibility "Three Finger Drag"), leaving three-finger swipes to
+# macOS.
+# single_window_height = true makes settings.single_window_max_height cap a lone
+# window's height too, and adds its row to Settings › Layout › Wide displays.
+# route_all_windows = true makes a route rule with windows = "all" send every new
+# window of its app to its workspace, not only the first one.
+# menu_bar_icon_style = true makes Spaceman read settings.menu_bar_icon, and adds
+# its picker to Settings › General.
+# focus_follows_mouse = true focuses the tile the pointer comes to rest on,
+# without a click; floats, the Scratchpad and the menu bar are never hovered.
+# window_overlay = true shows a card over every visible window while Option+Shift
+# is held on its own: float, pin, Fullscreen Layout, swap and send-to-workspace
+# buttons that act on that window without focusing it.
 #
 # [labs]
 # scratchpad = false
+# activity = false
+# portrait_edge_rows = false
+# physical_displays = false
+# recent_focus = false
+# swipe_switch = false
+# empty_workspace_focus = false
+# float_follows_display = false
+# workspace_steps = false
+# four_finger_swipe = false
+# single_window_height = false
+# route_all_windows = false
+# menu_bar_icon_style = false
+# focus_follows_mouse = false
+# window_overlay = false

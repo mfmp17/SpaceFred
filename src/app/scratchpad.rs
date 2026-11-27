@@ -10,6 +10,7 @@
 use super::parking::RESTORE_CONFIRM_TOLERANCE;
 use super::*;
 use crate::scratchpad::{ScratchpadCommand, summon_frame};
+use crate::workspace::FloatCause;
 
 const LAB_OFF: &str = "Scratchpad is off (set [labs] scratchpad = true in config.toml)";
 
@@ -38,7 +39,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let window = self
             .current_focus()
             .ok_or("Focused window is unavailable")?;
-        if let Some(entry) = self.scratchpad.entry(&window) {
+        if let Some(entry) = self.workspaces.scratchpad().entry(&window) {
             return match entry.shown_on {
                 Some(workspace) => {
                     self.release_from_scratchpad(window, workspace, outputs, cancelled)
@@ -50,14 +51,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             // A window observed for the first time may not be bound yet.
             self.cycle(outputs.clone(), cancelled)?;
         }
-        let workspace = self
+        let home = self
             .workspaces
             .workspace_of_any(&window)
             .ok_or("Focused window is not managed by SpaceFred")?;
+        // A pin shows on whichever workspace its display shows, which need not be its home, and
+        // stays on screen through every park, so it hides from there without its pin (#659).
+        let pinned = self.workspaces.is_pinned(&window);
+        let workspace = if pinned {
+            let visible = self.visible_workspaces(&outputs);
+            self.shown_workspace_for(&window, &visible, &outputs)
+                .ok_or("Focused window is not on an active workspace")?
+                .workspace
+        } else {
+            home
+        };
         if !self.is_visible(workspace, &outputs) {
             return Err("Focused window is not on an active workspace".into());
         }
-        if self.parking_exempt.contains(&window) {
+        if self.parked.is_exempt(&window) {
             return Err(
                 "Focused window keeps moving itself back on screen, so it cannot be hidden".into(),
             );
@@ -71,18 +83,32 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let output = output_for(&self.workspaces, workspace, &outputs);
         // Parked while its workspace still owns it: the recovery frame is durable before the
         // window leaves the screen, and a crash before ownership changes restores it in place.
+        let canvas = self.layout_settings(output).canvas();
+        // The Scratchpad drops a float's record, pin included, once it is hidden. A rule pin
+        // is judged again on the next observation; only a hand pin needs putting back.
+        let pinned_by_hand = pinned && self.workspaces.unpin(&window);
+        if pinned {
+            self.workspaces.set_rule_pinned(&window, false);
+            self.workspaces.own_floating(window.clone(), workspace);
+        }
         match self.park_window(&window, output, &outputs) {
             macos::ApplyOutcome::Applied if self.parked.contains_key(&window) => {}
             macos::ApplyOutcome::Gone => {
-                self.forget_window(workspace, &window);
+                self.forget_window_on(workspace, &window, canvas);
                 return Err("Focused window has closed".into());
             }
-            _ => return Err("Focused window could not be moved off-screen".into()),
+            _ => {
+                if pinned {
+                    self.workspaces.own_floating(window.clone(), home);
+                }
+                if pinned_by_hand {
+                    self.workspaces.pin(window);
+                }
+                return Err("Focused window could not be moved off-screen".into());
+            }
         }
-        self.forget_window(workspace, &window);
-        // Forgetting drops parking bookkeeping, but the park still has to settle.
-        self.recently_parked.insert(window.clone(), Instant::now());
-        self.scratchpad.insert(window.clone(), size);
+        self.forget_window_on(workspace, &window, canvas);
+        self.workspaces.stash(window.clone(), size);
         log_event!("scratchpad: hid {window:?} from workspace {workspace}");
         let layout = self.layout_workspace(workspace, output, cancelled);
         self.persist_workspace_state_if_changed()?;
@@ -90,7 +116,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         Ok(self.status(layout.failed, &outputs))
     }
 
-    /// A shown scratchpad window leaves the scratchpad and joins the tiles of its display.
+    /// A shown scratchpad window leaves the scratchpad and joins the tiles of the workspace it
+    /// is shown on, or floats there when a rule or its size keeps it out of the tiles. One
+    /// residency transition: its route never applies, since it is not a new window (#414).
     fn release_from_scratchpad(
         &mut self,
         window: crate::PhysicalWindowId,
@@ -98,17 +126,16 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
-        self.scratchpad.remove(&window);
-        self.manual_floating.remove(&window);
-        self.workspaces.forget_floating(&window);
+        // A summon still landing becomes an ordinary restore.
+        self.parked.cancel_summon(&window);
         log_event!("scratchpad: released {window:?} on workspace {workspace}");
-        // Reconciliation adopts an observed window it does not own, exactly as it adopts a new one.
-        let result = self.cycle(outputs, cancelled);
-        if self.workspaces.workspace_of_any(&window).is_none() {
-            self.workspaces.own_floating(window, workspace);
+        if self.keeps_floating(&window, &outputs).is_some() {
+            self.workspaces
+                .float(window, workspace, FloatCause::Automatic);
             self.persist_workspace_state_if_changed()?;
+            return Ok(self.status(0, &outputs));
         }
-        result
+        self.tile_in_place(window, workspace, &outputs, cancelled)
     }
 
     /// Hide the scratchpad window shown on the focused display's workspace, or summon the next one.
@@ -117,23 +144,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: &macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
-        if self.scratchpad.is_empty() {
+        let scratchpad = self.workspaces.scratchpad();
+        if scratchpad.is_empty() {
             return Err("Scratchpad is empty".into());
         }
         let target = self.scratchpad_target(outputs)?;
-        let shown = self.scratchpad.shown_on(target.workspace);
+        let shown = scratchpad.shown_on(target.workspace);
         if !shown.is_empty() {
             return self.hide_scratchpad(&shown, &target, outputs);
         }
-        let window = self
-            .scratchpad
+        let window = scratchpad
             .next_for(target.workspace)
             .ok_or("Scratchpad is empty")?;
         self.summon_scratchpad(window, &target, outputs, cancelled)
     }
 
-    /// The visible workspace a toggle acts on: the focused window's, else the display it is on,
-    /// else the last focused workspace, else the main display's.
+    /// The visible workspace a toggle acts on: the one showing on the display the
+    /// focused float (pinned or not, #556/#652) or unmanaged window sits on, else the
+    /// focused window's own workspace (a shown Scratchpad window's is the one it was
+    /// summoned onto), else the last focused workspace, else the main display's.
     fn scratchpad_target(
         &mut self,
         outputs: &macos::DisplayOutputs,
@@ -143,39 +172,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .into_iter()
             .filter(|resolved| self.scope.manages_selector(&resolved.selector))
             .collect();
-        let find = |workspace: Option<WorkspaceId>| {
-            workspace.and_then(|workspace| {
-                visible
-                    .iter()
-                    .find(|resolved| resolved.workspace == workspace)
-            })
-        };
-        let focused = self.current_focus();
-        if let Some(resolved) = find(
-            focused
-                .as_ref()
-                .and_then(|window| self.workspaces.workspace_of_any(window)),
-        ) {
-            return Ok(resolved.clone());
-        }
-        let frame = focused
-            .as_ref()
-            .and_then(|window| self.backend.window_server_frame(window));
-        frame
-            .and_then(|frame| {
-                visible
-                    .iter()
-                    .find(|resolved| resolved.output.contains_center(frame))
-            })
-            .or_else(|| find(self.last_focused_workspace))
-            .or_else(|| {
-                visible
-                    .iter()
-                    .find(|resolved| resolved.display_id == outputs.main().id)
-            })
-            .or_else(|| visible.first())
-            .cloned()
-            .ok_or_else(|| "No active workspace is available".into())
+        self.focused_visible_workspace(&visible, outputs)
+            .map(|(resolved, _)| resolved)
     }
 
     fn summon_scratchpad(
@@ -185,17 +183,20 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: &macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
-        let size = self.scratchpad.entry(&window).and_then(|entry| entry.size);
+        let size = self
+            .workspaces
+            .scratchpad()
+            .entry(&window)
+            .and_then(|entry| entry.size);
         let frame = summon_frame(target.output, size);
-        let recovery = self.parked.get(&window).copied();
-        match self.write_restore_position(&window, frame) {
+        let recovery = self.parked.record(&window).cloned();
+        let expected = self.restore_target(frame);
+        match self.write_restore_position(&window, expected) {
             macos::ApplyOutcome::Applied => {}
             macos::ApplyOutcome::Gone => {
                 log_event!("scratchpad: {window:?} closed while hidden");
-                self.scratchpad.remove(&window);
-                if let Some(recovery) = recovery {
-                    self.persist_removals_or_rollback(vec![(window, recovery)]);
-                }
+                self.leave_scratchpad(&window);
+                self.persist_removals_or_rollback(recovery.map(|recovery| (window, recovery)));
                 return self.toggle_scratchpad(outputs, cancelled);
             }
             _ => return Err("Scratchpad window could not be shown".into()),
@@ -211,15 +212,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             &settings,
             cancelled,
         ));
-        self.workspaces
-            .own_floating(window.clone(), target.workspace);
-        self.manual_floating.insert(window.clone());
-        self.scratchpad.mark_shown(&window, target.workspace);
+        self.workspaces.show_scratchpad(&window, target.workspace);
         // Like any restore, the recovery frame is retired only once the window server
         // confirms the window arrived at its centered summon frame; until then its owner's
         // cycles confirm or retry the centered destination rather than the former tile frame.
-        if let Some(recovery) = recovery {
-            let expected = self.restore_target(frame);
+        if self.parked.contains_key(&window) {
             if self
                 .backend
                 .window_server_frame(&window)
@@ -227,12 +224,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     actual.position_approximately_equals(expected, RESTORE_CONFIRM_TOLERANCE)
                 })
             {
-                self.scratchpad.set_pending_summon(&window, None);
-                self.commit_unparked(&window);
-                self.persist_removals_or_rollback(vec![(window.clone(), recovery)]);
+                let record = self.commit_unparked(&window);
+                self.persist_removals_or_rollback(record.map(|record| (window.clone(), record)));
             } else {
-                self.scratchpad.set_pending_summon(&window, Some(frame));
-                self.recently_parked.insert(window.clone(), Instant::now());
+                self.parked
+                    .summon_written(&window, frame, self.backend.now());
             }
         }
         if !self.focus_scratchpad_target(&window, &[]) {
@@ -253,7 +249,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// the stale pre-summon tile recovery frame before moving the float to another
     /// workspace so its floating position is preserved (#304).
     pub(super) fn settle_pending_summon_for_move(&mut self, window: &crate::PhysicalWindowId) {
-        let Some(summon) = self.scratchpad.pending_summon(window) else {
+        let Some(summon) = self.parked.summon_destination(window) else {
             return;
         };
         let expected = self.restore_target(summon);
@@ -273,49 +269,38 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         target: crate::Rect,
         retry_throttled: bool,
     ) -> macos::ApplyOutcome {
-        let Some(&recovery) = self.parked.get(window) else {
-            self.scratchpad.set_pending_summon(window, None);
+        let Some(recovery) = self.parked.record(window).cloned() else {
             return macos::ApplyOutcome::Applied;
         };
         let target = self.restore_target(target);
-        if self
-            .backend
-            .window_server_frame(window)
-            .is_some_and(|actual| {
-                actual.position_approximately_equals(target, RESTORE_CONFIRM_TOLERANCE)
-            })
-        {
-            self.scratchpad.set_pending_summon(window, None);
-            self.commit_unparked(window);
-            self.persist_removals_or_rollback(vec![(window.clone(), recovery)]);
+        let arrived = |runtime: &mut Self| {
+            runtime
+                .backend
+                .window_server_frame(window)
+                .is_some_and(|actual| {
+                    actual.position_approximately_equals(target, RESTORE_CONFIRM_TOLERANCE)
+                })
+        };
+        let outcome = if arrived(self) {
+            macos::ApplyOutcome::Applied
+        } else if retry_throttled {
             return macos::ApplyOutcome::Applied;
-        }
-        if retry_throttled {
-            return macos::ApplyOutcome::Applied;
-        }
-        let outcome = self.write_restore_position(window, target);
-        match outcome {
-            macos::ApplyOutcome::Applied => {
-                if self
-                    .backend
-                    .window_server_frame(window)
-                    .is_some_and(|actual| {
-                        actual.position_approximately_equals(target, RESTORE_CONFIRM_TOLERANCE)
-                    })
-                {
-                    self.scratchpad.set_pending_summon(window, None);
-                    self.commit_unparked(window);
-                    self.persist_removals_or_rollback(vec![(window.clone(), recovery)]);
-                } else {
-                    self.recently_parked.insert(window.clone(), Instant::now());
+        } else {
+            // Applied keeps the summon pending (and throttles the next retry)
+            // until the window server confirms the window arrived.
+            match self.write_restore_position(window, target) {
+                macos::ApplyOutcome::Applied if !arrived(self) => {
+                    return macos::ApplyOutcome::Applied;
                 }
+                outcome => outcome,
             }
-            macos::ApplyOutcome::Gone => {
-                self.scratchpad.set_pending_summon(window, None);
-                self.commit_unparked(window);
-                self.persist_removals_or_rollback(vec![(window.clone(), recovery)]);
-            }
-            _ => {}
+        };
+        if matches!(
+            outcome,
+            macos::ApplyOutcome::Applied | macos::ApplyOutcome::Gone
+        ) {
+            let _: Option<ParkRecord> = self.commit_unparked(window);
+            self.persist_removals_or_rollback([(window.clone(), recovery)]);
         }
         outcome
     }
@@ -334,7 +319,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 .ok()
                 .map(|frame| (frame.width, frame.height));
             match self.park_scratchpad_window(window, target.output, outputs) {
-                macos::ApplyOutcome::Applied => self.scratchpad.mark_hidden(window, size),
+                macos::ApplyOutcome::Applied => self.workspaces.hide_scratchpad(window, size),
                 macos::ApplyOutcome::Gone => {}
                 _ => failed += 1,
             }
@@ -344,8 +329,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         Ok(self.status(failed, outputs))
     }
 
-    /// Park a shown scratchpad window and release its floating ownership. A closed window
-    /// leaves the scratchpad (`Gone`); any other failure leaves it shown.
+    /// Park a shown scratchpad window; the caller then hides it. A closed window leaves the
+    /// scratchpad (`Gone`); any other failure leaves it shown.
     fn park_scratchpad_window(
         &mut self,
         window: &crate::PhysicalWindowId,
@@ -354,7 +339,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     ) -> macos::ApplyOutcome {
         let displays: Vec<_> = outputs.frames().collect();
         let already_hidden = self.parked.contains_key(window)
-            && self.scratchpad.pending_summon(window).is_none()
+            && self.parked.summon_destination(window).is_none()
             && self
                 .backend
                 .window_server_frame(window)
@@ -363,19 +348,28 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             match self.park_window(window, output, outputs) {
                 macos::ApplyOutcome::Applied if self.parked.contains_key(window) => {}
                 macos::ApplyOutcome::Gone => {
-                    self.scratchpad.remove(window);
+                    self.leave_scratchpad(window);
                     self.workspaces.forget_floating(window);
-                    self.manual_floating.remove(window);
                     return macos::ApplyOutcome::Gone;
                 }
                 macos::ApplyOutcome::Applied => return macos::ApplyOutcome::Unavailable,
                 outcome => return outcome,
             }
         }
-        self.workspaces.forget_floating(window);
-        self.manual_floating.remove(window);
         log_event!("scratchpad: hid {window:?}");
         macos::ApplyOutcome::Applied
+    }
+
+    /// `window` left the scratchpad; a summon still landing becomes an ordinary restore.
+    pub(super) fn leave_scratchpad(&mut self, window: &crate::PhysicalWindowId) {
+        self.workspaces.leave_scratchpad(window);
+        self.parked.cancel_summon(window);
+    }
+
+    pub(super) fn clear_scratchpad(&mut self) {
+        for window in self.workspaces.clear_scratchpad() {
+            self.parked.cancel_summon(&window);
+        }
     }
 
     /// Hand focus back to the workspace's tiles once a scratchpad window leaves the screen.
@@ -396,11 +390,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 log_event!("scratchpad: could not focus {target:?} on workspace {workspace}");
             }
         } else {
-            self.pending_focus = None;
+            self.focus.end_request();
         }
     }
 
-    /// Requests focus on `target` and records it in `pending_focus` so immediate
+    /// Requests focus on `target` and records the request so immediate
     /// follow-up commands address `target` while Accessibility still reports the
     /// previous or just-hidden window.
     fn focus_scratchpad_target(
@@ -409,38 +403,22 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         extra_stale: &[crate::PhysicalWindowId],
     ) -> bool {
         let reported = self.backend.focused_window();
-        let mut stale = self.take_pending_focus_stale();
-        stale.retain(|window| window.as_ref() != Some(target));
-        if reported.as_ref() != Some(target) && !stale.contains(&reported) {
-            stale.push(reported);
-        }
-        for hidden in extra_stale {
-            let entry = Some(hidden.clone());
-            if hidden != target && !stale.contains(&entry) {
-                stale.push(entry);
-            }
-        }
-        if !self.backend.focus_window(target) {
-            return false;
-        }
-        self.pending_focus = Some(super::commands::PendingFocus {
-            target: target.clone(),
-            stale,
-            at: Instant::now(),
-        });
-        true
+        let hidden = extra_stale.iter().cloned().map(Some);
+        self.request_focus(target, std::iter::once(reported).chain(hidden))
     }
 
     /// After every worker command: hide windows whose workspace was switched away (i3 keeps them
-    /// hidden until summoned again), prune windows that closed or left by other means, and bring
-    /// everything back when the Lab is turned off.
+    /// hidden until summoned again), let go of hidden windows that closed or came back on screen
+    /// by other means, and bring everything back when the Lab is turned off. A window that
+    /// closed, tiled, or moved while shown already left the scratchpad with its residency.
     pub(super) fn sync_scratchpad(&mut self, outputs: &macos::DisplayOutputs) {
-        if self.scratchpad.is_empty() {
+        let scratchpad = self.workspaces.scratchpad();
+        if scratchpad.is_empty() {
             return;
         }
         if !self.config.labs().scratchpad {
-            let hidden = self.scratchpad.hidden();
-            self.scratchpad.clear();
+            let hidden = scratchpad.hidden();
+            self.clear_scratchpad();
             log_event!("scratchpad: Lab off; restoring {} window(s)", hidden.len());
             self.restore_windows(hidden);
             return;
@@ -450,18 +428,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .into_iter()
             .map(|resolved| resolved.workspace)
             .collect();
-        let entries: Vec<_> = self.scratchpad.entries().cloned().collect();
         let mut closed = Vec::new();
         let mut hid = false;
-        for entry in entries {
-            let window = entry.window;
+        for entry in scratchpad.entries() {
+            let window = &entry.window;
             match entry.shown_on {
-                // Closed, tiled again, or moved to another workspace: it left the scratchpad.
-                Some(workspace)
-                    if self.workspaces.floating_workspace_of(&window) != Some(workspace) =>
-                {
-                    self.scratchpad.remove(&window);
-                }
                 Some(workspace) if visible.contains(&workspace) => {}
                 Some(workspace) => {
                     let output = output_for(&self.workspaces, workspace, outputs);
@@ -470,36 +441,35 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     // `self.parked` still holds the pre-summon tile recovery frame (#258).
                     let size = self
                         .backend
-                        .frame(&window)
+                        .frame(window)
                         .ok()
-                        .or(entry.pending_summon)
-                        .or_else(|| self.parked.get(&window).copied())
+                        .or_else(|| self.parked.summon_destination(window))
+                        .or_else(|| self.parked.get(window).copied())
                         .map(|frame| (frame.width, frame.height));
-                    if self.park_scratchpad_window(&window, output, outputs)
+                    if self.park_scratchpad_window(window, output, outputs)
                         == macos::ApplyOutcome::Applied
                     {
-                        self.scratchpad.mark_hidden(&window, size);
+                        self.workspaces.hide_scratchpad(window, size);
                         hid = true;
                     }
                 }
-                // Back on screen or owned by other means (healed, recovered): an ordinary window.
-                None if !self.parked.contains_key(&window)
-                    || self.workspaces.workspace_of_any(&window).is_some() =>
-                {
-                    self.scratchpad.remove(&window);
-                }
+                // Back on screen by other means (healed, recovered): an ordinary window.
+                None if !self.parked.contains_key(window) => self.leave_scratchpad(window),
                 None => {
                     if self.backend.is_process_running(&window.app)
-                        && self.backend.window_server_frame(&window).is_some()
+                        && (self.backend.window_server_frame(window).is_some()
+                            || !matches!(
+                                self.backend.frame(window),
+                                Err(macos::WindowAccessError::Gone)
+                            ))
                     {
                         continue;
                     }
                     log_event!("scratchpad: {window:?} closed while hidden");
-                    if let Some(frame) = self.parked.get(&window).copied() {
-                        self.commit_unparked(&window);
-                        closed.push((window.clone(), frame));
+                    if let Some(record) = self.commit_unparked(window) {
+                        closed.push((window.clone(), record));
                     }
-                    self.scratchpad.remove(&window);
+                    self.leave_scratchpad(window);
                 }
             }
         }

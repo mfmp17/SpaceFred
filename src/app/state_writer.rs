@@ -28,15 +28,22 @@ struct Shared {
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
+struct PendingWrite {
+    bytes: Vec<u8>,
+    label: &'static str,
+    owner_only: bool,
+}
+
 struct FailedWrite {
     bytes: Vec<u8>,
     label: &'static str,
+    owner_only: bool,
     attempt: u64,
 }
 
 #[derive(Default)]
 struct Queue {
-    pending: BTreeMap<PathBuf, (Vec<u8>, &'static str)>,
+    pending: BTreeMap<PathBuf, PendingWrite>,
     failed: BTreeMap<PathBuf, FailedWrite>,
     attempts: u64,
     writing: bool,
@@ -54,9 +61,11 @@ impl Queue {
         let mut requeued = false;
         for path in paths {
             if let Some(entry) = self.failed.remove(&path) {
-                self.pending
-                    .entry(path)
-                    .or_insert((entry.bytes, entry.label));
+                self.pending.entry(path).or_insert(PendingWrite {
+                    bytes: entry.bytes,
+                    label: entry.label,
+                    owner_only: entry.owner_only,
+                });
                 requeued = true;
             }
         }
@@ -82,11 +91,20 @@ impl StateWriter {
     }
 
     pub(super) fn write(&self, path: PathBuf, bytes: Vec<u8>, label: &'static str) {
+        self.enqueue(path, bytes, label, false);
+    }
+
+    /// Like [`Self::write`], but writes the file atomically with mode `0600`.
+    pub(super) fn write_owner_only(&self, path: PathBuf, bytes: Vec<u8>, label: &'static str) {
+        self.enqueue(path, bytes, label, true);
+    }
+
+    fn enqueue(&self, path: PathBuf, bytes: Vec<u8>, label: &'static str, owner_only: bool) {
         if !self.threaded {
             let mut queue = self.shared.lock();
             queue.attempts += 1;
             let attempt = queue.attempts;
-            if write(&path, &bytes, label) {
+            if write(&path, &bytes, label, owner_only) {
                 queue.failed.remove(&path);
             } else {
                 queue.failed.insert(
@@ -94,6 +112,7 @@ impl StateWriter {
                     FailedWrite {
                         bytes,
                         label,
+                        owner_only,
                         attempt,
                     },
                 );
@@ -102,7 +121,14 @@ impl StateWriter {
         }
         let mut queue = self.shared.lock();
         queue.failed.remove(&path);
-        queue.pending.insert(path, (bytes, label));
+        queue.pending.insert(
+            path,
+            PendingWrite {
+                bytes,
+                label,
+                owner_only,
+            },
+        );
         drop(queue);
         self.shared.changed.notify_all();
     }
@@ -117,7 +143,7 @@ impl StateWriter {
             for (path, entry) in failed {
                 queue.attempts += 1;
                 let attempt = queue.attempts;
-                if !write(&path, &entry.bytes, entry.label) {
+                if !write(&path, &entry.bytes, entry.label, entry.owner_only) {
                     queue.failed.insert(path, FailedWrite { attempt, ..entry });
                 }
             }
@@ -164,7 +190,15 @@ fn run(shared: &Shared) {
     let mut retry_delay = RETRY_BASE;
     let mut next_retry: Option<Instant> = None;
     loop {
-        let Some((path, (bytes, label))) = queue.pending.pop_first() else {
+        let Some((
+            path,
+            PendingWrite {
+                bytes,
+                label,
+                owner_only,
+            },
+        )) = queue.pending.pop_first()
+        else {
             if queue.closed {
                 return;
             }
@@ -196,7 +230,7 @@ fn run(shared: &Shared) {
         let attempt = queue.attempts;
         queue.writing = true;
         drop(queue);
-        let ok = write(&path, &bytes, label);
+        let ok = write(&path, &bytes, label, owner_only);
         queue = shared.lock();
         queue.writing = false;
         if ok {
@@ -208,6 +242,7 @@ fn run(shared: &Shared) {
                 FailedWrite {
                     bytes,
                     label,
+                    owner_only,
                     attempt,
                 },
             );
@@ -216,9 +251,14 @@ fn run(shared: &Shared) {
     }
 }
 
-fn write(path: &Path, bytes: &[u8], label: &str) -> bool {
+fn write(path: &Path, bytes: &[u8], label: &str, owner_only: bool) -> bool {
     let started = Instant::now();
-    let ok = match crate::state_file::write_atomic(path, bytes) {
+    let result = if owner_only {
+        crate::state_file::write_atomic_owner_only(path, bytes)
+    } else {
+        crate::state_file::write_atomic(path, bytes)
+    };
+    let ok = match result {
         Ok(()) => true,
         Err(error) => {
             log_event!("failed to write {label} state: {error}");
@@ -322,6 +362,37 @@ mod tests {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(writer.flush(timeout));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "latest");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn owner_only_writes_set_mode_0600_including_after_retry() {
+        let directory = temp_dir("owner-only");
+        let path = directory.join("window-memory.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let writer = StateWriter::spawn();
+        let timeout = Duration::from_secs(2);
+        writer.write_owner_only(path.clone(), b"first".to_vec(), "window memory");
+        assert!(writer.flush(timeout));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        writer.write_owner_only(path.clone(), b"retried".to_vec(), "window memory");
+        assert!(!writer.flush(timeout));
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(writer.flush(timeout));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "retried");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

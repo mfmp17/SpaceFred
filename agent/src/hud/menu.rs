@@ -1,5 +1,6 @@
-//! Interactive HUD actions, per-app Float/Pin context menus, and the macOS secondary-click
-//! bridge for non-activating overlay panels.
+//! Interactive HUD actions, the per-app context menu (Float or Tile, Pin on all workspaces,
+//! Always open on a workspace), and the macOS secondary-click bridge for non-activating overlay
+//! panels.
 
 use rune::{PopupItem, PopupMenu};
 use spaceman::WorkspaceId;
@@ -7,8 +8,12 @@ use spaceman::WorkspaceId;
 use crate::rules::Place;
 
 pub const ID_TOGGLE_FLOAT: &str = "toggle-float";
+/// The `pin` action: floating, and shown on every workspace.
 pub const ID_TOGGLE_PIN: &str = "toggle-pin";
-pub const ID_UNPIN_OTHER: &str = "unpin-other";
+/// A `route` rule to the workspace that was right-clicked.
+pub const ID_TOGGLE_ROUTE: &str = "toggle-route";
+/// The checked `route` rule to another workspace; picking it removes the rule.
+pub const ID_CLEAR_ROUTE: &str = "clear-route";
 
 /// Side effects triggered by an interactive HUD overlay: switching workspaces and reading or
 /// editing per-app `config.toml` rules.
@@ -79,80 +84,80 @@ impl HudSink for LiveHudSink {
     }
 }
 
-/// Builds the compact native context menu for right-clicking an app icon inside a HUD slot.
+/// Whether `bundle_id`'s windows float: by its own rule, else by Spaceman's built-in default. A
+/// `route` rule only says where windows open, so a built-in float still floats there.
+fn floats(current: Option<Place>, floats_by_default: bool) -> bool {
+    match current {
+        Some(Place::Float | Place::Pin) => true,
+        Some(Place::Tile | Place::Ignore) => false,
+        Some(Place::Workspace(_)) | None => floats_by_default,
+    }
+}
+
+/// Builds the native context menu for right-clicking an app icon inside a HUD slot. Two groups,
+/// each editing the app's one rule in config.toml: how its windows sit (tiled, floating, or
+/// pinned on every workspace), then where its new windows open. "Pin" only ever means the
+/// `pin` action; a `route` rule reads "Always open … on Workspace N".
 #[must_use]
-pub fn build_app_menu(app_name: &str, workspace: WorkspaceId, current: Option<Place>) -> PopupMenu {
-    let float_item = if current == Some(Place::Float) {
+pub fn build_app_menu(
+    app_name: &str,
+    workspace: WorkspaceId,
+    current: Option<Place>,
+    floats_by_default: bool,
+) -> PopupMenu {
+    let float_item = if floats(current, floats_by_default) {
         PopupItem::new(ID_TOGGLE_FLOAT, format!("Tile {app_name}")).symbol("rectangle.split.2x1")
     } else {
         PopupItem::new(ID_TOGGLE_FLOAT, format!("Float {app_name}"))
             .symbol("rectangle.on.rectangle")
     };
-    let mut menu = PopupMenu::new().item(float_item);
-    match current {
-        Some(Place::Workspace(pinned)) if pinned == workspace => {
-            menu = menu.item(
-                PopupItem::new(
-                    ID_TOGGLE_PIN,
-                    format!("Unpin {app_name} from Workspace {workspace}"),
-                )
-                .symbol("pin.slash"),
-            );
-        }
-        Some(Place::Workspace(other)) => {
-            menu = menu
-                .item(
-                    PopupItem::new(
-                        ID_TOGGLE_PIN,
-                        format!("Pin {app_name} to Workspace {workspace}"),
-                    )
-                    .symbol("pin"),
-                )
-                .item(
-                    PopupItem::new(
-                        ID_UNPIN_OTHER,
-                        format!("Unpin {app_name} from Workspace {other}"),
-                    )
-                    .symbol("pin.slash"),
-                );
-        }
-        _ => {
-            menu = menu.item(
-                PopupItem::new(
-                    ID_TOGGLE_PIN,
-                    format!("Pin {app_name} to Workspace {workspace}"),
-                )
-                .symbol("pin"),
-            );
-        }
+    let pin_item = if current == Some(Place::Pin) {
+        PopupItem::new(ID_TOGGLE_PIN, format!("Unpin {app_name}")).symbol("pin.slash")
+    } else {
+        PopupItem::new(ID_TOGGLE_PIN, format!("Pin {app_name} on all workspaces")).symbol("pin")
+    };
+    let route_item = |id: &str, home: WorkspaceId| {
+        PopupItem::new(id, format!("Always open {app_name} on Workspace {home}"))
+            .symbol("arrow.down.right.square")
+            .checked(current == Some(Place::Workspace(home)))
+    };
+    let mut menu = PopupMenu::new()
+        .item(float_item)
+        .item(pin_item)
+        .separator()
+        .item(route_item(ID_TOGGLE_ROUTE, workspace));
+    // A home on another workspace stays in the menu, checked: picking it removes the rule.
+    if let Some(Place::Workspace(other)) = current
+        && other != workspace
+    {
+        menu = menu.item(route_item(ID_CLEAR_ROUTE, other));
     }
     menu
 }
 
-/// Resolves a picked menu item ID into the new `Place` to write with `Doc::set_app_place`.
-/// Returns `None` if the pick ID is unrecognized.
+/// Resolves a picked menu item ID into the new `Place` to write with `Doc::set_app_place`
+/// (`Some(None)` removes the app's rule). Returns `None` if the pick ID is unrecognized.
 #[must_use]
 pub fn resolve_app_menu_pick(
     picked: &str,
     workspace: WorkspaceId,
     current: Option<Place>,
+    floats_by_default: bool,
 ) -> Option<Option<Place>> {
+    // Floating, the way this app floats with the fewest rules: a built-in float needs none.
+    let floating = (!floats_by_default).then_some(Place::Float);
     match picked {
-        ID_TOGGLE_FLOAT => {
-            if current == Some(Place::Float) {
-                Some(None)
-            } else {
-                Some(Some(Place::Float))
-            }
+        ID_TOGGLE_FLOAT if floats(current, floats_by_default) => {
+            // Tiling a built-in float takes a `tile` rule; any other app tiles with no rule.
+            Some(floats_by_default.then_some(Place::Tile))
         }
-        ID_TOGGLE_PIN => {
-            if current == Some(Place::Workspace(workspace)) {
-                Some(None)
-            } else {
-                Some(Some(Place::Workspace(workspace)))
-            }
-        }
-        ID_UNPIN_OTHER => Some(None),
+        ID_TOGGLE_FLOAT => Some(floating),
+        // Unpinning leaves the windows floating on the workspace they are on.
+        ID_TOGGLE_PIN if current == Some(Place::Pin) => Some(floating),
+        ID_TOGGLE_PIN => Some(Some(Place::Pin)),
+        ID_TOGGLE_ROUTE if current == Some(Place::Workspace(workspace)) => Some(None),
+        ID_TOGGLE_ROUTE => Some(Some(Place::Workspace(workspace))),
+        ID_CLEAR_ROUTE => Some(None),
         _ => None,
     }
 }

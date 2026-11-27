@@ -93,7 +93,7 @@ function Product() {
             Each new window takes a share of the screen and the others make room. Drag a window onto another to swap them, or drag an edge to resize the split.
           </Feature>
           <Feature title="Ten workspaces on the keyboard" demo={<WorkspacesDemo />}>
-            <Kbd>⌥1</Kbd> to <Kbd>⌥0</Kbd> switch workspaces. Add <Kbd>⇧</Kbd> to send the focused window to one without following it. A small bar shows each workspace's number and apps as you go.
+            <Kbd>⌥1</Kbd> to <Kbd>⌥0</Kbd> switch workspaces. Add <Kbd>⇧</Kbd> to send the focused window to one and stay where you are; if that workspace is already showing on another display, the window lands there and focus follows it. A small bar shows each workspace's number and apps as you go.
           </Feature>
           <Feature title="Rules for where apps go" demo={<RulesStill />}>
             Send an app to a workspace when it opens, or leave a window alone by its title. Rules are checked in order and the first match wins.

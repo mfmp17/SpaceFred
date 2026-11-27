@@ -120,6 +120,51 @@ fn anomalies_are_debounced_and_report_their_duration() {
 }
 
 #[test]
+fn still_open_anomaly_keeps_the_time_before_it_was_journaled() {
+    let mut tracker = AnomalyTracker::default();
+    let start = Instant::now();
+    let base = 100_000;
+    let misplaced = || vec![anomaly(AnomalyKind::Misplaced, 10)];
+    let mut lines = Vec::new();
+    for second in 0..=3 {
+        lines.extend(
+            tracker
+                .update(start + Duration::from_secs(second), misplaced())
+                .into_iter()
+                .map(|event| JournalLine {
+                    t: base + second * 1_000,
+                    event,
+                }),
+        );
+    }
+    assert_eq!(lines.len(), 1);
+
+    // Four seconds in, the episode is still open and must already report its full length.
+    let now = base + 4_000;
+    let open = Summary::new(&lines, 0, now);
+    let stats = &open.anomalies[&AnomalyKind::Misplaced];
+    assert_eq!((stats.count, stats.open), (1, 1));
+    assert_eq!(stats.longest_ms, 4_000);
+    assert!(
+        summarize(&lines, 0, now, 0).contains("longest      4s"),
+        "{}",
+        summarize(&lines, 0, now, 0)
+    );
+
+    // Ending it at that same instant gives the identical longest duration.
+    lines.extend(
+        tracker
+            .update(start + Duration::from_secs(4), Vec::new())
+            .into_iter()
+            .map(|event| JournalLine { t: now, event }),
+    );
+    let closed = Summary::new(&lines, 0, now);
+    let stats = &closed.anomalies[&AnomalyKind::Misplaced];
+    assert_eq!((stats.count, stats.open), (1, 0));
+    assert_eq!(stats.longest_ms, 4_000);
+}
+
+#[test]
 fn journal_rotates_and_reads_both_generations() {
     let directory = std::env::temp_dir().join(format!(
         "spaceman-journal-test-{}-{}",

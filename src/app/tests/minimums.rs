@@ -152,6 +152,7 @@ fn a_sibling_minimum_revealed_by_refitting_is_fitted_too() {
             ..frames[0]
         },
         &output,
+        &HashMap::new(),
     );
     engine.resize_window(
         &second,
@@ -161,6 +162,7 @@ fn a_sibling_minimum_revealed_by_refitting_is_fitted_too() {
             ..frames[1]
         },
         &output,
+        &HashMap::new(),
     );
     assert_eq!(
         tile_frames(&runtime)
@@ -188,7 +190,7 @@ fn fullscreen_layout_ignores_minimum_widths() {
     let mut runtime = tiled(&[(left.clone(), 0), (right.clone(), 600)]);
     runtime
         .workspaces
-        .set_fullscreen_layout(WorkspaceId::ONE, true);
+        .set_deck(WorkspaceId::ONE, crate::workspace::DeckMode::Monocle);
     let before = tile_frames(&runtime);
 
     runtime.layout_workspace(

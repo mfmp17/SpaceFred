@@ -68,9 +68,30 @@ fn bare_and_shift_only_keys_are_refused() {
 }
 
 #[test]
+fn keypad_keys_are_refused_rather_than_bound_to_their_main_key() {
+    let ctrl_alt = mods(true, true, false, false);
+    assert_eq!(us(K::NumpadEnter, ctrl_alt), Press::Refused(UNSUPPORTED));
+    // Even when the layout says the keypad key types `1`, it isn't the number row's `1`.
+    let typed = |key| (key == K::Numpad1).then_some('1');
+    assert_eq!(
+        press(K::Numpad1, ctrl_alt, typed),
+        Press::Refused(UNSUPPORTED)
+    );
+    assert_eq!(us(K::Enter, ctrl_alt), chord("ctrl+alt+return"));
+}
+
+#[test]
 fn escape_cancels_and_a_bare_delete_unbinds() {
     assert_eq!(us(K::Escape, Mods::default()), Press::Cancel);
-    assert_eq!(us(K::Escape, ALT), Press::Cancel);
+    assert_eq!(
+        us(K::Escape, mods(false, false, true, false)),
+        Press::Cancel
+    );
+    assert_eq!(us(K::Escape, ALT), chord("alt+escape"));
+    assert_eq!(
+        us(K::Escape, mods(true, true, false, false)),
+        chord("ctrl+alt+escape")
+    );
     assert_eq!(us(K::Backspace, Mods::default()), Press::Unbind);
     assert_eq!(
         us(K::Delete, mods(false, false, true, false)),
@@ -193,6 +214,29 @@ fn held_modifiers_show_and_clear_a_refusal() {
 }
 
 #[test]
+fn a_refusal_stays_while_a_two_modifier_chord_is_released() {
+    let mut ui = listening("focus-right");
+    let before = ui.doc.source();
+    let ctrl_alt = mods(true, true, false, false);
+    assert!(on_input(&mut ui, &PhysicalInput::Modifiers(ctrl_alt)));
+    record(&mut ui, "focus-right", us(K::NumpadEnter, ctrl_alt));
+    assert_eq!(message(&ui), Some(UNSUPPORTED));
+    // Control comes up first, leaving Option alone: still a bindable hold, but no new press.
+    assert!(on_input(&mut ui, &PhysicalInput::Modifiers(ALT)));
+    assert_eq!(message(&ui), Some(UNSUPPORTED));
+    assert!(on_input(
+        &mut ui,
+        &PhysicalInput::Modifiers(Mods::default())
+    ));
+    assert_eq!(message(&ui), Some(UNSUPPORTED));
+    assert_eq!(ui.shortcut_capture.listening(), Some("focus-right"));
+    assert_eq!(ui.doc.source(), before);
+    // Pressing a modifier again starts the next attempt.
+    assert!(on_input(&mut ui, &PhysicalInput::Modifiers(ALT)));
+    assert_eq!(message(&ui), None);
+}
+
+#[test]
 fn recording_refuses_an_enabled_named_workspace_chord_and_accepts_it_when_absent() {
     let mut ui = listening("balance");
     ui.doc = crate::rules::Doc::parse(
@@ -254,6 +298,38 @@ fn recording_refuses_an_enabled_named_workspace_chord_and_accepts_it_when_absent
             .binding(parse_chord("alt+a").unwrap()),
         Some(Some(&shortcuts::Command::Balance))
     );
+}
+
+#[test]
+fn a_workspace_enabled_after_startup_leaves_its_letter_with_the_running_built_in() {
+    let h = spaceman::WorkspaceId::named('H').unwrap();
+    let mut ui = listening("focus-right");
+    ui.doc = crate::rules::Doc::parse(
+        "version = 1\n[[workspaces]]\nworkspace = 'H'\nmonitor = 'main'\n",
+    );
+    // H was added after startup: Option+H still runs Focus left.
+    ui.agent = Some(spaceman::app::UiAgentSnapshot {
+        shortcut_workspaces: Some(Vec::new()),
+        ..Default::default()
+    });
+    let focus_left = catalog::find("focus-left").unwrap();
+    let named = running_named_workspaces(&ui);
+    assert!(named.is_empty());
+    assert_eq!(
+        focus_left.chords(&ui.doc.shortcuts(), &named),
+        vec![parse_chord("alt+h").unwrap()]
+    );
+    record(&mut ui, "focus-right", us(K::KeyH, ALT));
+    assert_eq!(message(&ui), Some("Used by Focus left"));
+
+    // H registered at startup keeps its letter.
+    ui.agent = Some(spaceman::app::UiAgentSnapshot {
+        shortcut_workspaces: Some(vec![h]),
+        ..Default::default()
+    });
+    assert_eq!(running_named_workspaces(&ui), vec![h]);
+    record(&mut ui, "focus-right", us(K::KeyH, ALT));
+    assert_eq!(message(&ui), Some("Used by Switch to workspace H"));
 }
 
 #[test]
@@ -324,7 +400,7 @@ fn a_cleared_shortcut_stays_cleared_after_its_old_chord_is_reused() {
             .collect::<Vec<_>>(),
         ["alt+h"]
     );
-    // Reset to Defaults restores every built-in shortcut.
+    // Reset to defaults restores every built-in shortcut.
     ui.doc.reset_shortcuts();
     assert!(!ui.doc.has_custom_shortcuts());
 }
@@ -351,4 +427,65 @@ fn control_an_unrelated_chord_changes_nothing() {
         ("balance", ctrl_cmd(K::KeyB)),
     ]);
     assert_eq!(chords, Vec::<String>::new());
+}
+
+/// What a US layout types with Shift on the keys these tests press.
+fn us_shifted(key: Key) -> Option<char> {
+    match key {
+        Key::Character('=') => Some('+'),
+        Key::Character('/') => Some('?'),
+        Key::Character('h') => Some('H'),
+        Key::Number(1) => Some('!'),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_shift_chord_bound_under_its_typed_character_is_refused() {
+    let mut ui = listening("focus-left");
+    ui.doc =
+        crate::rules::Doc::parse("version = 1\n[shortcuts.bindings]\n\"alt++\" = \"layout\"\n");
+    let before = ui.doc.source();
+    // Option+Shift+`=` types `+`: the same keys as `alt++`, which flips the split.
+    record_with(
+        &mut ui,
+        "focus-left",
+        us(K::Equal, mods(true, false, true, false)),
+        us_shifted,
+    );
+    assert_eq!(ui.shortcut_capture.listening(), Some("focus-left"));
+    assert_eq!(message(&ui), Some("Used by Flip split"));
+    assert_eq!(ui.doc.source(), before);
+    // An unused Shift chord still records.
+    record_with(
+        &mut ui,
+        "focus-left",
+        us(K::Slash, mods(true, false, true, false)),
+        us_shifted,
+    );
+    assert_eq!(
+        ui.shortcut_capture,
+        Capture::Saved {
+            action: "focus-left"
+        }
+    );
+    assert_eq!(
+        ui.doc
+            .shortcuts()
+            .binding(parse_chord("alt+shift+/").unwrap()),
+        Some(Some(&shortcuts::Command::Focus(spaceman::Direction::Left)))
+    );
+}
+
+#[test]
+fn only_a_shifted_symbol_has_a_twin_spelling() {
+    let twin = |source: &str| shifted_twin(parse_chord(source).unwrap(), us_shifted);
+    assert_eq!(twin("alt+shift+="), Some(parse_chord("alt++").unwrap()));
+    assert_eq!(
+        twin("ctrl+alt+shift+1"),
+        Some(parse_chord("ctrl+alt+!").unwrap())
+    );
+    assert_eq!(twin("alt+="), None);
+    assert_eq!(twin("alt+shift+h"), None);
+    assert_eq!(twin("alt+shift+left"), None);
 }

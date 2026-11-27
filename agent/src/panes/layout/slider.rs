@@ -93,7 +93,7 @@ pub(super) fn slider(p: Paint, key: &str, label: &str, value: i32, channel: Chan
         .child(
             text(format!("{value} px"))
                 .key("readout")
-                .font(p.k.ty.small)
+                .font(p.tabular(p.meta()))
                 .color(p.muted())
                 .w(READOUT_WIDTH)
                 .align(Align::End),

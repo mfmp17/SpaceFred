@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use spaceman::{
     WorkspaceId,
-    config::{HudPosition, HudStyle, MouseFollowsFocus, UpdateChannel},
+    config::{LabFeature, LabsConfig},
 };
 use toml_edit::{
     Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value,
@@ -19,6 +19,8 @@ const EMPTY: &str = "# SpaceFred configuration.\nversion = 1\n";
 pub enum Place {
     Workspace(WorkspaceId),
     Float,
+    /// Floating, and shown on every workspace.
+    Pin,
     /// Tiled even when the window looks like a dialog.
     Tile,
     /// Never tiled, moved or parked.
@@ -31,7 +33,21 @@ pub struct Rule {
     pub index: usize,
     pub bundle_id: Option<String>,
     pub title: Option<String>,
+    /// A case-insensitive title substring the rule requires, as written in config.toml.
+    pub title_contains: Option<String>,
     pub place: Place,
+}
+
+impl Rule {
+    /// Whether the rule covers every window of its app rather than only some titles.
+    pub fn app_wide(&self) -> bool {
+        self.title.is_none() && self.title_contains.is_none()
+    }
+
+    /// The title filter as written, exact or substring, for display.
+    pub fn title_filter(&self) -> Option<&str> {
+        self.title.as_deref().or(self.title_contains.as_deref())
+    }
 }
 
 #[derive(Clone)]
@@ -90,6 +106,22 @@ impl Doc {
 
     pub fn reload_pending(&self) -> bool {
         self.pending_reload
+    }
+
+    /// The `[labs]` switches as this document sets them.
+    pub fn labs(&self) -> LabsConfig {
+        LabsConfig::from_fn(|feature| self.lab(feature))
+    }
+
+    /// Whether `feature`'s switch is on, read straight from the edited file so a toggle shows
+    /// in Settings without waiting for a reload.
+    pub fn lab(&self, feature: LabFeature) -> bool {
+        self.doc
+            .get("labs")
+            .and_then(Item::as_table_like)
+            .and_then(|labs| labs.get(feature.key()))
+            .and_then(Item::as_bool)
+            .unwrap_or(false)
     }
 
     /// Reloads from this document's path (or the active config path if unset).
@@ -160,6 +192,7 @@ impl Doc {
         let same_rule = |rule: &Rule| {
             rule.bundle_id == expected.bundle_id
                 && rule.title == expected.title
+                && rule.title_contains == expected.title_contains
                 && rule.place == expected.place
         };
         if rules.get(expected.index).is_some_and(same_rule) {
@@ -188,7 +221,7 @@ impl Doc {
     pub fn app_place(&self, bundle_id: &str) -> Option<Place> {
         self.rules()
             .into_iter()
-            .find(|rule| rule.title.is_none() && rule.bundle_id.as_deref() == Some(bundle_id))
+            .find(|rule| rule.app_wide() && rule.bundle_id.as_deref() == Some(bundle_id))
             .map(|rule| rule.place)
     }
 
@@ -197,132 +230,13 @@ impl Doc {
         let existing = self
             .rules()
             .into_iter()
-            .find(|rule| rule.title.is_none() && rule.bundle_id.as_deref() == Some(bundle_id))
+            .find(|rule| rule.app_wide() && rule.bundle_id.as_deref() == Some(bundle_id))
             .map(|rule| rule.index);
         match (existing, place) {
             (Some(index), Some(place)) => self.place(index, place),
             (Some(index), None) => self.remove(index),
             (None, Some(place)) => self.add(bundle_id, place),
             (None, None) => {}
-        }
-    }
-
-    /// Whether the Workspace HUD overlay is enabled in `[settings]` (defaults to `true`).
-    pub fn hud(&self) -> bool {
-        self.doc
-            .get("settings")
-            .and_then(Item::as_table_like)
-            .and_then(|table| table.get("hud"))
-            .and_then(Item::as_bool)
-            .unwrap_or(true)
-    }
-
-    pub fn set_hud(&mut self, enabled: bool) {
-        self.set_setting("hud", (!enabled).then(|| value(false)));
-    }
-
-    /// How the Workspace HUD draws its row, from `settings.hud_style` (defaults to icons).
-    pub fn hud_style(&self) -> HudStyle {
-        self.doc
-            .get("settings")
-            .and_then(Item::as_table_like)
-            .and_then(|table| table.get("hud_style"))
-            .and_then(Item::as_str)
-            .and_then(HudStyle::parse)
-            .unwrap_or_default()
-    }
-
-    pub fn set_hud_style(&mut self, style: HudStyle) {
-        self.set_setting(
-            "hud_style",
-            (style != HudStyle::default()).then(|| value(style.as_str())),
-        );
-    }
-
-    /// Where the Workspace HUD capsule sits, from `settings.hud_position` (defaults to the
-    /// bottom of each display).
-    pub fn hud_position(&self) -> HudPosition {
-        self.doc
-            .get("settings")
-            .and_then(Item::as_table_like)
-            .and_then(|table| table.get("hud_position"))
-            .and_then(Item::as_str)
-            .and_then(HudPosition::parse)
-            .unwrap_or_default()
-    }
-
-    pub fn set_hud_position(&mut self, position: HudPosition) {
-        self.set_setting(
-            "hud_position",
-            (position != HudPosition::default()).then(|| value(position.as_str())),
-        );
-    }
-
-    /// The release channel the updater follows, from `settings.update_channel` (defaults to
-    /// stable).
-    pub fn update_channel(&self) -> UpdateChannel {
-        self.doc
-            .get("settings")
-            .and_then(Item::as_table_like)
-            .and_then(|table| table.get("update_channel"))
-            .and_then(Item::as_str)
-            .and_then(UpdateChannel::parse)
-            .unwrap_or_default()
-    }
-
-    pub fn set_update_channel(&mut self, channel: UpdateChannel) {
-        self.set_setting(
-            "update_channel",
-            (channel != UpdateChannel::default()).then(|| value(channel.as_str())),
-        );
-    }
-
-    /// Whether Spaceman moves the pointer on explicit focus changes, from
-    /// `settings.mouse_follows_focus` (defaults to off).
-    pub fn mouse_follows_focus(&self) -> MouseFollowsFocus {
-        self.doc
-            .get("settings")
-            .and_then(Item::as_table_like)
-            .and_then(|table| table.get("mouse_follows_focus"))
-            .and_then(Item::as_str)
-            .and_then(MouseFollowsFocus::parse)
-            .unwrap_or_default()
-    }
-
-    pub fn set_mouse_follows_focus(&mut self, mode: MouseFollowsFocus) {
-        self.set_setting(
-            "mouse_follows_focus",
-            (mode != MouseFollowsFocus::default()).then(|| value(mode.as_str())),
-        );
-    }
-
-    /// Sets `key` in `[settings]`, or removes it (and an emptied table) for `None`, the default.
-    fn set_setting(&mut self, key: &str, item: Option<Item>) {
-        let Some(item) = item else {
-            let empty = if let Some(table) = self
-                .doc
-                .get_mut("settings")
-                .and_then(Item::as_table_like_mut)
-            {
-                table.remove(key);
-                table.is_empty()
-            } else {
-                false
-            };
-            if empty {
-                self.remove_table("settings");
-            }
-            return;
-        };
-        let entry = self
-            .doc
-            .entry("settings")
-            .or_insert_with(|| Item::Table(Table::new()));
-        if !entry.is_table_like() {
-            *entry = Item::Table(Table::new());
-        }
-        if let Some(table) = entry.as_table_like_mut() {
-            set_table_item(table, key, item);
         }
     }
 
@@ -361,7 +275,7 @@ impl Doc {
             .into_iter()
             .filter_map(|rule| match rule.place {
                 Place::Workspace(workspace) => Some(workspace),
-                Place::Float | Place::Tile | Place::Ignore => None,
+                Place::Float | Place::Pin | Place::Tile | Place::Ignore => None,
             })
             .chain(WorkspaceId::all().filter(|workspace| self.monitor(*workspace).is_some()))
             .collect();
@@ -571,6 +485,7 @@ impl Doc {
 fn read_rule(index: usize, table: &dyn TableLike) -> Option<Rule> {
     let place = match table.get("action").and_then(Item::as_str)? {
         "float" => Place::Float,
+        "pin" => Place::Pin,
         "tile" => Place::Tile,
         "ignore" => Place::Ignore,
         "route" => Place::Workspace(workspace(table.get("workspace")?)?),
@@ -580,6 +495,7 @@ fn read_rule(index: usize, table: &dyn TableLike) -> Option<Rule> {
         index,
         bundle_id: string(table, "bundle_id"),
         title: string(table, "title"),
+        title_contains: string(table, "title_contains"),
         place,
     })
 }
@@ -644,19 +560,24 @@ fn set_place(table: &mut dyn TableLike, place: Place) {
             set_table_item(table, "action", value("route"));
             set_table_item(table, "workspace", workspace_value(workspace));
         }
-        Place::Float | Place::Tile | Place::Ignore => {
+        Place::Float | Place::Pin | Place::Tile | Place::Ignore => {
             let action = match place {
                 Place::Float => "float",
+                Place::Pin => "pin",
                 Place::Tile => "tile",
                 _ => "ignore",
             };
             set_table_item(table, "action", value(action));
             table.remove("workspace");
+            // `windows` belongs to route rules only; the parser rejects it anywhere else.
+            table.remove("windows");
         }
     }
 }
 
 mod comments;
+mod filters;
+mod settings;
 mod shortcuts;
 mod spacing;
 #[cfg(test)]

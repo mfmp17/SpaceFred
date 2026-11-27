@@ -69,7 +69,7 @@ they contain bundle identifiers and geometry, though never window titles.
 
 ## Safe Uninstall
 
-1. Turn off `Launch at Login` in Spaceman Settings and confirm it is disabled.
+1. Turn off `Launch at login` in Spaceman Settings and confirm it is disabled.
 2. Disable automatic tiling with `spaceman ctl pause`.
 3. Wait for `spaceman ctl status` to report `"mode":"paused"` and `"busy":false`.
 4. Run `spaceman ctl quit` and wait for `spaceman-agent` to exit.

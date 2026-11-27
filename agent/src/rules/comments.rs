@@ -177,17 +177,37 @@ impl Doc {
         self.splice_removed_table_comments(comments, inline_comment, next_root_key);
     }
 
-    /// Removes scalar key `key_name` from top-level table `table_key`, preserving any
-    /// detached comments separated by a blank line above that key.
-    pub(super) fn remove_key_in_table(&mut self, table_key: &str, key_name: &str) {
-        let removed = self
-            .doc
-            .get_mut(table_key)
-            .and_then(Item::as_table_mut)
-            .and_then(|table| {
+    /// Removes scalar key `key_name` from the table at `path` (`["settings", "gaps"]` for
+    /// `[settings.gaps]`), preserving any detached comment separated by a blank line above that
+    /// key. Inline tables have no such comments to keep and just lose the key.
+    pub(super) fn remove_key_in_table(&mut self, path: &[&str], key_name: &str) {
+        let Some((first, rest)) = path.split_first() else {
+            return;
+        };
+        let Some(mut item) = self.doc.as_table_mut().get_mut(first) else {
+            return;
+        };
+        for name in rest {
+            let Some(next) = item
+                .as_table_like_mut()
+                .and_then(|table| table.get_mut(name))
+            else {
+                return;
+            };
+            item = next;
+        }
+        let removed = match item.as_table_mut() {
+            Some(table) => {
                 let pos = table.position();
                 remove_table_key(table, key_name).map(|comment| (pos, comment))
-            });
+            }
+            None => {
+                if let Some(table) = item.as_table_like_mut() {
+                    table.remove(key_name);
+                }
+                None
+            }
+        };
         if let Some((pos, comment)) = removed {
             self.splice_detached_after_table(pos, comment);
         }

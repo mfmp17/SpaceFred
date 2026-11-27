@@ -72,9 +72,13 @@ fn summoned() -> crate::Rect {
     summon_frame(outputs().main().frame, None)
 }
 
+fn pad(runtime: &WorkspaceRuntime<FakeBackend>) -> crate::scratchpad::Scratchpad {
+    runtime.workspaces.scratchpad()
+}
+
 fn assert_hidden(runtime: &WorkspaceRuntime<FakeBackend>, window: &crate::PhysicalWindowId) {
-    assert!(runtime.scratchpad.contains(window));
-    assert_eq!(runtime.scratchpad.entry(window).unwrap().shown_on, None);
+    assert!(pad(runtime).contains(window));
+    assert_eq!(pad(runtime).entry(window).unwrap().shown_on, None);
     assert!(runtime.parked.contains_key(window), "parked in memory");
     assert!(
         runtime.backend.persisted.contains_key(window),
@@ -146,9 +150,9 @@ fn summoning_on_workspace_two_floats_it_centred_without_disturbing_the_tiles() {
         runtime.workspaces.floating_workspace_of(&marked),
         Some(WorkspaceId::TWO)
     );
-    assert!(runtime.manual_floating.contains(&marked));
+    assert!(runtime.workspaces.is_manual_float(&marked));
     assert_eq!(
-        runtime.scratchpad.entry(&marked).unwrap().shown_on,
+        pad(&runtime).entry(&marked).unwrap().shown_on,
         Some(WorkspaceId::TWO)
     );
     assert!(!runtime.parked.contains_key(&marked));
@@ -187,8 +191,8 @@ fn marking_a_shown_scratchpad_window_tiles_it_on_the_current_workspace() {
 
     scratchpad(&mut runtime, ScratchpadCommand::Mark).unwrap();
 
-    assert!(!runtime.scratchpad.contains(&marked));
-    assert!(!runtime.manual_floating.contains(&marked));
+    assert!(!pad(&runtime).contains(&marked));
+    assert!(!runtime.workspaces.is_manual_float(&marked));
     assert_eq!(
         runtime.workspaces.workspace_of(&marked),
         Some(WorkspaceId::TWO)
@@ -215,7 +219,7 @@ fn toggles_cycle_through_several_scratchpad_windows() {
 
     for expected in [10, 20, 10] {
         scratchpad(&mut runtime, ScratchpadCommand::Toggle).unwrap();
-        let shown = runtime.scratchpad.shown_on(WorkspaceId::ONE);
+        let shown = pad(&runtime).shown_on(WorkspaceId::ONE);
         assert_eq!(shown, vec![window(expected)]);
         assert!(on_screen(&runtime, &window(expected)));
         scratchpad(&mut runtime, ScratchpadCommand::Toggle).unwrap();
@@ -233,7 +237,7 @@ fn a_closed_scratchpad_window_is_pruned_with_its_recovery_frame() {
 
     run(&mut runtime, WorkerAction::Retile).unwrap();
 
-    assert!(!runtime.scratchpad.contains(&closed));
+    assert!(!pad(&runtime).contains(&closed));
     assert!(!runtime.parked.contains_key(&closed));
     assert!(!runtime.backend.persisted.contains_key(&closed));
     assert_eq!(
@@ -282,10 +286,13 @@ fn pause_restores_hidden_scratchpad_windows_without_leaks() {
         &AtomicBool::new(false),
     );
 
-    assert!(matches!(result, Some(WorkerResult::Restored { failed: 0 })));
+    assert!(matches!(
+        result,
+        Some(WorkerResult::Restored { failed: 0, .. })
+    ));
     assert!(runtime.parked.is_empty());
     assert!(runtime.backend.persisted.is_empty());
-    assert!(runtime.scratchpad.is_empty());
+    assert!(pad(&runtime).is_empty());
     assert_eq!(runtime.backend.frames[&marked], original);
 }
 
@@ -324,7 +331,7 @@ fn turning_the_lab_off_brings_hidden_windows_back() {
     runtime.replace_config(Config::default());
     run(&mut runtime, WorkerAction::Retile).unwrap();
 
-    assert!(runtime.scratchpad.is_empty());
+    assert!(pad(&runtime).is_empty());
     assert!(!runtime.parked.contains_key(&marked));
     assert!(!runtime.backend.persisted.contains_key(&marked));
     assert!(on_screen(&runtime, &marked));
@@ -339,7 +346,7 @@ fn the_scratchpad_does_nothing_while_the_lab_is_off() {
         assert!(error.starts_with("Scratchpad is off"), "{error}");
     }
 
-    assert!(runtime.scratchpad.is_empty());
+    assert!(pad(&runtime).is_empty());
     assert!(!runtime.parked.contains_key(&window(10)));
     assert_eq!(
         runtime
@@ -393,7 +400,7 @@ fn adding_a_display_reparks_hidden_scratchpad_windows_without_dropping_membershi
         panic!("expected mark status");
     };
     result.unwrap();
-    assert!(runtime.scratchpad.hidden().contains(&window(10)));
+    assert!(pad(&runtime).hidden().contains(&window(10)));
     assert!(
         !crate::geometry::shows_on(
             runtime.backend.frames[&window(10)],
@@ -417,7 +424,7 @@ fn adding_a_display_reparks_hidden_scratchpad_windows_without_dropping_membershi
         "hidden scratchpad window leaked onto newly added display: {:?}",
         runtime.backend.frames[&window(10)]
     );
-    assert!(runtime.scratchpad.hidden().contains(&window(10)));
+    assert!(pad(&runtime).hidden().contains(&window(10)));
     assert_eq!(runtime.workspaces.workspace_of_any(&window(10)), None);
     assert!(runtime.parked.contains_key(&window(10)));
 
@@ -433,8 +440,7 @@ fn adding_a_display_reparks_hidden_scratchpad_windows_without_dropping_membershi
     };
     result.unwrap();
     assert!(
-        runtime
-            .scratchpad
+        pad(&runtime)
             .entry(&window(10))
             .is_some_and(|entry| entry.shown_on.is_some())
     );
@@ -474,12 +480,10 @@ fn delayed_scratchpad_summon_stays_centered_when_a_later_cycle_confirms_it() {
         runtime.parked.contains_key(&w),
         "recovery frame stays persisted until confirmed"
     );
-    assert_eq!(runtime.scratchpad.pending_summon(&w), Some(centered));
+    assert_eq!(runtime.parked.summon_destination(&w), Some(centered));
 
     // Expire the retry throttle and let the window server catch up to the centered frame.
-    runtime
-        .recently_parked
-        .insert(w.clone(), Instant::now() - Duration::from_secs(5));
+    runtime.backend.advance(Duration::from_secs(5));
     runtime.backend.server_frames.insert(w.clone(), centered);
     runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
 
@@ -488,7 +492,7 @@ fn delayed_scratchpad_summon_stays_centered_when_a_later_cycle_confirms_it() {
         "later cycle must confirm the centered summon frame, not restore the old tile position"
     );
     assert!(!runtime.parked.contains_key(&w));
-    assert_eq!(runtime.scratchpad.pending_summon(&w), None);
+    assert_eq!(runtime.parked.summon_destination(&w), None);
 }
 
 #[test]
@@ -502,7 +506,7 @@ fn second_toggle_supersedes_an_unconfirmed_scratchpad_summon_with_a_park_write()
     rt.backend.server_frames.insert(w.clone(), parked);
     rt.backend.frozen_server_frames = true;
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
-    assert!(rt.scratchpad.pending_summon(&w).is_some());
+    assert!(rt.parked.summon_destination(&w).is_some());
 
     rt.backend.calls.clear();
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
@@ -515,7 +519,7 @@ fn second_toggle_supersedes_an_unconfirmed_scratchpad_summon_with_a_park_write()
         )),
         "hide must supersede the unconfirmed summon with an off-screen park write"
     );
-    assert_eq!(rt.scratchpad.pending_summon(&w), None);
+    assert_eq!(rt.parked.summon_destination(&w), None);
     assert_hidden(&rt, &w);
 }
 
@@ -547,8 +551,7 @@ fn background_bounds_reassertion_reparks_hidden_scratchpad_window_while_frontmos
     // while another app stays frontmost.
     rt.backend.focused = Some(other.clone());
     rt.backend.frontmost = Some(other.app.clone());
-    rt.recently_parked
-        .insert(target.clone(), Instant::now() - Duration::from_secs(5));
+    rt.backend.advance(Duration::from_secs(5));
     rt.backend.frames.insert(target.clone(), recovery);
     rt.backend.server_frames.insert(target.clone(), recovery);
 
@@ -563,7 +566,7 @@ fn background_bounds_reassertion_reparks_hidden_scratchpad_window_while_frontmos
     // Still summonable via Toggle.
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
     assert_eq!(
-        rt.scratchpad.entry(&target).and_then(|e| e.shown_on),
+        pad(&rt).entry(&target).and_then(|e| e.shown_on),
         Some(WorkspaceId::ONE)
     );
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
@@ -571,14 +574,13 @@ fn background_bounds_reassertion_reparks_hidden_scratchpad_window_while_frontmos
 
     // Control: frontmost activation still honors the reappearance and adopts it.
     let recovery = rt.parked[&target];
-    rt.recently_parked
-        .insert(target.clone(), Instant::now() - Duration::from_secs(5));
+    rt.backend.advance(Duration::from_secs(5));
     rt.backend.frames.insert(target.clone(), recovery);
     rt.backend.server_frames.insert(target.clone(), recovery);
     rt.backend.focused = Some(target.clone());
     rt.backend.frontmost = Some(target.app.clone());
     run(&mut rt, WorkerAction::Retile).unwrap();
-    assert!(!rt.scratchpad.contains(&target));
+    assert!(!pad(&rt).contains(&target));
     assert!(!rt.parked.contains_key(&target));
     assert_eq!(
         rt.workspaces.workspace_of_any(&target),
@@ -598,12 +600,12 @@ fn tiling_an_unconfirmed_scratchpad_summon_keeps_tiles_separate_after_arrival() 
         .insert(w.clone(), rt.backend.frames[&w]);
     rt.backend.frozen_server_frames = true;
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
-    assert!(rt.scratchpad.pending_summon(&w).is_some());
+    assert!(rt.parked.summon_destination(&w).is_some());
 
     // Tile while the summon is still unconfirmed.
     run(&mut rt, WorkerAction::ToggleFloat).unwrap();
     assert_eq!(rt.workspaces.workspace_of(&w), Some(WorkspaceId::ONE));
-    assert!(!rt.scratchpad.contains(&w));
+    assert!(!pad(&rt).contains(&w));
     let tile_frame = rt.backend.frames[&w];
     assert_ne!(tile_frame, rt.backend.frames[&sibling]);
 
@@ -611,8 +613,7 @@ fn tiling_an_unconfirmed_scratchpad_summon_keeps_tiles_separate_after_arrival() 
     // overwrite the tile with its pre-summon recovery frame.
     rt.backend.server_frames.insert(w.clone(), tile_frame);
     rt.backend.frozen_server_frames = false;
-    rt.recently_parked
-        .insert(w.clone(), Instant::now() - Duration::from_secs(5));
+    rt.backend.advance(Duration::from_secs(5));
     run(&mut rt, WorkerAction::Retile).unwrap();
     assert_eq!(rt.backend.frames[&w], tile_frame);
     assert_ne!(rt.backend.frames[&w], rt.backend.frames[&sibling]);
@@ -632,21 +633,21 @@ fn switching_away_before_delayed_summon_confirmation_remembers_floated_size() {
     rt.backend.frozen_server_frames = true;
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
     assert_eq!(rt.backend.frames[&w], summoned());
-    assert!(rt.scratchpad.pending_summon(&w).is_some());
+    assert!(rt.parked.summon_destination(&w).is_some());
 
     // Summon arrives on the window server, then the user switches away before a cycle confirms it.
     rt.backend.frozen_server_frames = false;
     rt.backend.server_frames.insert(w.clone(), summoned());
     run(&mut rt, WorkerAction::SwitchWorkspace(WorkspaceId::TWO)).unwrap();
     assert_hidden(&rt, &w);
-    assert_eq!(rt.scratchpad.entry(&w).unwrap().size, Some((750, 600)));
+    assert_eq!(pad(&rt).entry(&w).unwrap().size, Some((750, 600)));
 
     run(&mut rt, WorkerAction::SwitchWorkspace(WorkspaceId::ONE)).unwrap();
     scratchpad(&mut rt, ScratchpadCommand::Toggle).unwrap();
     run(&mut rt, WorkerAction::Retile).unwrap();
     assert_eq!(rt.backend.frames[&w], summoned());
     assert_eq!(rt.backend.server_frames[&w], summoned());
-    assert_eq!(rt.scratchpad.pending_summon(&w), None);
+    assert_eq!(rt.parked.summon_destination(&w), None);
     assert!(!rt.parked.contains_key(&w));
 }
 
@@ -702,9 +703,9 @@ fn scratchpad_actions_honor_and_track_pending_focus_during_activation_lag() {
         rt
     };
     let hidden_ids = |rt: &WorkspaceRuntime<FakeBackend>| {
-        let mut ids: Vec<_> = rt
-            .scratchpad
+        let mut ids: Vec<_> = pad(rt)
             .entries()
+            .iter()
             .filter(|e| e.shown_on.is_none())
             .map(|e| e.window.window_id)
             .collect();
@@ -717,7 +718,7 @@ fn scratchpad_actions_honor_and_track_pending_focus_during_activation_lag() {
         act(&mut rt, WorkerAction::Scratchpad(ScratchpadCommand::Mark)).unwrap();
         act(&mut rt, WorkerAction::Scratchpad(ScratchpadCommand::Toggle)).unwrap();
         assert_eq!(
-            rt.scratchpad.entry(&w(20)).unwrap().shown_on,
+            pad(&rt).entry(&w(20)).unwrap().shown_on,
             Some(WorkspaceId::ONE)
         );
         rt
@@ -743,7 +744,7 @@ fn scratchpad_actions_honor_and_track_pending_focus_during_activation_lag() {
         }
         act(&mut rt, WorkerAction::Scratchpad(ScratchpadCommand::Toggle)).unwrap();
         assert_eq!(
-            rt.scratchpad.entry(&w(20)).unwrap().shown_on,
+            pad(&rt).entry(&w(20)).unwrap().shown_on,
             Some(WorkspaceId::SIX)
         );
 
@@ -834,8 +835,8 @@ fn mark_after_quick_focus_and_summon_ignores_intermediate_focus_report() {
         act(&mut rt, WorkerAction::Scratchpad(ScratchpadCommand::Mark));
         report(&mut rt, 30);
         act(&mut rt, WorkerAction::Retile);
-        assert!(!rt.scratchpad.contains(&w(30)));
-        assert!(!rt.scratchpad.contains(&w(20)));
+        assert!(!pad(&rt).contains(&w(30)));
+        assert!(!pad(&rt).contains(&w(20)));
         assert_eq!(rt.workspaces.workspace_of(&w(30)), Some(WorkspaceId::ONE));
         assert_eq!(rt.workspaces.workspace_of(&w(20)), Some(WorkspaceId::ONE));
         assert!(rt.parked.is_empty());
@@ -885,7 +886,7 @@ fn settled_scratchpad_summon_confirms_translated_target_after_display_removal() 
         WorkerAction::Scratchpad(ScratchpadCommand::Toggle),
         outputs(),
     );
-    let target = rt.scratchpad.pending_summon(&w).expect("delayed summon");
+    let target = rt.parked.summon_destination(&w).expect("delayed summon");
 
     // Secondary display disconnects and the window settles at the translated frame on main.
     rt.backend.frozen_server_frames = false;
@@ -897,10 +898,9 @@ fn settled_scratchpad_summon_confirms_translated_target_after_display_removal() 
     };
     rt.backend.frames.insert(w.clone(), settled);
     rt.backend.server_frames.insert(w.clone(), settled);
-    rt.recently_parked
-        .insert(w.clone(), Instant::now() - Duration::from_secs(5));
+    rt.backend.advance(Duration::from_secs(5));
     exec(&mut rt, WorkerAction::Retile, main_only.clone());
-    assert_eq!(rt.scratchpad.pending_summon(&w), None);
+    assert_eq!(rt.parked.summon_destination(&w), None);
     assert!(!rt.parked.contains_key(&w));
 
     // A subsequent drag and pause both preserve the dragged frame.
@@ -915,7 +915,7 @@ fn settled_scratchpad_summon_confirms_translated_target_after_display_removal() 
     rt.backend.frontmost = Some(w.app.clone());
     let gesture = rt.execute(
         WorkerCommand::Gesture(
-            FinalGesture::Drop(w.clone(), (150, 200)),
+            FinalGesture::drop(w.clone(), (150, 200)),
             false,
             main_only.clone(),
         ),
@@ -930,7 +930,7 @@ fn settled_scratchpad_summon_confirms_translated_target_after_display_removal() 
     let restored = rt.execute(WorkerCommand::RestoreAll(Some(main_only)), &cancelled);
     assert!(matches!(
         restored,
-        Some(WorkerResult::Restored { failed: 0 })
+        Some(WorkerResult::Restored { failed: 0, .. })
     ));
     assert_eq!(rt.backend.frames[&w], dragged);
 }
@@ -953,7 +953,7 @@ fn moving_unconfirmed_scratchpad_float_preserves_summoned_position() {
                 0
             );
             let summoned = rt.backend.frames[&w];
-            assert!(rt.scratchpad.pending_summon(&w).is_some());
+            assert!(rt.parked.summon_destination(&w).is_some());
             rt.backend.frozen_server_frames = false;
             if arrived {
                 rt.backend.server_frames.insert(w.clone(), summoned);
@@ -964,7 +964,7 @@ fn moving_unconfirmed_scratchpad_float_preserves_summoned_position() {
                     .failed,
                 0
             );
-            assert!(!rt.scratchpad.contains(&w));
+            assert!(!pad(&rt).contains(&w));
             assert_eq!(rt.workspaces.floating_workspace_of(&w), Some(target));
             if !rt.is_visible(target, &outputs()) {
                 assert_eq!(
@@ -974,8 +974,7 @@ fn moving_unconfirmed_scratchpad_float_preserves_summoned_position() {
                     0
                 );
             }
-            rt.recently_parked
-                .insert(w.clone(), Instant::now() - Duration::from_secs(5));
+            rt.backend.advance(Duration::from_secs(5));
             for _ in 0..2 {
                 assert_eq!(run(&mut rt, WorkerAction::Retile).unwrap().failed, 0);
             }

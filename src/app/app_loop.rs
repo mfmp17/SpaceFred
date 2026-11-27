@@ -4,60 +4,22 @@ use super::*;
 
 mod actions;
 mod automatic;
+mod builtin_display;
 mod controls;
 mod dispatch;
 mod hotkey_health;
+mod hover;
 mod live_shortcuts;
 mod probe;
+mod setup;
+mod status_text;
+mod window_overlay;
 
-pub(super) use dispatch::WorkerDispatch;
-
-/// Whether automatic tiling may start without the user asking for it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TilingStart {
-    /// Start now: Accessibility is granted and nothing is holding tiling.
-    Now,
-    /// Hold: the first-run setup tour is still open.
-    AfterSetup,
-}
-
-/// Automatic tiling's first start, held while a first-run setup tour is open.
-///
-/// The tour grants Accessibility while the user is still reading it, and the
-/// grant is noticed on the next tick. Starting tiling then rearranges every
-/// window behind the setup window, so the tour finishes first.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct TilingStartup {
-    setup_tour_open: bool,
-}
-
-impl TilingStartup {
-    pub(super) const fn new(setup_tour_open: bool) -> Self {
-        Self { setup_tour_open }
-    }
-
-    /// Accessibility became available, or the loop noticed it now.
-    pub(super) fn accessibility_granted(&mut self) -> TilingStart {
-        if self.setup_tour_open {
-            TilingStart::AfterSetup
-        } else {
-            TilingStart::Now
-        }
-    }
-
-    /// Whether a first-run tour still holds tiling.
-    pub(super) const fn held(&self) -> bool {
-        self.setup_tour_open
-    }
-
-    /// The first-run tour finished, was dismissed, or the user asked for tiling
-    /// directly. A manual re-open of the tour never holds tiling, so this is only
-    /// ever called for a first-run tour or an explicit start.
-    pub(super) fn setup_finished(&mut self) -> TilingStart {
-        self.setup_tour_open = false;
-        TilingStart::Now
-    }
-}
+#[cfg(test)]
+pub(super) use dispatch::{AfterCommand, WorkerLifecycle};
+pub(super) use dispatch::{RestoreKind, WorkerDispatch};
+pub(super) use setup::{TilingStart, TilingStartup};
+use status_text::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickOutcome {
@@ -80,6 +42,14 @@ pub(super) struct AppLoopInit {
     /// `[shortcuts]` as loaded at startup; later changes apply live (`live_shortcuts`).
     pub(super) shortcuts: crate::shortcuts::Shortcuts,
     pub(super) hud: bool,
+    /// `Config::swipe_fingers` as loaded at startup; the config probe keeps it current.
+    pub(super) swipe_fingers: Fingers,
+    /// `[labs] focus_follows_mouse` as loaded at startup; the config probe keeps it current.
+    pub(super) focus_follows_mouse: bool,
+    /// `[labs] window_overlay` as loaded at startup; the config probe keeps it current.
+    pub(super) window_overlay: bool,
+    /// `settings.pause_on_builtin_display` as loaded at startup; the config probe keeps it current.
+    pub(super) pause_on_builtin_display: bool,
     pub(super) trusted: bool,
     /// A first-run setup tour is open and holds automatic tiling until it ends.
     pub(super) setup_tour_open: bool,
@@ -113,6 +83,17 @@ pub struct MainThreadAgent {
     accessibility: bool,
     automatic: bool,
     hud: bool,
+    /// The only finger count whose swipes are queued for the worker.
+    swipe_fingers: Fingers,
+    /// The Focus follows mouse Lab: hover focuses tiles, timed by `hover`.
+    focus_follows_mouse: bool,
+    hover: hover::HoverTracker,
+    /// The Window overlay Lab, and whether its chord is held long enough to show it.
+    window_overlay: window_overlay::WindowOverlay,
+    pause_on_builtin_display: bool,
+    builtin_display: builtin_display::BuiltinDisplayPolicy,
+    last_display_topology_check: Instant,
+    display_topology_dirty: bool,
     awaiting_accessibility: bool,
     startup_tiling: TilingStartup,
     accessibility_requested: bool,
@@ -124,6 +105,8 @@ pub struct MainThreadAgent {
     last_error: Option<String>,
     latest_debug: Option<RuntimeDebug>,
     pending_inputs: InputQueue,
+    /// A command waited out a Space slide's layout hold; retile before it runs (#770).
+    retile_before_input: bool,
     gesture_tracker: GestureTracker,
     last_refresh: Instant,
     observation_recheck: Option<Instant>,
@@ -150,8 +133,11 @@ pub struct MainThreadAgent {
     updater: crate::updater::Updater,
     /// The updater revision last shown.
     update_revision: u64,
-    /// Tiling was on when Install & Restart began, so a failed install resumes it.
+    /// Tiling was on when Install & restart began, so a failed install resumes it.
     resume_after_update: bool,
+    /// An internal start is pending (e.g. failed-update recovery) and runs as non-manual.
+    pending_automatic_start: bool,
+    setup: setup::SetupRequests,
 }
 
 impl MainThreadAgent {
@@ -160,7 +146,18 @@ impl MainThreadAgent {
         launch_status: Result<login_item::Status, String>,
     ) -> Self {
         let trusted = init.trusted;
-        let (hotkeys, hotkey_error) = if trusted {
+        let mut builtin_display = builtin_display::BuiltinDisplayPolicy::default();
+        let initial_topology = init
+            .pause_on_builtin_display
+            .then(macos::display_topology)
+            .flatten();
+        let start_auto_paused = trusted
+            && !init.setup_tour_open
+            && builtin_display
+                .should_start_auto_paused(init.pause_on_builtin_display, initial_topology);
+        let (hotkeys, hotkey_error) = if start_auto_paused {
+            (None, None)
+        } else if trusted {
             match HotkeyPlan::current(&init.hotkey_workspaces, &init.shortcuts)
                 .and_then(|plan| Hotkeys::install(init.actions_sender.clone(), plan))
             {
@@ -176,7 +173,7 @@ impl MainThreadAgent {
         } else {
             (None, Some("Accessibility permission is required".into()))
         };
-        let automatic = hotkeys.is_some() && !init.setup_tour_open;
+        let automatic = hotkeys.is_some() && !init.setup_tour_open && !start_auto_paused;
         let mut worker = WorkerDispatch::new(init.commands);
 
         status_item::set_automatic(automatic);
@@ -188,6 +185,7 @@ impl MainThreadAgent {
             status_item::set_status(match hotkey_error.as_deref() {
                 Some(error) => error,
                 None if init.setup_tour_open => "Setup in progress · tiling starts when you finish",
+                None if start_auto_paused => builtin_display::PAUSED_STATUS,
                 None => "Paused",
             });
             worker.send_restore();
@@ -216,6 +214,14 @@ impl MainThreadAgent {
             accessibility: trusted,
             automatic,
             hud: init.hud,
+            swipe_fingers: init.swipe_fingers,
+            focus_follows_mouse: init.focus_follows_mouse,
+            hover: hover::HoverTracker::default(),
+            window_overlay: window_overlay::WindowOverlay::new(init.window_overlay),
+            pause_on_builtin_display: init.pause_on_builtin_display,
+            builtin_display,
+            last_display_topology_check: Instant::now(),
+            display_topology_dirty: false,
             awaiting_accessibility: !trusted,
             startup_tiling: TilingStartup::new(init.setup_tour_open),
             accessibility_requested: false,
@@ -227,6 +233,7 @@ impl MainThreadAgent {
             last_error: hotkey_error,
             latest_debug: None,
             pending_inputs: InputQueue::default(),
+            retile_before_input: false,
             gesture_tracker: GestureTracker::default(),
             last_refresh: initial_refresh,
             observation_recheck: None,
@@ -248,10 +255,17 @@ impl MainThreadAgent {
             updater: crate::updater::Updater::start(),
             update_revision: 0,
             resume_after_update: false,
+            pending_automatic_start: false,
+            setup: setup::SetupRequests::default(),
         };
         status_item::set_update(agent.updater.status().ready_version());
         if automatic {
             agent.listen_for_input();
+        } else if start_auto_paused {
+            log_event!("auto-paused tiling at startup: built-in display only");
+            agent
+                .bridge
+                .publish_toast(UiHudToast::paused(builtin_display::TOAST_PAUSED));
         }
         agent.publish_ui(false);
         agent
@@ -264,8 +278,9 @@ impl MainThreadAgent {
     fn listen_for_input(&mut self) {
         if self.swipes.is_none() {
             let sender = self.actions_sender.clone();
-            match macos::SwipeMonitor::install(move |swipe, point| {
-                drop(sender.send(Action::Worker(WorkerAction::Swipe(swipe, point))));
+            match macos::SwipeMonitor::install(move |swipe, fingers, point| {
+                let swipe = WorkerAction::Swipe(swipe, fingers, point);
+                drop(sender.send(Action::Worker(swipe)));
             }) {
                 Ok(monitor) => self.swipes = Some(monitor),
                 Err(error) => log_event!("trackpad swipes unavailable: {error}"),
@@ -284,7 +299,7 @@ impl MainThreadAgent {
 
     pub fn tick(&mut self) -> TickOutcome {
         loop {
-            let result = match self.results.try_recv() {
+            let mut result = match self.results.try_recv() {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -292,6 +307,7 @@ impl MainThreadAgent {
                     self.release_hotkey_hold_on_stop();
                     self.pending_inputs.clear();
                     self.gesture_tracker.clear();
+                    self.builtin_display.clear_auto_pause();
                     status_item::set_automatic(false);
                     self.automatic = false;
                     self.worker.reset_disconnected();
@@ -305,6 +321,13 @@ impl MainThreadAgent {
                     break;
                 }
             };
+            // A restore leaves nothing parked behind it; paused `debug` must
+            // show that rather than the last tiling snapshot (#548).
+            if let WorkerResult::Restored { debug, .. } = &mut result
+                && let Some(debug) = debug.take()
+            {
+                self.latest_debug = Some(*debug);
+            }
             match result {
                 WorkerResult::Status { result, debug } if self.automatic => {
                     self.worker.finish_command();
@@ -358,6 +381,12 @@ impl MainThreadAgent {
                             self.bridge.publish_hud(hud);
                         }
                     }
+                    self.window_overlay_result(
+                        result
+                            .as_ref()
+                            .ok()
+                            .and_then(|status| status.window_overlay.as_ref()),
+                    );
                     self.ui_dirty = true;
                     show_result(result, status_text.as_deref());
                 }
@@ -372,7 +401,7 @@ impl MainThreadAgent {
                 }
                 // Every parked window is back on screen: only now may the
                 // bundle be swapped and Spaceman relaunch into it.
-                WorkerResult::Restored { failed: 0 }
+                WorkerResult::Restored { failed: 0, .. }
                     if self.exit_intent == Some(ExitIntent::Update) =>
                 {
                     match self.updater.install() {
@@ -387,24 +416,28 @@ impl MainThreadAgent {
                 }
                 // Every parked window is back: a ready update may now be
                 // swapped in for the next launch.
-                WorkerResult::Restored { failed: 0 }
+                WorkerResult::Restored { failed: 0, .. }
                     if self.exit_intent == Some(ExitIntent::Terminate) =>
                 {
                     self.install_update_on_quit();
                     self.worker.stop();
                     return TickOutcome::TerminateAppKit;
                 }
-                WorkerResult::Restored { failed: 0 } if self.exit_intent.is_some() => {
+                WorkerResult::Restored { failed: 0, .. } if self.exit_intent.is_some() => {
                     self.install_update_on_quit();
                     self.worker.stop();
                     termination::allow_next();
                     return TickOutcome::Quit;
                 }
-                WorkerResult::Restored { failed: 0 } => {
+                WorkerResult::Restored { failed: 0, .. } => {
                     self.worker.finish_restore();
                     status_item::set_status(self.paused_status());
                 }
-                WorkerResult::Restored { failed } => {
+                WorkerResult::Inventory(inventory) => {
+                    self.worker.finish_command();
+                    self.bridge.publish_inventory(*inventory);
+                }
+                WorkerResult::Restored { failed, .. } => {
                     self.worker.defer_restore_retry();
                     self.next_restore_retry = Some(Instant::now() + RESTORE_RETRY_INTERVAL);
                     status_item::set_status(&format!("Restoring windows · {failed} failed"));
@@ -420,6 +453,7 @@ impl MainThreadAgent {
 
         self.drain_controls();
         self.drain_actions();
+        self.tick_window_overlay();
 
         if self.worker.is_restoring()
             && !self.worker.is_busy()
@@ -437,6 +471,8 @@ impl MainThreadAgent {
             }
         }
 
+        self.send_wanted_inventory();
+        self.tick_builtin_display();
         if self.automatic {
             self.tick_automatic();
         }
@@ -457,25 +493,36 @@ impl MainThreadAgent {
 
     /// What the menu reports while tiling has not started.
     fn paused_status(&self) -> &str {
-        match self.last_error.as_deref() {
+        // A cycle's window-operation failure belongs to tiling, not to the
+        // paused state (#694).
+        let error = self
+            .last_error
+            .as_deref()
+            .filter(|error| !is_window_operations_failed_error(error));
+        match error {
             Some(error) => error,
             None if self.startup_tiling.held() => {
                 "Setup in progress · tiling starts when you finish"
             }
+            None if self.builtin_display.auto_paused_for_builtin => builtin_display::PAUSED_STATUS,
             None => "Paused",
         }
     }
 
-    fn stop_automatic_and_restore(&mut self) {
+    fn stop_automatic_and_restore(&mut self, kind: RestoreKind) {
+        clear_window_operations_failed_error(&mut self.last_error);
         self.automatic = false;
+        self.pending_automatic_start = false;
+        self.builtin_display.clear_auto_pause();
         self.cancelled.store(true, Ordering::Release);
         self.hotkeys = None;
         self.release_hotkey_hold_on_stop();
         self.hotkey_delivery.clear();
         self.pending_inputs.clear();
+        self.retile_before_input = false;
         self.gesture_tracker.clear();
         self.ui_dirty = true;
-        self.worker.request_restore();
+        self.worker.request_restore(kind);
         status_item::set_automatic(false);
     }
 
@@ -509,7 +556,7 @@ impl MainThreadAgent {
         self.ui_dirty = true;
         status_item::set_status(&message);
         if std::mem::take(&mut self.resume_after_update) {
-            drop(self.actions_sender.send(Action::ToggleAutomatic));
+            self.pending_automatic_start = true;
         }
     }
 
@@ -526,13 +573,29 @@ impl MainThreadAgent {
     }
 
     fn queue_worker_input(&mut self, input: QueuedInput) {
+        // A rejection is already in the log and the menu status.
+        self.admit_worker_input(input).ok();
+    }
+
+    /// Queues `input`, or reports that the queue is full and returns that
+    /// error so a `spaceman ctl` caller sees it too (#712).
+    fn admit_worker_input(&mut self, mut input: QueuedInput) -> Result<(), &'static str> {
+        // A mark records the screen as the user saw it, not after a busy worker settles (#715).
+        if let QueuedInput::Action(WorkerAction::MarkWrong(moment @ None)) = &mut input {
+            *moment = journal::WrongMoment::capture(&self.active_workspaces);
+        }
+        if let QueuedInput::Action(action) = &input {
+            self.hover.note_action(action);
+        }
         self.last_activity = Instant::now();
-        if let Err(error) = self.pending_inputs.push(input) {
+        self.ui_dirty = true;
+        let admitted = self.pending_inputs.push(input);
+        if let Err(error) = admitted {
             log_event!("{error}");
             self.last_error = Some(error.into());
             status_item::set_status(error);
         }
-        self.ui_dirty = true;
+        admitted
     }
 
     fn maybe_publish_ui(&mut self) {
@@ -564,6 +627,22 @@ impl MainThreadAgent {
                     }
                     if let Some(shortcuts) = probe.shortcuts {
                         self.apply_shortcuts(shortcuts);
+                    }
+                    if let Some(fingers) = probe.swipe_fingers {
+                        self.swipe_fingers = fingers;
+                    }
+                    if let Some(icon) = probe.menu_bar_icon {
+                        status_item::set_visible(icon != crate::config::MenuBarIcon::Off);
+                    }
+                    if let Some(on) = probe.focus_follows_mouse {
+                        self.focus_follows_mouse = on;
+                        self.hover.interrupt();
+                    }
+                    if let Some(on) = probe.window_overlay {
+                        self.window_overlay.lab = on;
+                    }
+                    if let Some(on) = probe.pause_on_builtin_display {
+                        self.set_pause_on_builtin_display(on);
                     }
                 }
             }
@@ -597,7 +676,7 @@ impl MainThreadAgent {
             match self.startup_tiling.accessibility_granted() {
                 TilingStart::Now => {
                     self.awaiting_accessibility = false;
-                    drop(self.actions_sender.send(Action::ToggleAutomatic));
+                    self.start_automatic(false);
                 }
                 TilingStart::AfterSetup => {
                     status_item::set_status("Setup in progress · tiling starts when you finish");
@@ -634,33 +713,17 @@ impl MainThreadAgent {
             update: self.updater.status(),
             active_workspaces: self.active_workspaces.clone(),
             last_error: self.last_error.clone(),
+            running_shortcuts: self
+                .previous_shortcuts_run()
+                .then(|| self.shortcuts.clone()),
+            shortcut_workspaces: Some(
+                self.hotkey_workspaces
+                    .iter()
+                    .copied()
+                    .filter(|workspace| workspace.letter().is_some())
+                    .collect(),
+            ),
         }
-    }
-}
-
-pub(super) fn is_update_failed_error(error: Option<&str>) -> bool {
-    error.is_some_and(|error| error.starts_with(UPDATE_FAILED_PREFIX))
-}
-
-pub(super) fn is_shortcuts_not_applied_error(error: Option<&str>) -> bool {
-    error.is_some_and(|error| error.starts_with(live_shortcuts::NOT_APPLIED))
-}
-
-/// Updates `last_error` when automatic tiling starts and returns the status text
-/// to show in the menu bar. A failed update installation is unrelated to tiling
-/// and survives the automatic resume that follows it; an unapplied shortcut table
-/// also stays retained while the previous table remains active.
-pub(super) fn automatic_started_status<'a>(
-    last_error: &'a mut Option<String>,
-    automatic_status: &'a str,
-) -> &'a str {
-    if is_update_failed_error(last_error.as_deref()) {
-        last_error.as_deref().unwrap_or(automatic_status)
-    } else {
-        if !is_shortcuts_not_applied_error(last_error.as_deref()) {
-            *last_error = None;
-        }
-        automatic_status
     }
 }
 
@@ -677,58 +740,6 @@ fn apply_login_probe(
     *launch_at_login = UiLaunchAtLogin::from_result(status);
 }
 
-fn is_cancelled_error(error: &str) -> bool {
-    error.ends_with("cancelled")
-}
-
-/// Records a worker error that arrived after automatic tiling paused, ignoring
-/// routine cancellations caused by pausing or superseding input.
-fn record_paused_worker_error(last_error: &mut Option<String>, error: String) -> bool {
-    if is_cancelled_error(&error) {
-        return false;
-    }
-    *last_error = Some(error);
-    true
-}
-
-/// Applies a worker cycle result to `last_error` and returns the status line for
-/// the menu bar (`None` hides the status item).
-fn worker_status_update(
-    last_error: &mut Option<String>,
-    keep_shortcuts: bool,
-    result: Result<usize, &str>,
-) -> Option<String> {
-    match result {
-        Err(error) if is_cancelled_error(error) => {
-            // Routine cancellation is not a failure: keep any retained status
-            // error intact instead of overwriting it or flashing an error.
-            is_update_failed_error(last_error.as_deref())
-                .then(|| last_error.clone())
-                .flatten()
-        }
-        Err(error) => {
-            *last_error = Some(error.to_owned());
-            Some(error.to_owned())
-        }
-        Ok(failed) => {
-            let keep_update = is_update_failed_error(last_error.as_deref());
-            if !keep_shortcuts && !keep_update {
-                *last_error = None;
-            }
-            if failed > 0 {
-                Some(format!(
-                    "{failed} window operation{} failed",
-                    if failed == 1 { "" } else { "s" },
-                ))
-            } else if keep_update {
-                last_error.clone()
-            } else {
-                None
-            }
-        }
-    }
-}
-
 fn show_result(result: Result<CycleStatus, String>, status_text: Option<&str>) {
     if let Ok(status) = result {
         status_item::set_workspace_layouts(&status.layouts);
@@ -743,117 +754,6 @@ fn show_result(result: Result<CycleStatus, String>, status_text: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn automatic_resume_and_clean_cycles_preserve_update_install_failure() {
-        let reason = format!("{UPDATE_FAILED_PREFIX}could not write update receipt");
-        let mut last_error = Some(reason.clone());
-
-        let resumed_status = automatic_started_status(
-            &mut last_error,
-            "Automatic tiling enabled · Workspaces 1 / 6",
-        );
-        assert_eq!(resumed_status, reason);
-        assert_eq!(last_error.as_deref(), Some(reason.as_str()));
-
-        let cycle_status = worker_status_update(&mut last_error, false, Ok(0));
-        assert_eq!(cycle_status.as_deref(), Some(reason.as_str()));
-        assert_eq!(last_error.as_deref(), Some(reason.as_str()));
-
-        let failed_ops_status = worker_status_update(&mut last_error, false, Ok(2));
-        assert_eq!(
-            failed_ops_status.as_deref(),
-            Some("2 window operations failed")
-        );
-        assert_eq!(last_error.as_deref(), Some(reason.as_str()));
-    }
-
-    #[test]
-    fn automatic_start_and_clean_cycles_still_clear_non_update_errors() {
-        let mut last_error = Some("Accessibility permission is required".to_owned());
-        let status = automatic_started_status(
-            &mut last_error,
-            "Automatic tiling enabled · Workspaces 1 / 6",
-        );
-        assert_eq!(status, "Automatic tiling enabled · Workspaces 1 / 6");
-        assert_eq!(last_error, None);
-
-        let mut worker_error = Some("Workspace 2 could not restore all of its windows".to_owned());
-        assert_eq!(worker_status_update(&mut worker_error, false, Ok(0)), None);
-        assert_eq!(worker_error, None);
-
-        let mut shortcuts_error = Some("Shortcuts not applied: conflict".to_owned());
-        assert_eq!(
-            automatic_started_status(
-                &mut shortcuts_error,
-                "Automatic tiling enabled · Workspaces 1 / 6",
-            ),
-            "Automatic tiling enabled · Workspaces 1 / 6"
-        );
-        assert_eq!(
-            shortcuts_error.as_deref(),
-            Some("Shortcuts not applied: conflict")
-        );
-        assert_eq!(
-            worker_status_update(&mut shortcuts_error, true, Ok(0)),
-            None
-        );
-        assert_eq!(
-            shortcuts_error.as_deref(),
-            Some("Shortcuts not applied: conflict")
-        );
-    }
-
-    #[test]
-    fn routine_cancellations_preserve_retained_errors_and_never_store_cancelled() {
-        let reason = format!("{UPDATE_FAILED_PREFIX}could not write update receipt");
-        let mut last_error = Some(reason.clone());
-
-        // Routine cancellation while automatic preserves the retained install failure.
-        assert_eq!(
-            worker_status_update(&mut last_error, false, Err("workspace operation cancelled")),
-            Some(reason.clone())
-        );
-        assert_eq!(last_error.as_deref(), Some(reason.as_str()));
-
-        // The following clean cycle still retains the install failure.
-        assert_eq!(
-            worker_status_update(&mut last_error, false, Ok(0)),
-            Some(reason.clone())
-        );
-        assert_eq!(last_error.as_deref(), Some(reason.as_str()));
-
-        // Routine cancellation arriving after pause does not overwrite or populate last_error.
-        assert!(!record_paused_worker_error(
-            &mut last_error,
-            "workspace operation cancelled".into()
-        ));
-        assert_eq!(last_error.as_deref(), Some(reason.as_str()));
-
-        let mut empty = None;
-        assert_eq!(
-            worker_status_update(&mut empty, false, Err("workspace switch cancelled")),
-            None
-        );
-        assert_eq!(empty, None);
-        assert!(!record_paused_worker_error(
-            &mut empty,
-            "workspace operation cancelled".into()
-        ));
-        assert_eq!(empty, None);
-
-        // Genuine failures still report and store their error in both states.
-        assert_eq!(
-            worker_status_update(&mut empty, false, Err("Observation error: unavailable")),
-            Some("Observation error: unavailable".into())
-        );
-        assert_eq!(empty.as_deref(), Some("Observation error: unavailable"));
-        assert!(record_paused_worker_error(
-            &mut empty,
-            "Restore error".into()
-        ));
-        assert_eq!(empty.as_deref(), Some("Restore error"));
-    }
 
     #[test]
     fn login_probe_updates_both_snapshot_and_menu_item() {

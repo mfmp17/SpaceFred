@@ -27,12 +27,13 @@ fn closing_the_only_window_of_a_running_app_reflows_surviving_windows() {
                         frame: frame(50),
                         resizable: true,
                         title: None,
+                        document: None,
                     }],
                 },
                 crate::AppObservation::Complete {
                     app: crate::ObservedApplication {
                         id: popup.app.clone(),
-                        bundle_id: "com.raycast.macos".into(),
+                        bundle_id: "com.example.Popup".into(),
                     },
                     focused: Some(popup.clone()),
                     windows: vec![crate::ObservedWindow {
@@ -40,6 +41,7 @@ fn closing_the_only_window_of_a_running_app_reflows_surviving_windows() {
                         frame: frame(500),
                         resizable: true,
                         title: None,
+                        document: None,
                     }],
                 },
             ],
@@ -232,7 +234,7 @@ fn on_screen_window_omitted_from_one_snapshot_keeps_its_slot() {
 
     runtime.omitted_windows.insert(
         kept.clone(),
-        cycle::Omission::new(Instant::now() - OMISSION_SETTLE * 2),
+        cycle::Omission::new(runtime.backend.now() - OMISSION_SETTLE * 2),
     );
     runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
 
@@ -313,6 +315,7 @@ pub(super) fn apps_observation(
                         frame: *frame,
                         resizable: true,
                         title: None,
+                        document: None,
                     }],
                 },
             )
@@ -429,7 +432,7 @@ fn closed_window_its_app_keeps_ordered_out_gives_up_its_tile() {
 
     runtime.omitted_windows.insert(
         voice.clone(),
-        cycle::Omission::new(Instant::now() - OMISSION_SETTLE * 2),
+        cycle::Omission::new(runtime.backend.now() - OMISSION_SETTLE * 2),
     );
     runtime.cycle(outputs.clone(), &cancelled).unwrap();
 
@@ -471,7 +474,7 @@ fn workspace_whose_windows_all_leave_the_screen_keeps_its_tiles() {
     for window in [&editor, &agent] {
         runtime.omitted_windows.insert(
             window.clone(),
-            cycle::Omission::new(Instant::now() - OMISSION_SETTLE * 2),
+            cycle::Omission::new(runtime.backend.now() - OMISSION_SETTLE * 2),
         );
     }
     runtime.cycle(outputs.clone(), &cancelled).unwrap();
@@ -491,7 +494,6 @@ fn restored_slots_for_a_dead_application_are_retired() {
     let mut persisted = Workspaces::default();
     persisted.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
         id: SlotId(1),
-        weight: 1,
         binding: BindingState::Bound(dead.clone()),
     });
     let backend = FakeBackend {
@@ -577,6 +579,42 @@ fn an_app_that_quits_while_hidden_releases_its_tiles_and_recovery_metadata() {
 }
 
 #[test]
+fn a_failed_incarnation_lookup_does_not_forget_a_hidden_app_the_window_server_still_lists() {
+    // #735: the incarnation lookup briefly misses a running app (`running_apps` is
+    // empty, as when `NSRunningApplication` returns nil), but the window server, which
+    // the sweep reads directly through `window_server_frame`, still lists its parked
+    // windows under the same pid.
+    let first = window(10);
+    let second = window(11);
+    let backend = FakeBackend {
+        observation: Some(crate::NativeObservation {
+            cycle: 0,
+            mouse_down: false,
+            applications: Vec::new(),
+        }),
+        running_apps: Some(HashSet::new()),
+        ..FakeBackend::default()
+    };
+    let mut runtime = runtime_with_parked(
+        backend,
+        [(first.clone(), frame(50)), (second.clone(), frame(500))],
+    );
+    let hidden = WorkspaceId::new(3).unwrap();
+    bind(&mut runtime, hidden, &first);
+    bind(&mut runtime, hidden, &second);
+    runtime.backend.frames.insert(first.clone(), frame(50));
+    runtime.backend.frames.insert(second.clone(), frame(500));
+    let cancelled = AtomicBool::new(false);
+
+    runtime.cycle(outputs(), &cancelled).unwrap();
+
+    assert_eq!(runtime.workspaces.workspace_of(&first), Some(hidden));
+    assert_eq!(runtime.workspaces.workspace_of(&second), Some(hidden));
+    assert!(runtime.parked.contains_key(&first));
+    assert!(runtime.parked.contains_key(&second));
+}
+
+#[test]
 fn asynchronously_clamped_window_settles_without_reapplying_every_cycle() {
     let main = window(10);
     let huddle = window(11);
@@ -596,7 +634,8 @@ fn asynchronously_clamped_window_settles_without_reapplying_every_cycle() {
     backend.frames.insert(main.clone(), frame(50));
     backend.frames.insert(huddle.clone(), frame(350));
     backend.frames.insert(settings.clone(), frame(650));
-    let mut runtime = runtime(backend);
+    let columns = Config::parse("version = 1\n[settings]\nlayout = \"columns\"\n").unwrap();
+    let mut runtime = runtime_with_config(backend, columns);
     let outputs = outputs();
     let cancelled = AtomicBool::new(false);
 
@@ -669,7 +708,8 @@ fn varying_async_bounces_freeze_after_attempt_limit_and_clear_on_target_change()
     backend.frames.insert(main.clone(), frame(50));
     backend.frames.insert(huddle.clone(), frame(350));
     backend.frames.insert(settings.clone(), frame(650));
-    let mut runtime = runtime(backend);
+    let columns = Config::parse("version = 1\n[settings]\nlayout = \"columns\"\n").unwrap();
+    let mut runtime = runtime_with_config(backend, columns);
     let outputs = outputs();
     let cancelled = AtomicBool::new(false);
 
@@ -769,7 +809,7 @@ fn varying_constrained_rejections_freeze_and_clear_on_user_gesture() {
     runtime.backend.managed_outcome = None;
     let _ = runtime.execute(
         WorkerCommand::Gesture(
-            FinalGesture::Drop(stubborn.clone(), (750, 400)),
+            FinalGesture::drop(stubborn.clone(), (750, 400)),
             false,
             outputs.clone(),
         ),
@@ -855,7 +895,8 @@ fn delayed_async_bounce_after_matching_ticks_freezes_and_clears_on_target_change
     assert!(!runtime.constrained[ws].contains_key(&mini));
 
     // Once ASYNC_BOUNCE_SETTLE elapses at the matching frame, applied clears cleanly.
-    runtime.applied[ws].get_mut(&mini).unwrap().at = Instant::now() - cycle::ASYNC_BOUNCE_SETTLE;
+    runtime.applied[ws].get_mut(&mini).unwrap().at =
+        runtime.backend.now() - cycle::ASYNC_BOUNCE_SETTLE;
     runtime.cycle(outputs, &cancelled).unwrap();
     assert!(!runtime.applied[ws].contains_key(&mini));
 }

@@ -120,7 +120,7 @@ const KNOWN_SETTINGS: Record<string, BounceMeta> = {
     heading: "General Settings",
     ogTitle: "General Settings — Spaceman",
     description:
-      "Automatic tiling, Workspace HUD style, Launch at Login, update channel, and your config.toml file.",
+      "Automatic tiling, Workspace HUD style, Launch at login, update channel, and your config.toml file.",
     demo: "hud",
   },
   rules: {

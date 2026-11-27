@@ -35,11 +35,7 @@ impl MainThreadAgent {
                     .and_then(|debug| {
                         serde_json::to_string(debug).map_err(|error| error.to_string())
                     }),
-                ControlCommand::Queue(ref action) if self.automatic => self.queue_action(
-                    Action::Worker(action.clone()),
-                    &action.queued_acknowledgement(),
-                ),
-                ControlCommand::Queue(_) => Err("automatic tiling is paused".into()),
+                ControlCommand::Queue(ref action) => self.queue_control_input(action.clone()),
                 ControlCommand::Restart if self.worker.is_busy() => {
                     Err("Spaceman is busy; retry restart".into())
                 }
@@ -59,6 +55,23 @@ impl MainThreadAgent {
             };
             request.respond(response);
         }
+    }
+
+    /// Admits a `spaceman ctl` worker command straight into the input queue,
+    /// so its reply says `queued` only when the command really was (#712).
+    fn queue_control_input(&mut self, action: WorkerAction) -> Result<String, String> {
+        // Input that arrived earlier (shortcuts, the menu) keeps its place ahead.
+        self.drain_actions();
+        if self.exit_intent.is_some() {
+            return Err("Spaceman agent is stopping".into());
+        }
+        if !self.automatic {
+            return Err("automatic tiling is paused".into());
+        }
+        let ack = action.queued_acknowledgement();
+        self.admit_worker_input(QueuedInput::Action(action))
+            .map(|()| ack)
+            .map_err(Into::into)
     }
 
     fn queue_action(&self, action: Action, ack: &str) -> Result<String, String> {

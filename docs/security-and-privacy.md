@@ -3,17 +3,24 @@
 ## Accessibility Scope
 
 Spaceman needs macOS Accessibility permission to enumerate eligible application windows, read their
-role, state, title, position, and size, determine focus, and focus, move, or resize them. It also reads
+role, state, title, `AXDocument` URL/path, position, and size, determine focus, and focus, move,
+or resize them. It also reads
 the on-screen Core Graphics window list, display topology, keyboard input source, pointer position,
-and mouse-button state needed for tiling and gestures. Two listen-only event taps watch three-finger
-trackpad swipes and Option key presses. The key tap reads only the virtual key code and modifier flags
-of presses with Option held, never characters, to notice a Spaceman shortcut macOS did not deliver;
-other presses are ignored and nothing is stored.
+and mouse-button state needed for tiling and gestures. Two listen-only event taps watch three- and
+four-finger trackpad swipes and Option key presses. The key tap reads only the virtual key code and
+modifier flags of presses with Option held, never characters, to notice a Spaceman shortcut macOS
+did not deliver; other presses are ignored and nothing is stored. The setup tour's Try it step uses
+the same kind of tap, only while that step is on screen, to hear the four shortcuts it teaches.
+While the setup window has the keyboard on that step, Spaceman's global hotkeys are held off, so
+those shortcuts move the step's miniature desktop and no real window.
 
 The permission is broad because macOS grants Accessibility at application scope. Spaceman limits its
 own writes to eligible standard, non-minimized, non-fullscreen windows whose position is settable.
 Resizable windows may be moved and resized; movable non-resizable windows may be parked off-screen
-and restored without changing their size. It does not require disabling System Integrity Protection.
+and restored without changing their size. The one action Spaceman performs inside another app is
+`move-tab`: when you run it, Spaceman reads the focused app's trailing menu-bar menus (item
+identifiers, titles, and enabled state, never stored) to find its own `Move Tab to New Window`
+command and presses it. It does not require disabling System Integrity Protection.
 
 ## Data Handling
 
@@ -28,8 +35,8 @@ from `https://anoma.ly/release/spaceman/files/`, and is used only once its size 
 manifest and the `Spaceman.app` inside it is `anomaly.spaceman`, passes
 `codesign --verify --deep --strict` against Anomaly's notarized Developer ID requirement
 (`app/update-requirement.txt`), and carries team `5NZ4Q7NXJ4`. Automatic installation is off: the
-update waits for `Install & Restart` or a quit, either of which restores every parked window before
-the bundle is swapped (`renamex_np`); only `Install & Restart` relaunches. Downloads, the install's
+update waits for `Install & restart` or a quit, either of which restores every parked window before
+the bundle is swapped (`renamex_np`); only `Install & restart` relaunches. Downloads, the install's
 rollout bucket (a random 0–99 that never leaves the Mac) and `installed.json` (which release the
 updater last installed) live in `~/Library/Application Support/Spaceman/updates/`. Builds from
 source never check. An install in a location the user can't write to checks, but only offers the
@@ -41,9 +48,19 @@ The optional `Launch at Login` menu action registers or unregisters the signed m
 macOS Service Management. Registration is stored and enforced by macOS; Spaceman does not install a
 separate helper, daemon, or launch-agent plist.
 
-Spaceman can read a window title for exact config-rule matching. Titles remain in memory and are
-explicitly excluded from serialized observations, persisted state, the arrangement journal,
-`spaceman ctl debug`, `spaceman doctor`, and `spaceman hud` output.
+The setup tour suggests an arrangement from the windows open at that moment. The suggestion is
+computed on the Mac from each app's bundle ID, its `Info.plist` `LSApplicationCategoryType`, window
+sizes and resizability, and each display's width; window titles are never part of it, and nothing is
+sent anywhere. The tour's permission step reads two switches in the `com.apple.WindowManager`
+preferences (`GloballyEnabled` for Stage Manager, `EnableTilingByEdgeDrag` for macOS edge tiling)
+and writes one only when you press its `Turn off`, which System Settings › Desktop & Dock undoes.
+
+Spaceman reads window titles and `AXDocument` paths for config-rule matching (including
+`title_contains`) and for matching multi-window applications across restarts. They may be stored
+locally in mode-`0600` `window-memory.json` solely for placement recall, and are explicitly
+excluded from serialized observations, `workspace-state.json`, `parked-windows.json`, the
+arrangement journal, `agent.log`, `spaceman ctl debug`, `spaceman doctor`, fixtures, and
+`spaceman hud` output.
 
 The Workspace HUD shows each workspace's app icons. The runtime sends the agent each window's bundle
 identifier and its layout rectangle, never a title, and the agent reads the icons from the installed
@@ -52,11 +69,14 @@ apps on the Mac. Nothing about the HUD is written to disk or logged.
 Local files live under `~/Library/Application Support/Spaceman/`:
 
 - `config.toml`: user-authored configuration;
-- `workspace-state.json`: active workspace selectors, previous-workspace history, logical slots,
-  last-focused tile intent, Fullscreen Layout state, floating-window ownership, and layout trees;
+- `workspace-state.json`: active workspace selectors, previous-workspace history, the display
+  selector each connected display (by its display UUID) showed last, logical slots,
+  last-focused tile intent, Fullscreen Layout state, floating-window ownership, hand-pinned floating
+  windows, and layout trees;
 - `parked-windows.json`: physical process/window identifiers and original frames needed for recovery;
-- `window-memory.json`: per-application bundle identifiers with each remembered window's workspace,
-  floating state, and last frame, used to restore placements after relaunches and reboots;
+- `window-memory.json`: mode `0600`; per-application bundle identifiers with each remembered
+  window's workspace, floating state, last frame, and optional local `AXDocument` path and window
+  title, used solely to match and restore multi-window placements after relaunches and reboots;
 - `agent.log`: timestamped diagnostic events (switches, parking, restoration, ownership changes) with
   process/window identifiers and frames, never window titles. Focus-follow switches also record
   how long ago a key, click, or modifier change happened and whether Command was held, never which
@@ -70,9 +90,11 @@ Local files live under `~/Library/Application Support/Spaceman/`:
 - `control.sock`: local Unix control socket, mode `0600`;
 - `control.lock`: single-agent lock, mode `0600`.
 
-State files contain application process/window identity, bundle identifiers, and geometry, but no
-window titles. The code uses atomic replacement for the JSON state files and restricts the Application Support directory to
-mode `0700`; do not sync or publish recovery state without reviewing it.
+`workspace-state.json` and `parked-windows.json` contain application process/window identity,
+bundle identifiers, and geometry, never window titles or `AXDocument` paths. `window-memory.json`
+is written atomically at mode `0600` and may store local window titles and `AXDocument` paths for
+recall. The code uses atomic replacement for the JSON state files and restricts the Application
+Support directory to mode `0700`; do not sync or publish recovery state without reviewing it.
 
 ## Native Interfaces
 

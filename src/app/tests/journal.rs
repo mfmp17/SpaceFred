@@ -111,11 +111,60 @@ fn journal_writes_a_snapshot_then_only_diffs() {
 }
 
 #[test]
-fn journal_lines_never_contain_window_titles() {
+fn a_wrong_mark_snapshots_the_screen_it_was_accepted_on_not_the_settled_one() {
+    let tiled = window(10);
+    let mut backend = FakeBackend {
+        observation: Some(observation(&tiled, frame(50))),
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(tiled.clone(), frame(50));
+    let mut runtime = runtime(backend);
+    let cancelled = AtomicBool::new(false);
+    runtime.cycle(outputs(), &cancelled).unwrap();
+    runtime.check_arrangement(&outputs());
+    // The user marks while a busy switch still shows workspace 2 at the old frame…
+    let moment = crate::app::journal::WrongMoment {
+        t: 1_000,
+        active: vec![WorkspaceId::new(2).unwrap(), WorkspaceId::SIX],
+        frames: HashMap::from([(10, frame(50))]),
+    };
+    // …and the worker reaches the mark only after the window has settled.
+    runtime.backend.frames.insert(tiled.clone(), frame(60));
+    let written = runtime.backend.journal.len();
+    runtime.mark_wrong(Some(Box::new(moment)), &outputs());
+    runtime.check_arrangement(&outputs());
+
+    let events = &runtime.backend.journal[written..];
+    assert!(matches!(events[0], JournalEvent::MarkedWrong), "{events:?}");
+    let JournalEvent::Snapshot { arrangement } = &events[1] else {
+        panic!("expected a snapshot after the mark, got {events:?}");
+    };
+    assert_eq!(
+        arrangement.active,
+        vec![WorkspaceId::new(2).unwrap(), WorkspaceId::SIX]
+    );
+    assert_eq!(arrangement.windows[0].frame, Some(frame(50)));
+    // The settled arrangement still follows, as a diff from the marked one.
+    let JournalEvent::Diff {
+        active, changes, ..
+    } = &events[2]
+    else {
+        panic!("expected a diff to the settled frames, got {events:?}");
+    };
+    assert_eq!(
+        active.as_deref(),
+        Some([WorkspaceId::ONE, WorkspaceId::SIX].as_slice())
+    );
+    assert_eq!(changes[0].after.as_ref().unwrap().frame, Some(frame(60)));
+}
+
+#[test]
+fn journal_lines_never_contain_window_titles_or_documents() {
     let tiled = window(10);
     let mut observed = observation(&tiled, frame(50));
     if let crate::AppObservation::Complete { windows, .. } = &mut observed.applications[0] {
         windows[0].title = Some("Private document".into());
+        windows[0].document = Some("file:///Users/example/private/secret.rs".into());
     }
     let mut backend = FakeBackend {
         observation: Some(observed),
@@ -126,11 +175,21 @@ fn journal_lines_never_contain_window_titles() {
     runtime.journal_start(false);
     runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
     runtime.check_arrangement(&outputs());
+    let mut lines = Vec::new();
     for event in &runtime.backend.journal {
         let json = serde_json::to_string(event).unwrap();
         assert!(!json.contains("Private document"), "{json}");
         assert!(!json.contains("title"), "{json}");
+        assert!(!json.contains("secret.rs"), "{json}");
+        assert!(!json.contains("document"), "{json}");
+        lines.push(crate::journal::JournalLine {
+            t: 1_000,
+            event: event.clone(),
+        });
     }
+    let doctor = crate::journal::summarize(&lines, 0, 2_000, 0);
+    assert!(!doctor.contains("Private document"), "{doctor}");
+    assert!(!doctor.contains("secret.rs"), "{doctor}");
 }
 
 #[test]

@@ -1,14 +1,13 @@
 //! The Scratchpad Lab (`[labs] scratchpad`): an i3/sway-style stash of windows kept off-screen
-//! until summoned. This module is the pure, platform-neutral model: which windows are in the
-//! scratchpad, which one is shown where, the order a toggle cycles through them, and where a
-//! summoned window lands. `app::scratchpad` performs the native writes.
+//! until summoned. This module is the pure, platform-neutral side: the order a toggle cycles
+//! through the scratchpad's windows and where a summoned window lands. Membership is a window's
+//! [`crate::workspace::Residency`], so a scratchpad window is never also a float or a tile.
+//! `app::scratchpad` performs the native writes.
 //!
 //! A hidden scratchpad window is parked exactly like a window on an inactive workspace (its
 //! recovery frame in `parked-windows.json`), so pause, quit, restart and crashes bring it back on
 //! screen. A shown one floats on the workspace it was summoned to. None of this is persisted:
 //! after a restart a recovered scratchpad window is an ordinary window again.
-
-use std::collections::VecDeque;
 
 use crate::{PhysicalWindowId, Rect, WorkspaceId};
 
@@ -53,18 +52,22 @@ pub struct ScratchpadEntry {
     pub size: Option<(i32, i32)>,
     /// The workspace it floats on while shown; `None` while hidden (parked off-screen).
     pub shown_on: Option<WorkspaceId>,
-    /// Centered frame a summon requested that the window server has not confirmed yet.
-    pub pending_summon: Option<Rect>,
 }
 
-/// Scratchpad windows in toggle order: a toggle summons the first one not already shown on the
-/// focused workspace, and hiding a window sends it to the back, so repeated toggles cycle.
+/// The scratchpad windows in toggle order, read from their residency
+/// ([`crate::workspace::Residency::Scratchpad`]): a toggle summons the first one not already
+/// shown on the focused workspace, and hiding a window sends it to the back, so repeated toggles
+/// cycle.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ScratchpadState {
-    entries: VecDeque<ScratchpadEntry>,
+pub struct Scratchpad {
+    entries: Vec<ScratchpadEntry>,
 }
 
-impl ScratchpadState {
+impl Scratchpad {
+    pub(crate) const fn new(entries: Vec<ScratchpadEntry>) -> Self {
+        Self { entries }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -81,39 +84,16 @@ impl ScratchpadState {
     }
 
     #[must_use]
-    pub fn entry(&self, window: &PhysicalWindowId) -> Option<&ScratchpadEntry> {
-        self.entries.iter().find(|entry| &entry.window == window)
-    }
-
-    pub fn entries(&self) -> impl Iterator<Item = &ScratchpadEntry> {
-        self.entries.iter()
-    }
-
-    /// Adds a hidden window at the back of the order. Returns false if it was already there.
-    pub fn insert(&mut self, window: PhysicalWindowId, size: Option<(i32, i32)>) -> bool {
-        if self.contains(&window) {
-            return false;
-        }
-        self.entries.push_back(ScratchpadEntry {
-            window,
-            size,
-            shown_on: None,
-            pending_summon: None,
-        });
-        true
-    }
-
-    pub fn remove(&mut self, window: &PhysicalWindowId) -> Option<ScratchpadEntry> {
-        let index = self
-            .entries
+    pub fn entry(&self, window: &PhysicalWindowId) -> Option<ScratchpadEntry> {
+        self.entries
             .iter()
-            .position(|entry| &entry.window == window)?;
-        self.entries.remove(index)
+            .find(|entry| &entry.window == window)
+            .cloned()
     }
 
-    /// Empties the scratchpad, returning what it held.
-    pub fn clear(&mut self) -> Vec<ScratchpadEntry> {
-        self.entries.drain(..).collect()
+    #[must_use]
+    pub fn entries(&self) -> &[ScratchpadEntry] {
+        &self.entries
     }
 
     /// The windows shown on `workspace`, in order.
@@ -143,43 +123,6 @@ impl ScratchpadState {
             .iter()
             .find(|entry| entry.shown_on != Some(workspace))
             .map(|entry| entry.window.clone())
-    }
-
-    pub fn mark_shown(&mut self, window: &PhysicalWindowId, workspace: WorkspaceId) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| &entry.window == window)
-        {
-            entry.shown_on = Some(workspace);
-        }
-    }
-
-    #[must_use]
-    pub fn pending_summon(&self, window: &PhysicalWindowId) -> Option<Rect> {
-        self.entry(window).and_then(|entry| entry.pending_summon)
-    }
-
-    pub fn set_pending_summon(&mut self, window: &PhysicalWindowId, frame: Option<Rect>) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| &entry.window == window)
-        {
-            entry.pending_summon = frame;
-        }
-    }
-
-    /// Hides `window` and sends it to the back of the order, so the next toggle summons the
-    /// window after it. `size` replaces the remembered size when known.
-    pub fn mark_hidden(&mut self, window: &PhysicalWindowId, size: Option<(i32, i32)>) {
-        let Some(mut entry) = self.remove(window) else {
-            return;
-        };
-        entry.shown_on = None;
-        entry.pending_summon = None;
-        entry.size = size.or(entry.size);
-        self.entries.push_back(entry);
     }
 }
 
@@ -263,33 +206,73 @@ mod tests {
 
     #[test]
     fn toggles_cycle_through_windows_in_order() {
-        let mut scratchpad = ScratchpadState::default();
+        let mut workspaces = crate::workspace::Workspaces::default();
         let one = WorkspaceId::ONE;
-        assert_eq!(scratchpad.next_for(one), None);
-        assert!(scratchpad.insert(window(1), None));
-        assert!(scratchpad.insert(window(2), Some((500, 400))));
-        assert!(!scratchpad.insert(window(1), None));
-        assert_eq!(scratchpad.len(), 2);
+        assert_eq!(workspaces.scratchpad().next_for(one), None);
+        assert!(workspaces.stash(window(1), None));
+        assert!(workspaces.stash(window(2), Some((500, 400))));
+        assert!(!workspaces.stash(window(1), None));
+        assert_eq!(workspaces.scratchpad().len(), 2);
 
-        assert_eq!(scratchpad.next_for(one), Some(window(1)));
-        scratchpad.mark_shown(&window(1), one);
-        assert_eq!(scratchpad.shown_on(one), vec![window(1)]);
-        assert_eq!(scratchpad.hidden(), vec![window(2)]);
+        assert_eq!(workspaces.scratchpad().next_for(one), Some(window(1)));
+        workspaces.show_scratchpad(&window(1), one);
+        assert_eq!(workspaces.scratchpad().shown_on(one), vec![window(1)]);
+        assert_eq!(workspaces.floating_workspace_of(&window(1)), Some(one));
+        assert_eq!(workspaces.scratchpad().hidden(), vec![window(2)]);
         // A window shown on another workspace can be summoned here.
-        assert_eq!(scratchpad.next_for(WorkspaceId::TWO), Some(window(1)));
+        assert_eq!(
+            workspaces.scratchpad().next_for(WorkspaceId::TWO),
+            Some(window(1))
+        );
 
-        scratchpad.mark_hidden(&window(1), Some((640, 480)));
+        workspaces.hide_scratchpad(&window(1), Some((640, 480)));
+        assert_eq!(workspaces.floating_workspace_of(&window(1)), None);
+        let scratchpad = workspaces.scratchpad();
         assert_eq!(scratchpad.next_for(one), Some(window(2)));
         assert_eq!(scratchpad.entry(&window(1)).unwrap().size, Some((640, 480)));
-        scratchpad.mark_shown(&window(2), one);
-        scratchpad.mark_hidden(&window(2), None);
+        workspaces.show_scratchpad(&window(2), one);
+        workspaces.hide_scratchpad(&window(2), None);
+        let scratchpad = workspaces.scratchpad();
         assert_eq!(scratchpad.entry(&window(2)).unwrap().size, Some((500, 400)));
         assert_eq!(scratchpad.next_for(one), Some(window(1)));
 
-        assert_eq!(scratchpad.remove(&window(1)).unwrap().window, window(1));
-        assert!(!scratchpad.contains(&window(1)));
-        assert_eq!(scratchpad.clear().len(), 1);
-        assert!(scratchpad.is_empty());
+        assert!(workspaces.leave_scratchpad(&window(1)));
+        assert!(!workspaces.scratchpad().contains(&window(1)));
+        assert_eq!(workspaces.clear_scratchpad().len(), 1);
+        assert!(workspaces.scratchpad().is_empty());
+    }
+
+    #[test]
+    fn a_window_has_one_residency() {
+        use crate::workspace::{FloatCause, Residency};
+        let mut workspaces = crate::workspace::Workspaces::default();
+        let one = WorkspaceId::ONE;
+        workspaces.float(window(1), one, FloatCause::Manual);
+        assert!(workspaces.pin(window(1)));
+        // Stashing a float drops the float and its pin.
+        assert!(workspaces.stash(window(1), None));
+        assert!(!workspaces.is_pinned(&window(1)));
+        assert_eq!(workspaces.floating_workspace_of(&window(1)), None);
+        // Moving a summoned window to another workspace takes it out of the scratchpad.
+        workspaces.show_scratchpad(&window(1), one);
+        workspaces.own_floating(window(1), WorkspaceId::TWO);
+        assert!(!workspaces.scratchpad().contains(&window(1)));
+        assert!(workspaces.is_manual_float(&window(1)));
+        // Tiling a float is one transition: no float is left behind.
+        workspaces.adopt_tile(
+            window(1),
+            WorkspaceId::TWO,
+            crate::config::LayoutMode::Columns,
+            Rect::default(),
+            None,
+        );
+        assert_eq!(
+            workspaces.residency(&window(1)),
+            Some(Residency::Tiled {
+                workspace: WorkspaceId::TWO
+            })
+        );
+        assert_eq!(workspaces.floating_workspace_of(&window(1)), None);
     }
 
     #[test]

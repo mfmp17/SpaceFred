@@ -59,6 +59,16 @@ pub struct WorkspaceRow {
     pub keys: RowKeys,
 }
 
+/// Keycaps for a compact numbered range. Switch to space 1–10 stays on Control while the
+/// base is Option; Move follows the base and adds Shift.
+fn numbered_range_modifiers(kind: WorkspaceKind, base: Modifiers) -> Modifiers {
+    if kind == WorkspaceKind::Switch {
+        spaceman::shortcuts::numbered_switch_modifiers(base)
+    } else {
+        kind.modifiers(base)
+    }
+}
+
 fn command_for(kind: WorkspaceKind, workspace: WorkspaceId) -> Command {
     match kind {
         WorkspaceKind::Switch => Command::Switch(workspace),
@@ -100,17 +110,62 @@ pub fn active_chords(
     chords
 }
 
+/// The keys that switch to `workspace` as one run of keycaps ("⌃⌥0"), from the first chord
+/// that does it; `None` when no shortcut does.
+pub fn switch_keys(shortcuts: &Shortcuts, workspace: WorkspaceId) -> Option<String> {
+    active_chords(shortcuts, WorkspaceKind::Switch, workspace)
+        .first()
+        .map(|chord| chord.keycaps().concat())
+}
+
 /// All workspace rows for the Workspaces card in Settings › Shortcuts: numbered Switch and Move,
 /// then named Switch and Move.
 pub fn rows(shortcuts: &Shortcuts, named: &[WorkspaceId]) -> Vec<WorkspaceRow> {
     // Numbered Switch to space rows are recorders in the Switching section, not this card.
-    let mut out = numbered_rows(shortcuts, WorkspaceKind::Move);
-    out.extend(named_rows(shortcuts, named, WorkspaceKind::Switch));
-    out.extend(named_rows(shortcuts, named, WorkspaceKind::Move));
+    let mut out = numbered_rows(shortcuts, WorkspaceKind::Move, None);
+    for kind in [WorkspaceKind::Switch, WorkspaceKind::Move] {
+        out.extend(named_rows(shortcuts, named, kind, None));
+    }
     out
 }
 
-fn numbered_rows(shortcuts: &Shortcuts, kind: WorkspaceKind) -> Vec<WorkspaceRow> {
+/// The rows `running` shows for the workspaces `saved` gives no row at all (with
+/// `defaults = false`, those it binds nothing to) while `running` still runs a chord for them,
+/// grouped as `running`'s own rows group them. Empty when `saved` keeps its built-ins, since then
+/// every workspace already has a saved row.
+pub fn running_only_rows(
+    running: &Shortcuts,
+    saved: &Shortcuts,
+    named: &[WorkspaceId],
+) -> Vec<WorkspaceRow> {
+    if saved.defaults {
+        return Vec::new();
+    }
+    let kinds = [WorkspaceKind::Switch, WorkspaceKind::Move];
+    let only = |kind: WorkspaceKind| {
+        move |workspace: WorkspaceId| {
+            active_chords(saved, kind, workspace).is_empty()
+                && !active_chords(running, kind, workspace).is_empty()
+        }
+    };
+    let mut out = Vec::new();
+    for kind in kinds {
+        out.extend(numbered_rows(running, kind, Some(&only(kind))));
+    }
+    for kind in kinds {
+        out.extend(named_rows(running, named, kind, Some(&only(kind))));
+    }
+    out
+}
+
+/// Keeps only the workspaces it accepts; `None` keeps every one.
+type Include<'a> = Option<&'a dyn Fn(WorkspaceId) -> bool>;
+
+fn numbered_rows(
+    shortcuts: &Shortcuts,
+    kind: WorkspaceKind,
+    include: Include<'_>,
+) -> Vec<WorkspaceRow> {
     let mut default_numbers = Vec::new();
     let mut entries: Vec<(u8, WorkspaceRow)> = Vec::new();
 
@@ -118,6 +173,9 @@ fn numbered_rows(shortcuts: &Shortcuts, kind: WorkspaceKind) -> Vec<WorkspaceRow
         let Some(number) = workspace.number() else {
             continue;
         };
+        if include.is_some_and(|include| !include(workspace)) {
+            continue;
+        }
         let default = default_chord(kind, workspace, shortcuts.modifier);
         let chords = active_chords(shortcuts, kind, workspace);
         if shortcuts.defaults && chords == [default] {
@@ -135,7 +193,7 @@ fn numbered_rows(shortcuts: &Shortcuts, kind: WorkspaceKind) -> Vec<WorkspaceRow
     }
 
     if let Some(&first) = default_numbers.first() {
-        let mut caps = kind.modifiers(shortcuts.modifier).keycaps();
+        let mut caps = numbered_range_modifiers(kind, shortcuts.modifier).keycaps();
         caps.push(format_number_keycap(&default_numbers));
         entries.push((
             first,
@@ -159,6 +217,7 @@ fn named_rows(
     shortcuts: &Shortcuts,
     named: &[WorkspaceId],
     kind: WorkspaceKind,
+    include: Include<'_>,
 ) -> Vec<WorkspaceRow> {
     let mut default_letters: Vec<char> = Vec::new();
     let mut entries: Vec<(char, WorkspaceRow)> = Vec::new();
@@ -167,6 +226,9 @@ fn named_rows(
         let Some(letter) = workspace.letter() else {
             continue;
         };
+        if include.is_some_and(|include| !include(workspace)) {
+            continue;
+        }
         let default = default_chord(kind, workspace, shortcuts.modifier);
         let chords = active_chords(shortcuts, kind, workspace);
         if shortcuts.defaults && chords == [default] {
@@ -183,7 +245,8 @@ fn named_rows(
         }
     }
 
-    if shortcuts.defaults && entries.is_empty() {
+    // The generic A…Z row names no workspace, so a filtered list never shows it.
+    if include.is_none() && shortcuts.defaults && entries.is_empty() {
         let mut caps = kind.modifiers(shortcuts.modifier).keycaps();
         caps.push("A…Z".into());
         return vec![WorkspaceRow {
@@ -409,6 +472,63 @@ mod tests {
             }
         );
         assert_eq!(list[3].title, "Move window to a named workspace");
+    }
+
+    #[test]
+    fn a_rejected_defaults_off_table_lists_the_workspace_keys_that_still_run() {
+        let saved = parse(
+            "[shortcuts]\ndefaults = false\n[shortcuts.bindings]\n\"ctrl+alt+d\" = \"switch next\"\n",
+        );
+        // The saved table has no workspace rows, so the running family gets its own.
+        assert!(rows(&saved, &[]).is_empty());
+        let running = parse("[shortcuts]\nmodifier = \"ctrl+alt\"\n");
+        let list = running_only_rows(&running, &saved, &[]);
+        assert_eq!(
+            list.iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Switch to workspace 1–10", "Move window to workspace 1–10"]
+        );
+        assert_eq!(
+            list[0].keys,
+            RowKeys::Range(vec!["⌃".into(), "⌥".into(), "1…9, 0".into()])
+        );
+
+        // A rebound number shows its own chord; a disabled one runs nothing and gets no row.
+        let running = parse(
+            "[shortcuts.bindings]\n\"ctrl+alt+y\" = \"switch 2\"\n\"ctrl+2\" = \"none\"\n\"ctrl+8\" = \"none\"\n",
+        );
+        let switch: Vec<_> = running_only_rows(&running, &saved, &[])
+            .into_iter()
+            .filter(|row| row.key.starts_with("switch"))
+            .collect();
+        assert_eq!(
+            switch,
+            vec![
+                WorkspaceRow {
+                    key: "switch".into(),
+                    title: "Switch to workspace 1, 3–7, 9–10".into(),
+                    keys: RowKeys::Range(vec!["⌃".into(), "1, 3…7, 9, 0".into()]),
+                },
+                WorkspaceRow {
+                    key: "switch-2".into(),
+                    title: "Switch to workspace 2".into(),
+                    keys: RowKeys::Chords(vec![chord("ctrl+alt+y")]),
+                },
+            ]
+        );
+
+        // A workspace the saved table still binds keeps its saved row and is not repeated.
+        let saved_one = parse(
+            "[shortcuts]\ndefaults = false\n[shortcuts.bindings]\n\"ctrl+alt+1\" = \"switch 1\"\n",
+        );
+        let running = parse("[shortcuts]\nmodifier = \"ctrl+alt\"\n");
+        assert_eq!(
+            running_only_rows(&running, &saved_one, &[])[0].title,
+            "Switch to workspace 2–10"
+        );
+        // With the built-ins on, every workspace already has a saved row.
+        assert!(running_only_rows(&running, &parse(""), &[]).is_empty());
     }
 
     #[test]

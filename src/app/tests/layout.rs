@@ -84,7 +84,7 @@ fn layout_toggle_exits_fullscreen_and_applies_the_next_split_axis() {
 
     runtime.toggle_layout(outputs, &cancelled).unwrap();
 
-    assert!(!runtime.workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(!runtime.workspaces.deck(WorkspaceId::ONE).is_monocle());
     assert_eq!(
         runtime.workspaces.engine(WorkspaceId::ONE).root_axis(),
         crate::Axis::Vertical
@@ -143,9 +143,8 @@ fn layout_toggle_repartitions_and_persists_the_focused_workspace() {
         runtime
             .workspaces
             .engine(WorkspaceId::ONE)
-            .model()
-            .workspace
-            .axis,
+            .layout()
+            .root_axis(),
         crate::Axis::Vertical
     );
     assert_eq!(runtime.backend.frames[&first].height, 400);
@@ -154,7 +153,7 @@ fn layout_toggle_repartitions_and_persists_the_focused_workspace() {
 }
 
 #[test]
-fn resizing_a_tile_updates_weights_and_live_previews_its_sibling() {
+fn resizing_a_tile_previews_its_sibling_and_saves_weights_on_release() {
     let first = window(10);
     let second = window(20);
     let mut backend = FakeBackend {
@@ -182,13 +181,16 @@ fn resizing_a_tile_updates_weights_and_live_previews_its_sibling() {
         )
         .unwrap();
 
-    let slots = &runtime
-        .workspaces
-        .engine(WorkspaceId::ONE)
-        .model()
-        .workspace
-        .slots;
-    assert_eq!((slots[0].weight, slots[1].weight), (600, 400));
+    let weights = |runtime: &WorkspaceRuntime<FakeBackend>| {
+        let engine = runtime.workspaces.engine(WorkspaceId::ONE);
+        let slots = &engine.model().workspace.slots;
+        (
+            engine.layout().weight(slots[0].id),
+            engine.layout().weight(slots[1].id),
+        )
+    };
+    // The preview moves the sibling; the split itself waits for mouse-up.
+    assert_eq!(weights(&runtime), (Some(1), Some(1)));
     assert_eq!(runtime.backend.frames[&second].x, 600);
     assert_eq!(runtime.backend.frames[&first], frame(50));
     assert!(runtime.backend.workspace_state.is_none());
@@ -208,6 +210,7 @@ fn resizing_a_tile_updates_weights_and_live_previews_its_sibling() {
         )
         .unwrap();
 
+    assert_eq!(weights(&runtime), (Some(600), Some(400)));
     assert!(runtime.backend.workspace_state.is_some());
 }
 
@@ -382,9 +385,8 @@ fn perpendicular_reorder_reorients_a_two_window_workspace_before_crossing_displa
         runtime
             .workspaces
             .engine(WorkspaceId::ONE)
-            .model()
-            .workspace
-            .axis,
+            .layout()
+            .root_axis(),
         crate::Axis::Horizontal
     );
     assert_eq!(

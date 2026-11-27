@@ -19,6 +19,7 @@ fn spacing(inner: i32, [top, bottom, left, right]: [i32; 4]) -> Spacing {
         left,
         right,
         single_window_max_width: 0,
+        single_window_max_height: 0,
     }
 }
 
@@ -206,6 +207,40 @@ fn fullscreen_layout_uses_the_padded_and_capped_single_frame() {
     assert_eq!(Settings::for_output(OUTPUT).single(), OUTPUT);
 }
 
+#[test]
+fn a_height_cap_centers_the_lone_tile_on_both_axes() {
+    let both = Settings::for_output(OUTPUT).spaced(Spacing {
+        single_window_max_width: 600,
+        single_window_max_height: 500,
+        ..spacing(0, [20, 0, 0, 0])
+    });
+    let usable = both.usable();
+    let frame = both.single();
+    assert_eq!((frame.width, frame.height), (600, 500));
+    assert_eq!(frame.x, usable.x + (usable.width - 600) / 2);
+    assert_eq!(frame.y, usable.y + (usable.height - 500) / 2);
+
+    // Height alone keeps the full width; a cap past the usable height changes nothing.
+    let tall = Settings::for_output(OUTPUT).spaced(Spacing {
+        single_window_max_height: 400,
+        ..Spacing::NONE
+    });
+    assert_eq!(
+        tall.single(),
+        Rect {
+            x: OUTPUT.x,
+            y: OUTPUT.y + (OUTPUT.height - 400) / 2,
+            width: OUTPUT.width,
+            height: 400,
+        }
+    );
+    let past = Settings::for_output(OUTPUT).spaced(Spacing {
+        single_window_max_height: OUTPUT.height + 1,
+        ..Spacing::NONE
+    });
+    assert_eq!(past.single(), OUTPUT);
+}
+
 fn window(id: u32) -> PhysicalWindowId {
     PhysicalWindowId {
         app: AppInstanceId {
@@ -226,6 +261,7 @@ fn directional_focus_crosses_inner_gaps() {
                 workspace: WorkspaceId::ONE,
                 window: window(slot.0 as u32),
                 frame,
+                display: None,
             })
             .collect();
         let target = |from, direction| {
@@ -246,12 +282,16 @@ fn engine_with(count: u64) -> (Engine, Vec<PhysicalWindowId>) {
     for id in 1..=count {
         engine.insert_slot(Slot {
             id: SlotId(id),
-            weight: 1,
             binding: crate::BindingState::Bound(window(id as u32)),
         });
     }
     let windows = engine.bound_windows();
     (engine, windows)
+}
+
+/// No window has refused a size yet.
+fn no_minimums() -> crate::runtime::WindowMinimums {
+    crate::runtime::WindowMinimums::new()
 }
 
 #[test]
@@ -260,12 +300,12 @@ fn resizing_a_gapped_window_moves_the_boundary_by_the_drag() {
     let (mut engine, windows) = engine_with(2);
     let before = engine.placements(&settings);
     // At rest, the gap is not a drag.
-    assert!(!engine.resize_window(&windows[0], before[0].frame, &settings));
+    assert!(!engine.resize_window(&windows[0], before[0].frame, &settings, &no_minimums()));
     let dragged = Rect {
         width: before[0].frame.width + 100,
         ..before[0].frame
     };
-    assert!(engine.resize_window(&windows[0], dragged, &settings));
+    assert!(engine.resize_window(&windows[0], dragged, &settings, &no_minimums()));
     let after = engine.placements(&settings);
     assert_eq!(after[0].frame, dragged);
     assert_eq!(after[1].frame.x, right(dragged) + 20);
@@ -276,7 +316,13 @@ fn resizing_a_gapped_window_moves_the_boundary_by_the_drag() {
 fn keyboard_resize_and_balance_stay_inside_the_usable_rect() {
     let settings = Settings::for_output(OUTPUT).spaced(spacing(8, [0, 0, 50, 50]));
     let (mut engine, windows) = engine_with(3);
-    assert!(engine.resize_focused_tile(&windows[0], crate::ResizeDirection::Grow, 60, &settings));
+    assert!(engine.resize_focused_tile(
+        &windows[0],
+        crate::ResizeDirection::Grow,
+        60,
+        &settings,
+        &no_minimums()
+    ));
     let tiles: Vec<_> = engine
         .placements(&settings)
         .into_iter()
@@ -286,7 +332,7 @@ fn keyboard_resize_and_balance_stay_inside_the_usable_rect() {
     assert_eq!(tiles[1].1.x - right(tiles[0].1), 8);
     assert_eq!(tiles[2].1.x - right(tiles[1].1), 8);
     assert_eq!(right(tiles[2].1), right(settings.usable()));
-    assert!(engine.balance_focused_parent(&windows[0], &settings));
+    assert!(engine.balance_focused_parent(&windows[0], &settings, &no_minimums()));
     let widths: Vec<_> = engine
         .placements(&settings)
         .iter()
@@ -302,7 +348,13 @@ fn keyboard_resize_and_balance_stay_inside_the_usable_rect() {
 fn resize_to_sets_the_window_frame_through_gaps() {
     let settings = Settings::for_output(OUTPUT).spaced(spacing(9, [0, 0, 30, 30]));
     let (mut engine, windows) = engine_with(3);
-    assert!(engine.resize_focused_tile_to(&windows[1], Axis::Horizontal, 500, &settings));
+    assert!(engine.resize_focused_tile_to(
+        &windows[1],
+        Axis::Horizontal,
+        500,
+        &settings,
+        &no_minimums()
+    ));
     let tiles: Vec<_> = engine
         .placements(&settings)
         .into_iter()
@@ -334,6 +386,8 @@ fn keys_parse_check_and_round_trip() {
     assert_eq!(SpacingKey::SingleWindowMaxWidth.check(0), Ok(0));
     assert_eq!(SpacingKey::SingleWindowMaxWidth.check(320), Ok(320));
     assert!(SpacingKey::SingleWindowMaxWidth.check(319).is_err());
+    assert_eq!(SpacingKey::SingleWindowMaxHeight.check(1050), Ok(1050));
+    assert!(SpacingKey::SingleWindowMaxHeight.check(16_385).is_err());
     assert_eq!(spacing(0, [4, 4, 4, 4]).uniform_edges(), Some(4));
     assert_eq!(spacing(0, [4, 4, 4, 5]).uniform_edges(), None);
     assert_eq!(Spacing::NONE.with_edges(9).uniform_edges(), Some(9));

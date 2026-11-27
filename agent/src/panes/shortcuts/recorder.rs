@@ -1,12 +1,13 @@
 //! Click-to-record: a shortcut's keys, pressed, listen for a new chord. The global hotkeys are
 //! held off meanwhile (`host::set_shortcut_recording`), so the chord reaches the recorder rather
-//! than moving windows. Esc cancels, ⌫ unbinds, and a chord without ⌥, ⌃ or ⌘, or one another
-//! shortcut uses, keeps listening and says why.
+//! than moving windows. Esc on its own cancels, ⌫ unbinds, and a chord without ⌥, ⌃ or ⌘, or one
+//! another shortcut uses (under either spelling of a Shift chord, `alt+shift+=` or `alt++`),
+//! keeps listening and says why.
 
 use rune::{Mods, PhysicalInput, PhysicalKeyCode};
 use spaceman::{
     WorkspaceId,
-    shortcuts::{self, Chord, Modifiers, Shortcuts},
+    shortcuts::{self, Chord, Key, Modifiers, Shortcuts},
 };
 
 use super::catalog::{self, Action, Occupant};
@@ -82,7 +83,7 @@ pub fn press(
         | K::SuperRight
         | K::CapsLock
         | K::Fn => return Press::Ignore,
-        K::Escape => return Press::Cancel,
+        K::Escape if !held.can_bind() => return Press::Cancel,
         K::Backspace | K::Delete if !held.can_bind() => return Press::Unbind,
         _ => match key_name(key, character) {
             Some(name) => name,
@@ -102,11 +103,24 @@ pub fn press(
     }
 }
 
+/// The chord pressing `key` with `mods` spells on the active keyboard layout, if it could be a
+/// shortcut.
+pub fn pressed_chord(key: PhysicalKeyCode, mods: Mods) -> Option<Chord> {
+    match press(key, mods, layout_character) {
+        Press::Chord(chord) => Some(chord),
+        _ => None,
+    }
+}
+
 fn key_name(
     key: PhysicalKeyCode,
     character: impl Fn(PhysicalKeyCode) -> Option<char>,
 ) -> Option<String> {
     use PhysicalKeyCode as K;
+    if is_keypad(key) {
+        // `[shortcuts]` names no keypad key, so `return` or `1` would register on the main key.
+        return None;
+    }
     let named = match key {
         K::Digit0 => "0",
         K::Digit1 => "1",
@@ -122,9 +136,10 @@ fn key_name(
         K::ArrowRight => "right",
         K::ArrowUp => "up",
         K::ArrowDown => "down",
-        K::Enter | K::NumpadEnter => "return",
+        K::Enter => "return",
         K::Tab => "tab",
         K::Space => "space",
+        K::Escape => "escape",
         K::Backspace => "backspace",
         K::Delete => "forwarddelete",
         K::Home => "home",
@@ -149,6 +164,44 @@ fn key_name(
         }
     };
     Some(named.into())
+}
+
+/// Whether `key` is on the numeric keypad, which a shortcut can't name apart from its main twin.
+fn is_keypad(key: PhysicalKeyCode) -> bool {
+    use PhysicalKeyCode as K;
+    matches!(
+        key,
+        K::Numpad0
+            | K::Numpad1
+            | K::Numpad2
+            | K::Numpad3
+            | K::Numpad4
+            | K::Numpad5
+            | K::Numpad6
+            | K::Numpad7
+            | K::Numpad8
+            | K::Numpad9
+            | K::NumpadAdd
+            | K::NumpadBackspace
+            | K::NumpadClear
+            | K::NumpadClearEntry
+            | K::NumpadComma
+            | K::NumpadDecimal
+            | K::NumpadDivide
+            | K::NumpadEnter
+            | K::NumpadEqual
+            | K::NumpadHash
+            | K::NumpadMemoryAdd
+            | K::NumpadMemoryClear
+            | K::NumpadMemoryRecall
+            | K::NumpadMemoryStore
+            | K::NumpadMemorySubtract
+            | K::NumpadMultiply
+            | K::NumpadParenLeft
+            | K::NumpadParenRight
+            | K::NumpadStar
+            | K::NumpadSubtract
+    )
 }
 
 /// The character a US layout types on a character key, when the active layout can't say.
@@ -228,18 +281,69 @@ pub fn enabled_named_workspaces(ui: &Ui) -> Vec<WorkspaceId> {
     named
 }
 
-/// Whether `action` may take `chord`: refused while another shortcut runs it.
+/// Named workspaces whose shortcuts run in this session: the set the agent registered at
+/// startup, or [`enabled_named_workspaces`] when no agent says. A workspace enabled by a config
+/// edit since then doesn't take its letter from a built-in shortcut until the next start.
+pub fn running_named_workspaces(ui: &Ui) -> Vec<WorkspaceId> {
+    match ui
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.shortcut_workspaces.as_ref())
+    {
+        Some(registered) => {
+            let mut named = registered
+                .iter()
+                .copied()
+                .filter(|workspace| workspace.letter().is_some())
+                .collect::<Vec<_>>();
+            named.sort();
+            named.dedup();
+            named
+        }
+        None => enabled_named_workspaces(ui),
+    }
+}
+
+/// Whether `action` may take `chord`: refused while another shortcut runs it, under this
+/// spelling or under `twin`, the other spelling of the same keys.
 pub fn check(
     shortcuts: &Shortcuts,
     named_workspaces: &[WorkspaceId],
     action: &Action,
     chord: Chord,
+    twin: Option<Chord>,
 ) -> Result<(), String> {
-    match catalog::occupant(shortcuts, named_workspaces, chord) {
-        Some(Occupant::Action(other)) if other.id == action.id => Ok(()),
-        Some(occupant) => Err(format!("Used by {}", occupant.title())),
-        None => Ok(()),
+    for spelling in std::iter::once(chord).chain(twin) {
+        match catalog::occupant(shortcuts, named_workspaces, spelling) {
+            Some(Occupant::Action(other)) if other.id == action.id => {}
+            Some(occupant) => return Err(format!("Used by {}", occupant.title())),
+            None => {}
+        }
     }
+    Ok(())
+}
+
+/// The other spelling of a Shift chord's keys: on a US layout Option+Shift+`=` types `+`, so
+/// it is also `alt++`, and the hotkeys register both on the same key. `shifted` names what
+/// a key types with Shift held. Letters and digits have no twin: `alt+H` is `alt+h`.
+fn shifted_twin(chord: Chord, shifted: impl Fn(Key) -> Option<char>) -> Option<Chord> {
+    if !chord.modifiers.shift {
+        return None;
+    }
+    let typed = shifted(chord.key)?;
+    if typed.is_alphanumeric() || typed.is_whitespace() {
+        return None;
+    }
+    let modifiers = Modifiers {
+        shift: false,
+        ..chord.modifiers
+    };
+    if !modifiers.can_bind() {
+        return None;
+    }
+    shortcuts::parse_chord(&format!("{}+{typed}", modifiers.source()))
+        .ok()
+        .filter(|twin| twin.key != chord.key)
 }
 
 pub fn begin(ui: &mut Ui, action: &'static str) {
@@ -271,8 +375,11 @@ pub fn on_input(ui: &mut Ui, event: &PhysicalInput) -> bool {
         PhysicalInput::FocusLost => cancel(ui),
         PhysicalInput::Modifiers(mods) => {
             if let Capture::Listening { held, message, .. } = &mut ui.shortcut_capture {
+                let before = *held;
                 *held = modifiers(mods);
-                if held.can_bind() {
+                // A refusal stays while the chord's keys come up, in any order; pressing a
+                // modifier again starts the next attempt.
+                if held.can_bind() && pressed_more(before, *held) {
                     *message = None;
                 }
             }
@@ -291,17 +398,38 @@ pub fn on_input(ui: &mut Ui, event: &PhysicalInput) -> bool {
     true
 }
 
+/// Whether `after` holds a modifier `before` didn't.
+fn pressed_more(before: Modifiers, after: Modifiers) -> bool {
+    (after.command && !before.command)
+        || (after.control && !before.control)
+        || (after.option && !before.option)
+        || (after.shift && !before.shift)
+}
+
 /// Saves what a press recorded, or keeps listening with why it was refused.
 pub fn record(ui: &mut Ui, id: &'static str, outcome: Press) {
+    record_with(ui, id, outcome, shortcuts::shifted_character);
+}
+
+/// [`record`], with `shifted` naming what a key types with Shift on the active layout.
+fn record_with(
+    ui: &mut Ui,
+    id: &'static str,
+    outcome: Press,
+    shifted: impl Fn(Key) -> Option<char>,
+) {
     let Some(action) = catalog::find(id) else {
         cancel(ui);
         return;
     };
     let shortcuts = ui.doc.shortcuts();
-    let named = enabled_named_workspaces(ui);
+    // What the saved table replaces follows the config, so it stays right after a restart; what
+    // occupies a chord follows the shortcuts that run now.
+    let configured = enabled_named_workspaces(ui);
+    let named = running_named_workspaces(ui);
     let default = action
         .default_chord(shortcuts.modifier)
-        .filter(|chord| catalog::named_workspace_for_key(&named, chord.key).is_none());
+        .filter(|chord| catalog::named_workspace_for_key(&configured, chord.key).is_none());
     let refused = match outcome {
         Press::Ignore => return,
         Press::Cancel => {
@@ -314,7 +442,13 @@ pub fn record(ui: &mut Ui, id: &'static str, outcome: Press) {
             });
             return;
         }
-        Press::Chord(chord) => match check(&shortcuts, &named, action, chord) {
+        Press::Chord(chord) => match check(
+            &shortcuts,
+            &named,
+            action,
+            chord,
+            shifted_twin(chord, shifted),
+        ) {
             Ok(()) => {
                 save(ui, id, |doc| {
                     doc.set_shortcut(action.command, default, Some(chord));

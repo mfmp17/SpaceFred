@@ -7,6 +7,7 @@ use std::{
 pub(crate) mod config;
 pub(crate) mod document;
 pub(crate) mod help;
+mod merge;
 pub(crate) mod rules;
 pub(crate) mod workspaces;
 

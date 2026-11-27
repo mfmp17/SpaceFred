@@ -1,6 +1,6 @@
 [package]
 name = "spaceman-agent"
-version = "0.3.3"
+version = "0.3.7"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
@@ -33,6 +33,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSImageRep",
   "NSResponder",
   "NSRunningApplication",
+  "NSSound",
   "NSWindow",
   "NSWorkspace",
 ] }
@@ -40,12 +41,15 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "std",
   "block2",
   "NSArray",
+  "NSBundle",
   "NSFileManager",
   "NSGeometry",
+  "NSProcessInfo",
   "NSRunLoop",
   "NSString",
   "NSTimer",
   "NSURL",
+  "NSUserDefaults",
 ] }
 
 [lints]

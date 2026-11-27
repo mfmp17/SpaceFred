@@ -29,7 +29,6 @@ fn floating_disposition_wins_over_pending_replacement_reservation() {
             .engine_mut(WorkspaceId::ONE)
             .insert_slot(Slot {
                 id: SlotId(1),
-                weight: 1,
                 binding: BindingState::Unresolved {
                     previous: old,
                     candidates: vec![replacement.clone()],
@@ -90,8 +89,8 @@ fn parked_window_in_a_display_gap_is_not_reparked_or_exempted() {
             .cycle(outputs.clone(), &AtomicBool::new(false))
             .unwrap();
     }
-    assert!(!runtime.repark_attempts.contains_key(&window));
-    assert!(!runtime.parking_exempt.contains(&window));
+    assert!(runtime.parked.reparks(&window) == 0);
+    assert!(!runtime.parked.is_exempt(&window));
     assert!(
         !runtime
             .backend

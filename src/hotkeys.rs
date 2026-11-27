@@ -138,7 +138,7 @@ impl HotkeyPlan {
         // `[shortcuts]` bindings claim their chords first, so a built-in shortcut on the same
         // chord quietly gives way instead of colliding.
         for binding in &shortcuts.bindings {
-            plan.push_binding(binding, enabled);
+            plan.push_binding(binding, enabled, shortcuts.workspace_steps);
         }
         if shortcuts.defaults {
             push_defaults(&mut plan, enabled, shortcuts);
@@ -328,6 +328,23 @@ fn worker_action(command: &Command) -> WorkerAction {
         Command::Switch(workspace) => WorkerAction::SwitchWorkspace(*workspace),
         Command::Move(workspace) => WorkerAction::MoveFocused(*workspace),
         Command::MoveFollow(workspace) => WorkerAction::MoveFocusedFollow(*workspace),
+        Command::SwitchStep(step) => WorkerAction::StepWorkspace(*step),
+        Command::MoveStep(step) => WorkerAction::MoveFocusedStep {
+            step: *step,
+            follow: false,
+        },
+        Command::MoveStepFollow(step) => WorkerAction::MoveFocusedStep {
+            step: *step,
+            follow: true,
+        },
+        Command::MoveTab(workspace) => WorkerAction::MoveTab {
+            target: *workspace,
+            follow: false,
+        },
+        Command::MoveTabFollow(workspace) => WorkerAction::MoveTab {
+            target: *workspace,
+            follow: true,
+        },
         Command::BackAndForth => WorkerAction::WorkspaceBackAndForth,
         Command::MoveWorkspace(target) => WorkerAction::MoveWorkspaceToDisplay(target.clone()),
         Command::Focus(direction) => WorkerAction::Focus(*direction),
@@ -337,11 +354,28 @@ fn worker_action(command: &Command) -> WorkerAction {
         Command::Layout => WorkerAction::ToggleLayout,
         Command::Fullscreen => WorkerAction::ToggleFullscreenLayout,
         Command::Float => WorkerAction::ToggleFloat,
+        Command::Pin => WorkerAction::TogglePin,
         Command::Resize(direction) => WorkerAction::Resize(*direction),
         Command::ResizeTo(axis, points) => WorkerAction::ResizeTo(*axis, *points),
         Command::Balance => WorkerAction::Balance,
         Command::Retile => WorkerAction::Retile,
     }
+}
+
+/// The virtual key and Carbon modifiers `chord` is pressed as on the active keyboard layout: the
+/// key a shortcut with nothing else on it registers. `None` when the layout has no key for it.
+pub(crate) fn key_press(chord: shortcuts::Chord) -> Option<(u32, u32)> {
+    key_press_on(&LayoutSnapshot::current().ok()?, chord)
+}
+
+fn key_press_on(layout: &LayoutSnapshot, chord: shortcuts::Chord) -> Option<(u32, u32)> {
+    let key = layout
+        .candidates(logical_key(chord.key))
+        .ok()?
+        .into_iter()
+        .next()?;
+    let shift = if key.shift { SHIFT_KEY } else { 0 };
+    Some((key.key_code, carbon_modifiers(chord.modifiers) | shift))
 }
 
 fn logical_key(key: shortcuts::Key) -> LogicalKey {
@@ -403,7 +437,7 @@ impl<'a> PlanBuilder<'a> {
 
     /// Claims a `[shortcuts]` binding's chord: registers its command, or for `none` only
     /// reserves the chord so no built-in shortcut takes it.
-    fn push_binding(&mut self, binding: &Binding, enabled: &[WorkspaceId]) {
+    fn push_binding(&mut self, binding: &Binding, enabled: &[WorkspaceId], workspace_steps: bool) {
         let source = &binding.source;
         let candidates = match self.layout.candidates(logical_key(binding.chord.key)) {
             Ok(candidates) => candidates,
@@ -449,6 +483,13 @@ impl<'a> PlanBuilder<'a> {
                 .insert(chord, format!("{source} (unavailable)"));
             self.warnings.push(format!(
                 "skipped shortcut {source}: workspace {workspace} is not enabled on a managed display"
+            ));
+            return;
+        }
+        if command.is_workspace_step() && !workspace_steps {
+            self.occupied.insert(chord, format!("{source} (Lab off)"));
+            self.warnings.push(format!(
+                "skipped shortcut {source}: next and prev workspace steps need [labs] workspace_steps = true"
             ));
             return;
         }
@@ -703,6 +744,11 @@ mod tests {
             .iter()
             .find(|registration| registration.description == description)
             .map(|registration| &registration.action)
+    }
+
+    #[test]
+    fn pin_shortcut_runs_the_same_action_as_ctl_pin() {
+        assert_eq!(worker_action(&Command::Pin), WorkerAction::TogglePin);
     }
 
     #[test]
@@ -1063,6 +1109,28 @@ mod tests {
     }
 
     #[test]
+    fn workspace_step_bindings_register_only_with_their_lab_on() {
+        let enabled = WorkspaceId::numbered().collect::<Vec<_>>();
+        let next = WorkerAction::StepWorkspace(crate::WorkspaceStep::Next);
+        let off = shortcuts(true, r#""ctrl+alt+h" = "switch next""#);
+        let plan = HotkeyPlan::from_layout(&enabled, &off, &layout()).unwrap();
+        assert!(registration(&plan, &next).is_empty());
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("workspace_steps")),
+            "{:?}",
+            plan.warnings
+        );
+        let on = Shortcuts {
+            workspace_steps: true,
+            ..off
+        };
+        let plan = HotkeyPlan::from_layout(&enabled, &on, &layout()).unwrap();
+        assert_eq!(registration(&plan, &next).len(), 1);
+    }
+
+    #[test]
     fn configured_binding_replaces_the_built_in_shortcut_on_its_chord() {
         let enabled = WorkspaceId::numbered().collect::<Vec<_>>();
         let shortcuts = shortcuts(true, r#""alt+j" = "layout""#);
@@ -1123,6 +1191,43 @@ mod tests {
         );
         assert!(resize.iter().any(|registration| registration.key_code == 13
             && registration.modifiers == OPTION_KEY | CONTROL_KEY));
+    }
+
+    #[test]
+    fn move_tab_bindings_queue_move_tab_with_and_without_follow() {
+        let enabled = WorkspaceId::numbered().collect::<Vec<_>>();
+        let shortcuts = shortcuts(
+            true,
+            r#"
+            "ctrl+alt+shift+2" = "move-tab 2"
+            "ctrl+alt+shift+3" = "move-tab 3 --follow"
+            "#,
+        );
+        let plan = HotkeyPlan::from_layout(&enabled, &shortcuts, &layout()).unwrap();
+        let send = registration(
+            &plan,
+            &WorkerAction::MoveTab {
+                target: WorkspaceId::TWO,
+                follow: false,
+            },
+        );
+        assert_eq!(send.len(), 1);
+        assert_eq!(send[0].modifiers, OPTION_KEY | SHIFT_KEY | CONTROL_KEY);
+        assert_eq!(send[0].description, "move tab to workspace 2");
+        let follow = registration(
+            &plan,
+            &WorkerAction::MoveTab {
+                target: WorkspaceId::THREE,
+                follow: true,
+            },
+        );
+        assert_eq!(follow.len(), 1);
+        // The built-in Move shortcut on Option+Shift+2 is untouched.
+        assert_eq!(
+            action(&plan, "move window to workspace 2"),
+            Some(&WorkerAction::MoveFocused(WorkspaceId::TWO))
+        );
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]

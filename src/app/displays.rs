@@ -4,48 +4,239 @@
 
 use super::*;
 
-/// The displays the runtime last saw, and the hidden windows still to re-park
-/// since they changed.
+/// The displays the runtime last saw. Which hidden windows still need a re-park
+/// since they changed is the park table's to say.
 #[derive(Default)]
 pub(super) struct DisplayWatch {
     known: Option<macos::DisplayOutputs>,
     /// The displays before the last change, which pending windows were parked against.
     previous: Option<macos::DisplayOutputs>,
-    repark_pending: HashSet<crate::PhysicalWindowId>,
+    /// The frames of the displays the last change took away. A window left off every
+    /// remaining display but still on one of these was stranded by the unplug, not
+    /// hidden there by its app, so it still needs a recovery frame and a park write
+    /// (#589).
+    lost: Vec<crate::Rect>,
+}
+
+impl DisplayWatch {
+    /// The displays the runtime last saw.
+    pub(super) const fn known_outputs(&self) -> Option<&macos::DisplayOutputs> {
+        self.known.as_ref()
+    }
+
+    /// The displays the last change took away. A window still on one of them, and on
+    /// no remaining display, was stranded by that change.
+    pub(super) fn lost_displays(&self) -> &[crate::Rect] {
+        &self.lost
+    }
 }
 
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
-    /// How tiles fill `output`: its frame with the configured gaps, padding and width cap.
+    /// How tiles fill `output`: its frame with the configured gaps, padding, width cap and layout.
     pub(super) fn layout_settings(&self, output: crate::Rect) -> Settings {
-        Settings::for_output(output).spaced(self.config.spacing())
+        Settings::for_output(output)
+            .spaced(self.config.spacing())
+            .with_layout(self.config.layout())
+    }
+
+    /// The last known display canvas for `workspace`, or an empty rect before
+    /// any display outputs have been observed.
+    pub(super) fn known_workspace_canvas(&self, workspace: WorkspaceId) -> crate::Rect {
+        self.displays
+            .known
+            .as_ref()
+            .map(|outputs| {
+                self.layout_settings(output_for(&self.workspaces, workspace, outputs))
+                    .canvas()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Move a tiled window to `target` using the last known source canvas and `target_output`.
+    pub(super) fn move_tiled_to(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        target: WorkspaceId,
+        target_output: crate::Rect,
+    ) -> Option<WorkspaceId> {
+        let source = self.workspaces.workspace_of(window)?;
+        let source_canvas = self.known_workspace_canvas(source);
+        let target_canvas = self.layout_settings(target_output).canvas();
+        self.workspaces.move_window_with(
+            window,
+            target,
+            self.config.layout(),
+            source_canvas,
+            target_canvas,
+        )
     }
 
     /// Record the current displays. When they differ from the last ones, every
     /// parked window is due a re-park against them.
     pub(super) fn note_outputs(&mut self, outputs: &macos::DisplayOutputs) {
-        if self
+        let changed = self
             .displays
             .known
             .as_ref()
-            .is_some_and(|known| !known.frames().eq(outputs.frames()))
-        {
+            .is_some_and(|known| !known.frames().eq(outputs.frames()));
+        if changed {
+            // Keep what went away: a window still sitting there, on no remaining
+            // display, was stranded by the change rather than hidden by its app.
+            self.displays.lost = self
+                .displays
+                .known
+                .as_ref()
+                .map(|known| {
+                    known
+                        .displays()
+                        .iter()
+                        .filter(|gone| !outputs.displays().iter().any(|now| now.id == gone.id))
+                        .map(|gone| gone.frame)
+                        .collect()
+                })
+                .unwrap_or_default();
             log_event!("displays changed: re-parking hidden windows");
+            // An empty workspace chosen on another display stood for focus on
+            // that arrangement only; after a display change the reported focus
+            // decides again.
+            self.focus.set_empty_choice(None);
             // A window still due a re-park never reached its corner for the last
             // displays, so they are no baseline: every window is written again.
-            self.displays.previous = if self.displays.repark_pending.is_empty() {
-                self.displays.known.clone()
-            } else {
+            self.displays.previous = if self.parked.displays_changed() {
                 None
+            } else {
+                self.displays.known.clone()
             };
-            self.displays.repark_pending = self.parked.keys().cloned().collect();
-            self.repark_attempts.clear();
             // macOS moves windows off a removed display, and Spaceman parks and
             // restores them: a frame read back against a target applied before
             // the change says nothing about what the app accepts, so it must
             // not freeze the tile as refused.
             self.applied.iter_mut().for_each(HashMap::clear);
+            if let Some(before) = self.displays.known.clone() {
+                self.carry_floats_with_workspaces(&before, outputs);
+            }
         }
         self.displays.known = Some(outputs.clone());
+    }
+
+    /// A display change can move a visible workspace to another display (its
+    /// own display reconnected, or unplugged). Its tiles follow the layout;
+    /// its floats still on the display it left go with it, keeping their size
+    /// and place on the display, as when the workspace is moved by hand (#405).
+    fn carry_floats_with_workspaces(
+        &mut self,
+        before: &macos::DisplayOutputs,
+        after: &macos::DisplayOutputs,
+    ) {
+        let shown_before = self.visible_workspaces(before);
+        let old_frames: Vec<_> = before.frames().collect();
+        for resolved in self.visible_workspaces(after) {
+            let Some(from) = shown_before
+                .iter()
+                .find(|old| old.workspace == resolved.workspace)
+                .map(|old| old.output)
+                .filter(|from| *from != resolved.output)
+            else {
+                continue;
+            };
+            let floats: Vec<_> = self
+                .workspaces
+                .floating_entries()
+                .filter(|(window, owner)| {
+                    *owner == resolved.workspace
+                        && !self.workspaces.is_pinned(window)
+                        && !self.parked.contains_key(window)
+                })
+                .map(|(window, _)| window.clone())
+                .collect();
+            for window in floats {
+                let Some(frame) = self
+                    .backend
+                    .window_server_frame(&window)
+                    .or_else(|| self.backend.frame(&window).ok())
+                else {
+                    continue;
+                };
+                if Self::display_for_frame(frame, &old_frames) != Some(from) {
+                    continue;
+                }
+                let target =
+                    super::move_workspace::translate_frame_to_output(frame, from, resolved.output);
+                let outcome = self.backend.set_position(&window, target);
+                log_event!(
+                    "displays changed: carry floating {window:?} with workspace {} to {target:?} ({outcome:?})",
+                    resolved.workspace
+                );
+            }
+        }
+    }
+
+    /// A config reload can assign a workspace to another display. Tiles are
+    /// laid out on the new display when it shows; its floats on the display it
+    /// left move with it, same size and place on the display. A parked float
+    /// restores to its recovery frame, so that frame moves (#543). A float
+    /// still on screen, its workspace shown when the assignment changed, would
+    /// otherwise be parked from where it stands and come back on the old
+    /// display (#665): it parks now with a recovery frame on the new display,
+    /// or moves there if the workspace shows there already.
+    /// `homes_before` holds each workspace's display, in `WorkspaceId::all`
+    /// order, before the reload.
+    pub(super) fn carry_floats_to_new_homes(
+        &mut self,
+        homes_before: &[crate::Rect],
+        outputs: &macos::DisplayOutputs,
+    ) {
+        let displays: Vec<_> = outputs.frames().collect();
+        let visible: HashSet<_> = self
+            .visible_workspaces(outputs)
+            .into_iter()
+            .map(|resolved| resolved.workspace)
+            .collect();
+        for (workspace, &from) in WorkspaceId::all().zip(homes_before) {
+            let to = output_for(&self.workspaces, workspace, outputs);
+            if to == from {
+                continue;
+            }
+            let floats: Vec<_> = self
+                .workspaces
+                .floating_entries()
+                .filter(|(window, owner)| *owner == workspace && !self.stays_on_screen(window))
+                .map(|(window, _)| window.clone())
+                .collect();
+            for window in floats {
+                if let Some(&recovery) = self.parked.get(&window) {
+                    if Self::display_for_frame(recovery, &displays) != Some(from) {
+                        continue;
+                    }
+                    let relocated =
+                        super::move_workspace::translate_frame_to_output(recovery, from, to);
+                    let recorded = self.record_recovery(&window, relocated);
+                    log_event!(
+                        "config reload: workspace {workspace} moved displays; parked floating {window:?} restores at {relocated:?} (recorded {recorded})"
+                    );
+                    continue;
+                }
+                let Some(frame) = self
+                    .backend
+                    .window_server_frame(&window)
+                    .or_else(|| self.backend.frame(&window).ok())
+                else {
+                    continue;
+                };
+                if Self::display_for_frame(frame, &displays) != Some(from) {
+                    continue;
+                }
+                let outcome = if visible.contains(&workspace) {
+                    let target = super::move_workspace::translate_frame_to_output(frame, from, to);
+                    self.backend.set_position(&window, target)
+                } else {
+                    self.park_window_across(&window, from, to, outputs)
+                };
+                log_event!(
+                    "config reload: workspace {workspace} moved displays; carry floating {window:?} ({outcome:?})"
+                );
+            }
+        }
     }
 
     /// Note the displays, then re-park each hidden window still due one. Runs
@@ -54,7 +245,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// (the app is briefly inaccessible) stays due and is retried next time.
     pub(super) fn follow_displays(&mut self, outputs: &macos::DisplayOutputs) {
         self.note_outputs(outputs);
-        if self.displays.repark_pending.is_empty() {
+        let due: Vec<_> = self.parked.awaiting_display().cloned().collect();
+        if due.is_empty() {
             return;
         }
         let visible: HashSet<_> = self
@@ -69,28 +261,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .previous
             .as_ref()
             .map(|previous| (previous.frames().collect::<Vec<_>>(), previous.screens()));
-        for window in std::mem::take(&mut self.displays.repark_pending) {
-            if !self.parked.contains_key(&window) || self.parking_exempt.contains(&window) {
-                continue;
-            }
+        for window in due {
             // Hidden scratchpad windows intentionally have no workspace owner, but still need to
             // stay parked off-screen when a newly connected display covers their parking edge.
-            let output = if let Some(owner) = self.workspaces.workspace_of_any(&window) {
-                if visible.contains(&owner) {
-                    continue;
+            let output = match self.workspaces.residency(&window) {
+                _ if self.stays_on_screen(&window) => None,
+                Some(crate::workspace::Residency::Scratchpad { shown_on: None, .. }) => {
+                    Some(outputs.main().frame)
                 }
-                output_for(&self.workspaces, owner, outputs)
-            } else if self
-                .scratchpad
-                .entry(&window)
-                .is_some_and(|entry| entry.shown_on.is_none())
-            {
-                outputs.main().frame
-            } else {
-                continue;
+                _ => self
+                    .workspaces
+                    .workspace_of_any(&window)
+                    .filter(|owner| !visible.contains(owner))
+                    .map(|owner| output_for(&self.workspaces, owner, outputs)),
             };
-            if !self.repark_for_displays(&window, output, &displays, &screens, previous.as_ref()) {
-                self.displays.repark_pending.insert(window);
+            // A write that fails stays due and is retried next time.
+            if output.is_none_or(|output| {
+                self.repark_for_displays(&window, output, &displays, &screens, previous.as_ref())
+            }) {
+                self.parked.display_settled(&window);
             }
         }
     }
@@ -127,14 +316,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if outcome != macos::ApplyOutcome::Applied {
             return false;
         }
-        self.recently_parked.insert(window.clone(), Instant::now());
+        self.parked.park_applied(window, self.backend.now());
         true
-    }
-
-    /// Whether `window` still awaits its re-park after a display change. Until
-    /// then a new display may show it, which is no reappearance to honor.
-    pub(super) fn awaiting_display_repark(&self, window: &crate::PhysicalWindowId) -> bool {
-        self.displays.repark_pending.contains(window)
     }
 
     /// Recover visible, non-parked owned windows whose on-screen window-server
@@ -153,7 +336,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if cancelled.load(Ordering::Acquire) || self.backend.mouse_down() {
             return;
         }
-        let displays: Vec<_> = outputs.frames().collect();
+        // A window is stranded only off every physical display: one released
+        // over a Dock or menu-bar strip is still on its display (#393).
+        let displays = outputs.screens();
         let has_candidate = visible.iter().any(|resolved| {
             self.scope.manages_selector(&resolved.selector)
                 && self
@@ -188,24 +373,17 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             let engine = self.workspaces.engine_mut(workspace);
             engine.fit_minimums(&settings, &self.minimum_sizes);
             let mut placements = engine.placements(&settings);
-            self.apply_fullscreen_layout(workspace, &mut placements, &settings);
+            self.project_deck(workspace, &mut placements, &settings);
             let mut recover_tiles = Vec::new();
             for placement in placements {
                 let Some(window) = placement.window.as_ref() else {
                     continue;
                 };
-                if self.parked.contains_key(window) {
-                    continue;
-                }
-                let Some(&frame) = onscreen_frames.get(&window.window_id) else {
+                let Some(frame) =
+                    self.stranded_visible_frame(window, &displays, &onscreen_frames, server_frames)
+                else {
                     continue;
                 };
-                if displays
-                    .iter()
-                    .any(|display| display.contains_center(frame))
-                {
-                    continue;
-                }
                 log_event!(
                     "recover stranded tiled {:?} on workspace {} from {:?} to {:?}",
                     window,
@@ -235,16 +413,21 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                if self.parked.contains_key(&window) {
-                    continue;
-                }
-                let Some(&frame) = onscreen_frames.get(&window.window_id) else {
+                let Some(frame) = self.stranded_visible_frame(
+                    &window,
+                    &displays,
+                    &onscreen_frames,
+                    server_frames,
+                ) else {
                     continue;
                 };
-                if displays
-                    .iter()
-                    .any(|display| display.contains_center(frame))
-                {
+                if self.float_frame_is_transient(&window, frame, &displays) {
+                    log_event!(
+                        "keep floating {:?} on workspace {}: window-server frame {:?} is transient",
+                        window,
+                        workspace,
+                        frame
+                    );
                     continue;
                 }
                 let target = clamp_into_output(frame, output);
@@ -267,6 +450,61 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
     }
 
+    /// The stranded off-display frame of `window`, if it is a live visible
+    /// window whose center sits outside every connected display.
+    ///
+    /// A window in `onscreen_frames` is already proven on screen (such as a
+    /// bottom-right sliver). One omitted from `onscreen_frames` because 0 px
+    /// overlap any connected display after an unplug is recovered only when
+    /// `server_frames` places it off every display (`!shows_on`), Accessibility
+    /// still reaches it, and it is neither minimized nor hidden — leaving
+    /// ordered-out windows on other Spaces or minimized alone.
+    fn stranded_visible_frame(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        displays: &[crate::Rect],
+        onscreen_frames: &HashMap<u32, crate::Rect>,
+        server_frames: &HashMap<u32, crate::Rect>,
+    ) -> Option<crate::Rect> {
+        if self.parked.contains_key(window) {
+            return None;
+        }
+        if let Some(&frame) = onscreen_frames.get(&window.window_id) {
+            return (!displays
+                .iter()
+                .any(|display| display.contains_center(frame)))
+            .then_some(frame);
+        }
+        let &frame = server_frames.get(&window.window_id)?;
+        if displays
+            .iter()
+            .any(|display| display.contains_center(frame))
+            || crate::geometry::shows_on(frame, displays)
+        {
+            return None;
+        }
+        (self.backend.frame(window).is_ok() && !self.backend.confirms_set_aside(window))
+            .then_some(frame)
+    }
+
+    /// Whether an off-display window-server `frame` of a float is a passing
+    /// animation rather than a stranded window: while macOS restores a minimized
+    /// window it briefly reports a small frame near the Dock, but Accessibility
+    /// still reports the window's own frame. A float is stranded only when
+    /// Accessibility agrees on its size and also places it off every display (#710).
+    fn float_frame_is_transient(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        frame: crate::Rect,
+        displays: &[crate::Rect],
+    ) -> bool {
+        let Ok(own) = self.backend.frame(window) else {
+            return false;
+        };
+        (own.width, own.height) != (frame.width, frame.height)
+            || displays.iter().any(|display| display.contains_center(own))
+    }
+
     /// Where a recovery frame is restored: itself while it shows on a connected
     /// display, otherwise moved onto the main display (its own is gone).
     pub(super) fn restore_target(&self, frame: crate::Rect) -> crate::Rect {
@@ -275,6 +513,35 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         };
         let displays: Vec<_> = outputs.frames().collect();
         crate::geometry::onto_displays(frame, &displays, outputs.main().frame)
+    }
+
+    /// Where a parked window is restored. When the display its recovery frame
+    /// was recorded on is unplugged it goes to the main display, even if
+    /// another display now covers the old position (#406).
+    pub(super) fn recovery_target(&self, window: &crate::PhysicalWindowId) -> Option<crate::Rect> {
+        let record = self.parked.record(window)?;
+        let outputs = self.displays.known.as_ref();
+        let display_gone = record.original_display.as_ref().is_some_and(|id| {
+            outputs.is_some_and(|outputs| outputs.displays().iter().all(|d| &d.id != id))
+        });
+        Some(match outputs {
+            Some(outputs) if display_gone => {
+                crate::geometry::onto_displays(record.original, &[], outputs.main().frame)
+            }
+            _ => self.restore_target(record.original),
+        })
+    }
+
+    /// The connected display a recovery frame is recorded on.
+    pub(super) fn recovery_display(&self, frame: crate::Rect) -> Option<String> {
+        let outputs = self.displays.known.as_ref()?;
+        let displays: Vec<_> = outputs.frames().collect();
+        let display = Self::display_for_frame(frame, &displays)?;
+        outputs
+            .displays()
+            .iter()
+            .find(|output| output.frame == display)
+            .map(|output| output.id.clone())
     }
 }
 

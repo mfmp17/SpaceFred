@@ -1,19 +1,21 @@
-//! The 3-step Rune setup tour view: Welcome, Permissions, and Done.
+//! The four-step Rune setup tour view: Welcome, Accessibility, Your workspaces, and Try it.
 
 use rune::{
-    Color, El, Icon, Shadow, Spring, SpringPair, TextStyle, Transition, col, el, icon, row, text,
+    Color, El, Icon, Shadow, Spring, SpringPair, TextStyle, Transition, Tx, col, el, icon, row,
+    text,
 };
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, glyphs};
-use spaceman::app::UiLaunchAtLogin;
 
-use super::{Input, Step, desk, flow::View, input, sandbox::Sandbox};
+use super::{
+    Input, Step, arrange, arrange::Board, conflicts::Conflict, flow::View, input, resolve, stage,
+    try_it,
+};
 use crate::{
     Ui,
-    controls::{self, ButtonKind, DESCRIPTION, Paint},
+    controls::{self, ButtonKind, Paint},
 };
 
 const WIDTH: f32 = 520.0;
-const FOOTER_SLOT: f32 = 176.0;
 const LEAD: TextStyle = TextStyle::new(15.0, 400.0).lh(22.0);
 const STEP_ENTER: Spring = Spring::new(0.3, 0.0);
 const STEP_EXIT: Spring = Spring::new(0.25, 0.0);
@@ -21,14 +23,7 @@ const STEP_EXIT: Spring = Spring::new(0.25, 0.0);
 static ACCESSIBILITY_ICON: Icon = Icon {
     name: "spaceman-accessibility",
     view: 16.0,
-    body: include_str!("../../assets/workspaces.svg"),
-};
-
-/// Two overlapping windows, for the calm "another window manager is running" card.
-static WINDOW_CONFLICT_ICON: Icon = Icon {
-    name: "spaceman-window-conflict",
-    view: 16.0,
-    body: r#"<rect x="1.5" y="4.5" width="8" height="6.5" rx="1.5" stroke="currentColor"/><rect x="6.5" y="1.5" width="8" height="6.5" rx="1.5" stroke="currentColor"/>"#,
+    body: include_str!("../../assets/layout.svg"),
 };
 
 fn title_style(dark: bool) -> TextStyle {
@@ -37,14 +32,15 @@ fn title_style(dark: bool) -> TextStyle {
         .tracking(-0.3)
 }
 
-pub fn overlay(ui: &Ui, p: Paint) -> Option<El> {
+/// The tour over the window. `still` is Reduce Motion.
+pub fn overlay(ui: &Ui, p: Paint, still: bool) -> Option<El> {
     let tour = ui.tour.as_ref()?;
     let view = tour.flow.view();
-    let tiling = ui.agent.as_ref().is_some_and(|agent| agent.automatic);
     let step_body = match view.step {
-        Step::Welcome => welcome(p, &tour.conflicts),
-        Step::Setup => setup(ui, p, &view),
-        Step::Done => done(p, &tour.sandbox),
+        Step::Welcome => welcome(p),
+        Step::Setup => setup(p, &view, &tour.conflicts),
+        Step::Arrange => workspaces(ui, p, &tour.board),
+        Step::TryIt => try_it::view(ui, p, &view, &tour.play, still),
     };
     let width = step_width(view.step);
     let page = col()
@@ -96,15 +92,15 @@ pub fn overlay(ui: &Ui, p: Paint) -> Option<El> {
                     .pt(12.0)
                     .pb(28.0)
                     .center()
-                    .child(footer(p, &view, tiling, width)),
+                    .child(footer(p, &view, tour.board.nothing_to_arrange(), width)),
             ),
     )
 }
 
-/// The Done step widens to hold the practice desktop beside its lessons.
+/// The workspaces step widens to hold five cards across.
 fn step_width(step: Step) -> f32 {
-    if step == Step::Done {
-        desk::WIDTH
+    if step == Step::Arrange {
+        arrange::WIDTH
     } else {
         WIDTH
     }
@@ -120,14 +116,22 @@ fn step_transition(direction: i8) -> Transition {
     Transition::asymmetric(enter, exit).springs(SpringPair::new(STEP_ENTER, STEP_EXIT))
 }
 
-fn footer(p: Paint, view: &View, tiling: bool, width: f32) -> El {
-    let (label, enabled, forward) = match view.step {
-        Step::Welcome => ("Get started", true, true),
-        Step::Setup => ("Continue", view.ready, true),
-        // A first-run tour holds automatic tiling, so its last button starts it.
-        Step::Done if !view.manual && !tiling => ("Start Tiling", true, false),
-        Step::Done => ("Done", true, false),
-    };
+/// What the primary button says and whether it leads on to another step.
+fn primary_label(view: &View, nothing_to_arrange: bool) -> (&'static str, bool) {
+    match view.step {
+        Step::Welcome => ("Get started", true),
+        Step::Setup => ("Continue", true),
+        // Tiling is already on when the tour is re-run from Settings.
+        Step::Arrange if view.tiling => ("Arrange", false),
+        Step::Arrange if nothing_to_arrange => ("Start tiling", false),
+        Step::Arrange => ("Arrange & start", false),
+        Step::TryIt => ("Done", false),
+    }
+}
+
+fn footer(p: Paint, view: &View, nothing_to_arrange: bool, width: f32) -> El {
+    let (label, forward) = primary_label(view, nothing_to_arrange);
+    let enabled = view.step != Step::Setup || view.ready;
     let mut btn = Button::new(label)
         .variant(ButtonVariant::Contrast)
         .control_size(ControlSize::Large);
@@ -141,7 +145,7 @@ fn footer(p: Paint, view: &View, tiling: bool, width: f32) -> El {
         });
     }
     let primary = if enabled {
-        btn.on_press(|ui: &mut Ui| input(ui, Input::Continue))
+        btn.on_press_tx(|ui: &mut Ui, tx: &mut Tx| advance(ui, Input::Continue, tx))
             .build(p.k)
             .px(12.0)
             .radius(p.k.radius.md)
@@ -155,10 +159,27 @@ fn footer(p: Paint, view: &View, tiling: bool, width: f32) -> El {
             .opacity(if p.k.dark { 0.3 } else { 1.0 })
             .key("tour-continue")
     };
-    let back = view.can_go_back.then(|| {
-        controls::button(p, "tour-back", "Back", ButtonKind::Secondary, |ui, _| {
-            input(ui, Input::Back);
+    let start = match view.step {
+        Step::TryIt => Some(controls::quiet_button(
+            p,
+            "tour-undo",
+            "Undo & restore",
+            |ui, _| input(ui, Input::Undo),
+        )),
+        _ if view.can_go_back => Some(controls::button(
+            p,
+            "tour-back",
+            "Back",
+            ButtonKind::Secondary,
+            |ui, _| input(ui, Input::Back),
+        )),
+        _ => None,
+    };
+    let skip = (view.step == Step::Arrange).then(|| {
+        controls::button(p, "tour-skip", "Skip", ButtonKind::Secondary, |ui, tx| {
+            advance(ui, Input::Skip, tx);
         })
+        .help("Leave every window where it is")
     });
     row()
         .key("tour-footer")
@@ -166,20 +187,34 @@ fn footer(p: Paint, view: &View, tiling: bool, width: f32) -> El {
         .motion(STEP_ENTER)
         .h(32.0)
         .center_y()
-        .child(row().key("start").w(FOOTER_SLOT).children(back))
+        .child(row().key("start").grow(1.0).w(0.0).children(start))
+        .child(row().key("middle").center().children(step_dots(p, view)))
         .child(
             row()
-                .key("middle")
+                .key("end")
                 .grow(1.0)
                 .w(0.0)
-                .center()
-                .children(step_dots(p, view)),
+                .gap(8.0)
+                .justify_end()
+                .children(skip)
+                .child(primary),
         )
-        .child(row().key("end").w(FOOTER_SLOT).justify_end().child(primary))
+}
+
+/// Moves the tour on, and gives the keyboard to the miniature desktop when that lands on Try it.
+fn advance(ui: &mut Ui, to: Input, tx: &mut Tx) {
+    input(ui, to);
+    if ui
+        .tour
+        .as_ref()
+        .is_some_and(|tour| tour.flow.step() == Step::TryIt)
+    {
+        tx.focus(stage::KEY, false);
+    }
 }
 
 fn step_dots(p: Paint, view: &View) -> Option<El> {
-    if view.step == Step::Done || view.count < 2 {
+    if view.count < 2 {
         return None;
     }
     let mut dots = row().key("step-dots").gap(6.0).center_y();
@@ -196,7 +231,7 @@ fn step_dots(p: Paint, view: &View) -> Option<El> {
     Some(dots)
 }
 
-fn title_block(p: Paint, heading: &str, body: Option<&str>) -> El {
+pub(super) fn title_block(p: Paint, heading: &str, body: Option<&str>) -> El {
     col()
         .key("title-block")
         .gap(10.0)
@@ -218,8 +253,8 @@ fn title_block(p: Paint, heading: &str, body: Option<&str>) -> El {
         }))
 }
 
-fn welcome(p: Paint, conflicts: &[String]) -> El {
-    let mut column = col()
+fn welcome(p: Paint) -> El {
+    col()
         .key("welcome")
         .gap(28.0)
         .child(welcome_hero(p))
@@ -227,13 +262,9 @@ fn welcome(p: Paint, conflicts: &[String]) -> El {
             p,
             "Welcome to SpaceFred",
             Some(
-                "Fast macOS workspaces and automatic tiling, with every window restored if you pause or quit.",
+                "Your windows stay put until you start. Pausing or quitting puts every window back.",
             ),
-        ));
-    if let Some(notice) = conflict_notice(p, conflicts) {
-        column = column.child(notice);
-    }
-    column
+        ))
 }
 
 /// Spaceman's split-tile mark inside a concentric halo ring.
@@ -293,67 +324,20 @@ fn welcome_hero(p: Paint) -> El {
     )
 }
 
-/// A calm surface card: another window manager is running, said quietly.
-fn conflict_notice(p: Paint, conflicts: &[String]) -> Option<El> {
-    if conflicts.is_empty() {
-        return None;
-    }
-    let names = match conflicts {
-        [only] => format!("{only} is running"),
-        [first, second] => format!("{first} and {second} are running"),
-        [first, rest @ ..] => format!("{first} and {} others are running", rest.len()),
-        [] => unreachable!(),
-    };
-    let c = &p.k.c;
-    Some(
-        controls::surface(
-            p,
-            row()
-                .key("conflict-notice")
-                .w_full()
-                .gap(12.0)
-                .px(14.0)
-                .py(12.0)
-                .center_y()
-                .child(
-                    icon(&WINDOW_CONFLICT_ICON, 16.0)
-                        .key("icon")
-                        .color(c.icon_muted),
-                )
-                .child(
-                    col()
-                        .key("copy")
-                        .grow(1.0)
-                        .shrink()
-                        .gap(2.0)
-                        .child(text(names).key("title").font(p.k.ty.ui_medium).color(p.text()))
-                        .child(
-                            text(
-                                "Two window managers fight over the same windows and shortcuts. Quit the other one before you start tiling.",
-                            )
-                            .key("detail")
-                            .font(DESCRIPTION)
-                            .color(p.muted())
-                            .wrap(),
-                        ),
-                ),
-        )
-        .border(p.hair, c.border_base.alpha(0.7)),
-    )
-}
-
-fn setup(ui: &Ui, p: Paint, view: &View) -> El {
+/// The permission step asks for one thing. Under it, one quiet row for each thing that would
+/// fight Spaceman for the same windows and is really on; nothing when none is.
+fn setup(p: Paint, view: &View, conflicts: &[Conflict]) -> El {
     let waiting = view.accessibility == controls::PermissionControl::Waiting;
     let access_desc = if view.ready {
         (
-            "Moves windows and listens for Option shortcuts.".to_owned(),
+            "Moves windows and listens for global shortcuts.".to_owned(),
             p.muted(),
         )
     } else if waiting {
         (spaceman::permission_guide::add_instructions(), p.warning())
     } else {
         (
-            "Needed to move windows and register Option shortcuts.".to_owned(),
+            "Needed to move windows and register global shortcuts.".to_owned(),
             p.muted(),
         )
     };
@@ -372,43 +356,46 @@ fn setup(ui: &Ui, p: Paint, view: &View) -> El {
             input(ui, Input::GrantAccessibility);
         }),
     );
-
-    let login_desc = match ui.agent.as_ref().map(|agent| &agent.launch_at_login) {
-        Some(UiLaunchAtLogin::NeedsApproval) => (
-            "Approve SpaceFred in System Settings › General › Login Items.".to_owned(),
-            p.warning(),
-        ),
-        Some(UiLaunchAtLogin::Failed(error)) => (error.clone(), p.danger()),
-        _ => (
-            "Start in the menu bar when you sign in.".to_owned(),
-            p.muted(),
-        ),
-    };
-    let login_row = controls::icon_toggle_row(
-        p,
-        "setup-login",
-        &glyphs::SPARKLE,
-        "Launch at Login",
-        Some(login_desc),
-        view.launch_at_login,
-        |ui| input(ui, Input::ToggleLaunchAtLogin),
-    );
-
+    let conflict_rows: Vec<El> = conflicts
+        .iter()
+        .enumerate()
+        .map(|(index, conflict)| {
+            controls::setting_row(
+                p,
+                &format!("conflict-{}", conflict.key()),
+                &conflict.label(),
+                None,
+                controls::button(
+                    p,
+                    "resolve",
+                    conflict.action(),
+                    ButtonKind::Secondary,
+                    move |ui, _| resolve(ui, index),
+                ),
+            )
+        })
+        .collect();
     col()
         .key("setup")
         .gap(24.0)
         .child(title_block(p, "Give SpaceFred window access", None))
-        .child(controls::card(p, "setup-card", vec![access_row, login_row]))
+        .child(
+            col()
+                .key("setup-cards")
+                .gap(12.0)
+                .child(controls::card(p, "setup-card", vec![access_row]))
+                .children(
+                    (!conflict_rows.is_empty())
+                        .then(|| controls::card(p, "conflict-card", conflict_rows)),
+                ),
+        )
 }
 
-fn done(p: Paint, sandbox: &Sandbox) -> El {
+fn workspaces(ui: &Ui, p: Paint, board: &Board) -> El {
     col()
-        .key("done")
-        .gap(28.0)
-        .child(title_block(
-            p,
-            "You're all set",
-            Some("Try the shortcuts here. SpaceFred lives in the menu bar."),
-        ))
-        .child(desk::practice(p, sandbox))
+        .key("workspaces")
+        .gap(24.0)
+        .center()
+        .child(title_block(p, "Your workspaces", None))
+        .child(arrange::view(ui, p, board))
 }

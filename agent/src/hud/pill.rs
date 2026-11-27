@@ -5,17 +5,17 @@
 //!
 //! | What changes                     | What moves                                            | Spring (duration / bounce) |
 //! | -------------------------------- | ----------------------------------------------------- | -------------------------- |
-//! | The HUD appears                  | fades in, scales from .96 and rises 6 pt              | .14 / 0                    |
-//! | The HUD leaves                   | the same path back                                    | .11 / 0                    |
-//! | Another workspace                | the marker's leading edge, then its trailing edge     | .16 / 0, .21 / 0           |
-//! |                                  | Layouts: the cells grow and shrink, neighbours slide  | .15 / 0                    |
-//! |                                  | Icons: the groups brighten and dim                    | .14 / 0                    |
+//! | The HUD appears                  | fades in, scales from .96 and rises 6 pt              | .10 / 0                    |
+//! | The HUD leaves                   | the same path back                                    | .105 / 0                   |
+//! | Another workspace                | the marker's leading edge, then its trailing edge     | .16 / 0, .20 / 0           |
+//! |                                  | Layouts: the cells grow and shrink, neighbours slide  | .12 / 0                    |
+//! |                                  | Icons: the groups brighten and dim                    | .095 / 0                   |
 //! | Shown again after hiding         | the marker starts on the workspace you left and       | as above                   |
 //! |                                  | travels while the capsule fades in                    |                            |
 //! | A workspace joins or leaves      | it fades and scales in or out in place                | settle                     |
-//! | A layout changes                 | each tile springs to its new frame                    | .15 / 0                    |
+//! | A layout changes                 | each tile springs to its new frame                    | .12 / 0                    |
 //! | A window moves                   | its icon leaves one workspace for the other           | settle                     |
-//! | More workspaces than fit         | the row scrolls to keep yours in view, edges fade     | .15 / 0                    |
+//! | More workspaces than fit         | the row scrolls to keep yours in view, edges fade     | .12 / 0                    |
 //!
 //! Under Reduce Motion nothing travels or scales; the row cross-fades instead.
 
@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 use rune::{Color, El, Pixels, Spring, Transition, el, row, text, tok::motion::pair::SETTLE};
 use spaceman::{
     WorkspaceId,
-    app::{UiHudDisplay, UiHudWorkspace},
+    app::{UiHudDisplay, UiHudToast, UiHudWorkspace},
     config::{HudPosition, HudStyle},
 };
 
@@ -42,24 +42,35 @@ pub const CAPSULE_INSET: f32 = 60.0;
 /// Room each side of the capsule for its shadow's widest blur.
 pub const SHADOW_SIDE: f32 = 32.0;
 
-/// The capsule answering a shortcut: crisp in, faster out.
-const ENTER: Spring = Spring::new(0.14, 0.0);
-const EXIT: Spring = Spring::new(0.11, 0.0);
+/// The capsule answering a shortcut, crisp both ways.
+const ENTER: Spring = Spring::new(0.10, 0.0);
+const EXIT: Spring = Spring::new(0.105, 0.0);
 const REST_SCALE: f32 = 0.96;
 const DROP: f32 = 6.0;
 /// The marker's leading edge, quicker so it stretches toward where it is going, and its
-/// trailing edge catching up; with nowhere to go, one spring for both.
+/// trailing edge catching up; with nowhere to go, one spring for both. A quicker lead fails the
+/// motion gate's jerk check when a fast switch turns the marker around.
 const MARKER_LEAD: Spring = Spring::new(0.16, 0.0);
-const MARKER_TRAIL: Spring = Spring::new(0.21, 0.0);
-const MARKER: Spring = Spring::new(0.17, 0.0);
+const MARKER_TRAIL: Spring = Spring::new(0.20, 0.0);
+const MARKER: Spring = Spring::new(0.115, 0.0);
 /// The row's own layout: scrolling, and the capsule's width.
-pub const ROW: Spring = Spring::new(0.15, 0.0);
+pub const ROW: Spring = Spring::new(0.12, 0.0);
 /// The fade at an edge the row is cut at, and at an edge it fits inside.
 const CLIPPED_FADE: f32 = 24.0;
 const EDGE_FADE: f32 = 6.0;
 
 /// App icons by bundle ID, looked up before the view runs.
 pub type Icons = HashMap<String, Pixels>;
+
+/// One build of a transient status toast capsule.
+#[derive(Clone, Copy, Debug)]
+pub struct ToastView<'a> {
+    pub toast: &'a UiHudToast,
+    /// Up, or on its way out.
+    pub shown: bool,
+    /// Reduce Motion: fades in place with no scale or drop.
+    pub still: bool,
+}
 
 /// One build of the capsule: what it shows and how it got here.
 #[derive(Clone, Copy, Debug)]
@@ -140,6 +151,72 @@ pub const fn enter_offset(position: HudPosition, shown: bool, still: bool) -> f3
     }
 }
 
+/// Non-activating transient status toast pill (pause / resume feedback).
+pub fn toast_slot(view: &ToastView<'_>, position: HudPosition, p: Paint) -> El {
+    let dark = Paint::new(true, 1.0 / p.hair);
+    let (spring, opacity) = if view.shown {
+        (ENTER, 1.0)
+    } else {
+        (EXIT, 0.0)
+    };
+    let scale = if view.shown || view.still {
+        1.0
+    } else {
+        REST_SCALE
+    };
+    let drop = enter_offset(position, view.shown, view.still);
+    let indicator = if view.toast.paused {
+        let bar = |key: &'static str| {
+            el().key(key)
+                .size(2.5, 10.0)
+                .radius(1.0)
+                .fill(rgba(0xffffff, 0.55))
+        };
+        row()
+            .key("hud-toast-pause")
+            .gap(2.5)
+            .center_y()
+            .child(bar("hud-toast-pause-l"))
+            .child(bar("hud-toast-pause-r"))
+    } else {
+        el().key("hud-toast-active")
+            .size(7.0, 7.0)
+            .radius(3.5)
+            .fill(dark.k.c.success.fg)
+    };
+    let mut capsule = row()
+        .key("hud-toast-pill")
+        .h(PILL_HEIGHT)
+        .px(16.0)
+        .gap(10.0)
+        .center_y()
+        .radius(PILL_HEIGHT / 2.0)
+        .fill(srgb(0x161618))
+        .border(p.hair, srgb(0x303036))
+        .child(indicator)
+        .child(
+            text(&view.toast.message)
+                .key("hud-toast-message")
+                .font(rune::TextStyle::new(13.0, 500.0))
+                .color(rgba(0xffffff, 0.92)),
+        );
+    for shadow in &dark.k.elevation.overlay {
+        capsule = capsule.box_shadow(*shadow);
+    }
+    row()
+        .key("hud-toast-slot")
+        .w_full()
+        .h(PILL_HEIGHT)
+        .center()
+        .opacity(opacity)
+        .opacity_motion(spring)
+        .scale(scale)
+        .scale_motion(spring)
+        .offset(0.0, drop)
+        .offset_motion(spring)
+        .child(capsule)
+}
+
 /// Passive capsule used by Playground previews (no `HudOverlay` event handlers).
 pub fn slot(
     view: &HudView,
@@ -153,7 +230,7 @@ pub fn slot(
 }
 
 /// Interactive capsule used by the live HUD overlay and its 120 Hz tests: marks the capsule as a
-/// hit region, holds on hover, switches workspaces on click, and opens the per-app Float/Pin menu
+/// hit region, holds on hover, switches workspaces on click, and opens the per-app rule menu
 /// on secondary click.
 pub fn interactive_slot(
     view: &HudView,
@@ -188,7 +265,14 @@ fn render_slot(
     let drop = enter_offset(position, view.shown, view.still);
     let entries = view.entries();
     let track = match style {
-        HudStyle::Layouts => grow::track_with_mode(&entries, view.focus, icons, p, interactive),
+        HudStyle::Layouts => grow::track_with_mode(
+            &entries,
+            view.focus,
+            view.row.portrait,
+            icons,
+            p,
+            interactive,
+        ),
         HudStyle::Icons => icons::track_with_mode(&entries, view.focus, icons, p, interactive),
     };
     row()

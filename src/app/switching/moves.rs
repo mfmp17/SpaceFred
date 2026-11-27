@@ -12,11 +12,19 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
+        // The window a focus command just targeted, though Accessibility may
+        // still report the one focus left (#397).
         let window = self
-            .backend
-            .focused_window()
+            .current_focus()
             .ok_or("Focused window is unavailable")?;
-        self.move_window(window, target, outputs, cancelled)
+        self.move_window_with_focus(
+            window,
+            target,
+            true,
+            outputs,
+            cancelled,
+            CommandOrigin::Explicit,
+        )
     }
 
     pub(in crate::app) fn move_focused_follow(
@@ -25,17 +33,31 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
+        // The window a focus command just targeted, though Accessibility may
+        // still report the one focus left (#397).
         let window = self
-            .backend
-            .focused_window()
+            .current_focus()
             .ok_or("Focused window is unavailable")?;
         let was_visible = self.is_visible(target, &outputs);
-        let moved = self.move_window(window.clone(), target, outputs.clone(), cancelled)?;
+        let moved = self.move_window_with_focus(
+            window.clone(),
+            target,
+            false,
+            outputs.clone(),
+            cancelled,
+            CommandOrigin::Explicit,
+        )?;
         if was_visible {
             return Ok(moved);
         }
         self.workspaces.remember_focus(target, &window);
-        let mut switched = self.switch(target, outputs, cancelled)?;
+        let mut switched = self.switch_with(
+            target,
+            outputs,
+            cancelled,
+            RepeatSwitch::KeepFocus,
+            CommandOrigin::Explicit,
+        )?;
         switched.failed += moved.failed;
         Ok(switched)
     }
@@ -49,17 +71,37 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     ) -> Result<CycleStatus, String> {
         let mut windows = self.windows_for_bundle(bundle_id);
         if windows.is_empty() {
-            self.with_warp_context(WarpContext::Suppressed, |rt| {
-                rt.cycle(outputs.clone(), cancelled)
-            })?;
+            self.cycle(outputs.clone(), cancelled)?;
             windows = self.windows_for_bundle(bundle_id);
         }
+        let focused_before = self.backend.focused_window();
+        let frontmost_before = self.backend.frontmost_application();
+        let focused_source = focused_before
+            .as_ref()
+            .filter(|focused| windows.contains(focused))
+            .and_then(|focused| self.workspaces.workspace_of_any(focused))
+            .filter(|source| *source != target);
         let mut status: Option<CycleStatus> = None;
         let mut retired_failed = 0;
+        let mut refused = None;
         for window in windows {
-            match self.with_warp_context(WarpContext::Suppressed, |rt| {
-                rt.move_window_outcome(window, target, outputs.clone(), cancelled)
-            })? {
+            let outcome = match self.move_window_outcome(
+                window,
+                target,
+                false,
+                outputs.clone(),
+                cancelled,
+                CommandOrigin::Passive,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Windows already moved stay moved, so focus still has
+                    // to leave the one parked off screen (#688).
+                    refused = Some(error);
+                    break;
+                }
+            };
+            match outcome {
                 MoveWindowOutcome::Moved(mut moved) => {
                     moved.failed += status.map_or(retired_failed, |earlier| earlier.failed);
                     retired_failed = 0;
@@ -75,6 +117,24 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     }
                 }
             }
+        }
+        if status.is_some()
+            && !self.is_visible(target, &outputs)
+            && let (Some(focused), Some(source)) = (focused_before, focused_source)
+            && (refused.is_none() || self.workspaces.workspace_of_any(&focused) == Some(target))
+            && self.is_visible(source, &outputs)
+        {
+            self.handoff_focus_after_park(
+                source,
+                &focused,
+                frontmost_before,
+                &outputs,
+                CommandOrigin::Passive,
+            );
+            self.persist_workspace_state_if_changed()?;
+        }
+        if let Some(error) = refused {
+            return Err(error);
         }
         status.ok_or_else(|| format!("No managed window found for {bundle_id}"))
     }
@@ -101,7 +161,46 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
-        match self.move_window_outcome(window, target, outputs, cancelled)? {
+        self.move_window_with_focus(
+            window,
+            target,
+            true,
+            outputs,
+            cancelled,
+            CommandOrigin::Passive,
+        )
+    }
+
+    /// A keyboard or `ctl` move of `window` (a directional move off the
+    /// workspace edge): focus follows it onto a workspace on screen elsewhere
+    /// and Mouse follows focus applies, unlike a drag or the setup tour (#517).
+    pub(in crate::app) fn move_window_explicit(
+        &mut self,
+        window: crate::PhysicalWindowId,
+        target: WorkspaceId,
+        outputs: macos::DisplayOutputs,
+        cancelled: &AtomicBool,
+    ) -> Result<CycleStatus, String> {
+        self.move_window_with_focus(
+            window,
+            target,
+            true,
+            outputs,
+            cancelled,
+            CommandOrigin::Explicit,
+        )
+    }
+
+    fn move_window_with_focus(
+        &mut self,
+        window: crate::PhysicalWindowId,
+        target: WorkspaceId,
+        handoff_focus: bool,
+        outputs: macos::DisplayOutputs,
+        cancelled: &AtomicBool,
+        origin: CommandOrigin,
+    ) -> Result<CycleStatus, String> {
+        match self.move_window_outcome(window, target, handoff_focus, outputs, cancelled, origin)? {
             MoveWindowOutcome::Moved(status) | MoveWindowOutcome::Retired(status) => Ok(status),
         }
     }
@@ -110,16 +209,16 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         &mut self,
         window: crate::PhysicalWindowId,
         target: WorkspaceId,
+        handoff_focus: bool,
         outputs: macos::DisplayOutputs,
         cancelled: &AtomicBool,
+        origin: CommandOrigin,
     ) -> Result<MoveWindowOutcome, String> {
         self.ensure_managed_workspace(target)?;
         let source = if let Some(source) = self.workspaces.workspace_of_any(&window) {
             source
         } else {
-            self.with_warp_context(WarpContext::Suppressed, |rt| {
-                rt.cycle(outputs.clone(), cancelled)
-            })?;
+            self.cycle(outputs.clone(), cancelled)?;
             self.workspaces
                 .workspace_of_any(&window)
                 .ok_or("Window is not managed by SpaceFred")?
@@ -127,6 +226,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if source == target {
             return Ok(MoveWindowOutcome::Moved(self.status(0, &outputs)));
         }
+        let reported = self.backend.focused_window();
+        let was_focused = self.effective_focus(reported.clone()).as_ref() == Some(&window);
+        let frontmost_before = self.backend.frontmost_application();
         let is_floating = self.workspaces.floating_workspace_of(&window).is_some();
         if is_floating {
             self.settle_pending_summon_for_move(&window);
@@ -165,22 +267,34 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if is_floating {
             self.workspaces.own_floating(window.clone(), target);
         } else {
+            // Its group may show another tab where it was before it gets there (#759).
+            self.note_departed_tile(&window, source);
+            let source_canvas = self.layout_settings(source_output).canvas();
+            let target_canvas = self.layout_settings(target_output).canvas();
             self.workspaces
-                .move_window(&window, target)
+                .move_window_with(
+                    &window,
+                    target,
+                    self.config.layout(),
+                    source_canvas,
+                    target_canvas,
+                )
                 .ok_or("Window could not be moved")?;
-            self.exit_fullscreen_if_split(target);
         }
         self.clear_fullscreen_restore_if_inactive(source);
         self.clear_relocation_evidence(source, target, &window);
         self.note_hand_move(&window, source, target);
-        if !target_is_active {
-            self.suppressed_app = Some(window.app.clone());
-            self.suppressed_focus = Some(window.clone());
-        }
         let mut failed = 0;
         if !is_floating && self.is_visible(source, &outputs) {
             let layout = self.layout_workspace(source, source_output, cancelled);
             failed += layout.failed;
+        }
+        if !target_is_active {
+            if handoff_focus && was_focused && self.is_visible(source, &outputs) {
+                self.handoff_focus_after_park(source, &window, frontmost_before, &outputs, origin);
+            } else {
+                self.guard_departure(Some(window.clone()), Some(window.app.clone()));
+            }
         }
         if target_is_active {
             let was_parked = self.parked.contains_key(&window);
@@ -214,7 +328,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             {
                 failed += 1;
             }
-            if self.backend.focus_window(&window) {
+            if self.request_focus(&window, [reported]) {
+                if !is_floating && self.workspaces.deck(target).is_monocle() {
+                    self.workspaces.remember_focus(target, &window);
+                }
                 // Focus followed the window to the workspace on screen
                 // elsewhere; Option+Tab goes back to where it came from.
                 self.record_focused_workspace(target);
@@ -223,7 +340,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     .resolve(self.workspaces.assignment(target))
                     .id
                     .as_str();
-                self.follow_pointer_to(target_display_id, target_output, frame, &outputs);
+                self.follow_pointer_to(origin, target_display_id, target_output, frame, &outputs);
             } else {
                 log_event!("move focus follow failed for {:?}", window);
             }
@@ -234,10 +351,45 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         Ok(MoveWindowOutcome::Moved(status))
     }
 
+    /// Hands keyboard focus to a remaining visible window on `source` after
+    /// `moved` was parked on an inactive workspace, so focus never stays
+    /// stranded on the off-screen window (#323). When `source` is now empty,
+    /// focus stays suppressed on `moved` so focus-follow does not snap back.
+    /// A window the user minimized or hid is not a remaining window: focusing
+    /// it, as the remembered float, would bring it back (#743).
+    fn handoff_focus_after_park(
+        &mut self,
+        source: WorkspaceId,
+        moved: &crate::PhysicalWindowId,
+        frontmost_before: Option<AppInstanceId>,
+        outputs: &macos::DisplayOutputs,
+        origin: CommandOrigin,
+    ) {
+        let remaining = self.shown_focus_candidates(source);
+        if remaining.is_empty() {
+            self.guard_departure(Some(moved.clone()), Some(moved.app.clone()));
+            return;
+        }
+        let outcome = self.focus_workspace_entry(
+            source,
+            &remaining,
+            Some(moved.clone()),
+            frontmost_before.or_else(|| Some(moved.app.clone())),
+            false,
+        );
+        if let WorkspaceFocusOutcome::Focused(ref next) = outcome {
+            if self.workspaces.deck(source).is_monocle() {
+                self.workspaces.remember_focus(source, next);
+            }
+            let source_output = output_for(&self.workspaces, source, outputs);
+            self.follow_pointer_for_workspace(origin, source, source_output, outcome, outputs);
+        }
+    }
+
     /// A floating window has no tile to carry it, so moving it to a workspace
     /// on screen on another display moves it there directly, keeping its size
     /// and its place relative to the display. A window already there stays.
-    fn carry_floating_window(
+    pub(in crate::app) fn carry_floating_window(
         &mut self,
         window: &crate::PhysicalWindowId,
         from: crate::Rect,

@@ -1,4 +1,4 @@
-use super::super::commands::FOCUS_SETTLE;
+use super::super::focus::FOCUS_SETTLE;
 use super::*;
 
 /// Three tiles side by side on the main display, the first one focused.
@@ -58,7 +58,7 @@ fn a_settled_or_different_focus_report_wins_over_the_pending_target() {
 
     focus(&mut runtime, Direction::Right);
     runtime.backend.focused = Some(first.clone());
-    runtime.pending_focus.as_mut().unwrap().at -= FOCUS_SETTLE;
+    runtime.focus.age_request(FOCUS_SETTLE);
     focus(&mut runtime, Direction::Right);
     assert_eq!(focus_calls(&runtime), vec![20, 20]);
 
@@ -132,7 +132,7 @@ fn switch_to_second_workspace(focus_outcome: bool) -> WorkspaceRuntime<FakeBacke
     let target = WorkspaceId::new(2).unwrap();
     bind(&mut runtime, WorkspaceId::ONE, &shown);
     bind(&mut runtime, target, &incoming);
-    runtime.pending_fullscreen_focus_restore.insert(target);
+    runtime.focus.restore_fullscreen_on(target);
 
     runtime
         .switch(target, outputs(), &AtomicBool::new(false))
@@ -147,8 +147,8 @@ fn a_workspace_switch_that_cannot_focus_keeps_the_focus_restore_pending() {
 
     assert!(
         runtime
-            .pending_fullscreen_focus_restore
-            .contains(&WorkspaceId::new(2).unwrap())
+            .focus
+            .restores_fullscreen(WorkspaceId::new(2).unwrap())
     );
 }
 
@@ -156,7 +156,7 @@ fn a_workspace_switch_that_cannot_focus_keeps_the_focus_restore_pending() {
 fn a_workspace_switch_that_focuses_settles_the_focus_restore() {
     let runtime = switch_to_second_workspace(true);
 
-    assert!(runtime.pending_fullscreen_focus_restore.is_empty());
+    assert!(!runtime.focus.restores_any_fullscreen());
 }
 
 #[test]
@@ -199,7 +199,10 @@ fn following_focus_to_a_hidden_workspace_keeps_the_window_that_took_it() {
         } else {
             bind(&mut runtime, target, &notified);
         }
-        runtime.workspaces.set_fullscreen_layout(target, fullscreen);
+        runtime.workspaces.set_deck(
+            target,
+            crate::workspace::DeckMode::from_fullscreen(fullscreen),
+        );
         runtime.workspaces.remember_focus(target, &remembered);
 
         let status = runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
@@ -252,7 +255,7 @@ fn a_follow_cancelled_by_the_activation_it_answers_follows_on_the_next_cycle() {
         Some(WorkspaceId::ONE)
     );
     assert_eq!(runtime.parked.get(&notified), Some(&frame(500)));
-    assert_eq!(runtime.suppressed_focus, None);
+    assert_eq!(runtime.focus.guarded_window().cloned(), None);
 
     let status = runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
     assert_eq!(status.active, vec![target, WorkspaceId::SIX]);
@@ -292,7 +295,7 @@ fn a_follow_that_fails_while_an_activation_cancels_stays_suppressed() {
 
     assert!(!error.ends_with("cancelled"), "{error}");
     assert!(cancelled.load(Ordering::Acquire));
-    assert_eq!(runtime.suppressed_focus, Some(notified));
+    assert_eq!(runtime.focus.guarded_window().cloned(), Some(notified));
 }
 
 fn config_with_mouse_follows_focus(mode: &str) -> Config {
@@ -394,7 +397,8 @@ fn mouse_follows_focus_display_warps_across_displays_and_skips_same_display() {
     assert_eq!(runtime.backend.focused, Some(sec_right));
     assert_eq!(warp_calls(&runtime), vec![(1250, 400)]);
 
-    // Explicit switch back to workspace 1 (main) warps to main's focused tile center.
+    // Explicit switch back to workspace 1 (main) warps to main's remembered
+    // focused tile (main_right at (750, 400), #639).
     runtime.record_focused_workspace(WorkspaceId::SIX);
     runtime
         .execute(
@@ -402,9 +406,10 @@ fn mouse_follows_focus_display_warps_across_displays_and_skips_same_display() {
             &cancelled,
         )
         .unwrap();
-    assert_eq!(warp_calls(&runtime), vec![(1250, 400), (250, 400)]);
+    assert_eq!(warp_calls(&runtime), vec![(1250, 400), (750, 400)]);
 
-    // Option+Tab back to visible workspace 6 on secondary warps back to secondary.
+    // Option+Tab back to visible workspace 6 on secondary warps back to its
+    // remembered focused tile (sec_right at (1750, 400), #527).
     runtime
         .execute(
             WorkerCommand::Action(WorkerAction::WorkspaceBackAndForth, outputs()),
@@ -413,7 +418,7 @@ fn mouse_follows_focus_display_warps_across_displays_and_skips_same_display() {
         .unwrap();
     assert_eq!(
         warp_calls(&runtime),
-        vec![(1250, 400), (250, 400), (1250, 400)]
+        vec![(1250, 400), (750, 400), (1750, 400)]
     );
 }
 
@@ -564,7 +569,9 @@ fn mouse_follows_focus_never_warps_on_passive_cycle_focus_follow_or_mouse_down()
         .backend
         .frames
         .insert(other_hidden.clone(), main_parked_frame(frame(1200)));
-    runtime.parked.insert(other_hidden.clone(), frame(1200));
+    runtime
+        .parked
+        .insert(other_hidden.clone(), frame(1200), None);
     bind(&mut runtime, WorkspaceId::new(8).unwrap(), &other_hidden);
     runtime.backend.focused = Some(other_hidden.clone());
     runtime.backend.frontmost = Some(other_hidden.app);
@@ -828,9 +835,9 @@ fn swipe_in_secondary_menu_bar_or_dock_targets_secondary_display() {
         }
         let mut tracker = crate::swipe::SwipeTracker::default();
         assert_eq!(tracker.frame(0.0, &[(0.6, 0.5); 3]), None);
-        let swipe = tracker.frame(0.1, &[(0.3, 0.5); 3]).unwrap();
+        let (swipe, fingers) = tracker.frame(0.1, &[(0.3, 0.5); 3]).unwrap();
         let result = rt.execute(
-            WorkerCommand::Action(WorkerAction::Swipe(swipe, point), displays.clone()),
+            WorkerCommand::Action(WorkerAction::Swipe(swipe, fingers, point), displays.clone()),
             &AtomicBool::new(false),
         );
         match result.unwrap() {
