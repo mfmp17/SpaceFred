@@ -12,6 +12,9 @@ pub(in crate::app) const ASYNC_BOUNCE_SETTLE: Duration = Duration::from_millis(5
 /// each cycle), preventing infinite resize-fight flicker loops.
 pub(in crate::app) const APPLY_ATTEMPT_LIMIT: u8 = 3;
 
+/// Points within which a clamped frame's edge meets a display's edge.
+const DISPLAY_EDGE_TOLERANCE: i32 = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::app) struct AppliedFrame {
     pub(in crate::app) target: crate::Rect,
@@ -19,15 +22,8 @@ pub(in crate::app) struct AppliedFrame {
 }
 
 impl AppliedFrame {
-    pub(in crate::app) fn now(target: crate::Rect) -> Self {
-        Self {
-            target,
-            at: Instant::now(),
-        }
-    }
-
-    pub(super) fn is_settling(&self, target: crate::Rect) -> bool {
-        self.target == target && self.at.elapsed() < ASYNC_BOUNCE_SETTLE
+    pub(super) fn is_settling(&self, target: crate::Rect, now: Instant) -> bool {
+        self.target == target && now.saturating_duration_since(self.at) < ASYNC_BOUNCE_SETTLE
     }
 }
 
@@ -37,6 +33,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         workspace: WorkspaceId,
         results: &[macos::ApplyResult],
     ) {
+        let now = self.backend.now();
+        let displays = self.displays.known_outputs();
         let constrained = &mut self.constrained[workspace.index()];
         let applied = &mut self.applied[workspace.index()];
         let attempts = &mut self.apply_attempts[workspace.index()];
@@ -44,7 +42,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             match (result.outcome, result.actual) {
                 (macos::ApplyOutcome::Constrained, Some(actual)) => {
                     applied.remove(&result.window);
-                    constrained.insert(result.window.clone(), (result.target, actual));
+                    if !clamped_to_departed_display(displays, result.target, actual) {
+                        constrained.insert(result.window.clone(), (result.target, actual));
+                    }
                     record_apply_attempt(attempts, workspace, &result.window, result.target);
                 }
                 (macos::ApplyOutcome::Applied, _) => {
@@ -55,7 +55,13 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     {
                         attempts.remove(&result.window);
                     }
-                    applied.insert(result.window.clone(), AppliedFrame::now(result.target));
+                    applied.insert(
+                        result.window.clone(),
+                        AppliedFrame {
+                            target: result.target,
+                            at: now,
+                        },
+                    );
                 }
                 (macos::ApplyOutcome::Gone, _) => {
                     applied.remove(&result.window);
@@ -72,6 +78,31 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             }
         }
     }
+}
+
+/// macOS fits a size write to the display a window is on when the write
+/// lands: a window moved onto a taller display keeps the bottom edge of the
+/// display it left until the app sees its new screen (#428). That frame is no
+/// refusal by the app, so it is not frozen as one; the next cycle writes the
+/// frame again, within the usual attempt limit.
+fn clamped_to_departed_display(
+    displays: Option<&macos::DisplayOutputs>,
+    target: crate::Rect,
+    actual: crate::Rect,
+) -> bool {
+    let Some(displays) = displays else {
+        return false;
+    };
+    if !actual.position_approximately_equals(target, DISPLAY_EDGE_TOLERANCE)
+        || actual.height + DISPLAY_EDGE_TOLERANCE >= target.height
+    {
+        return false;
+    }
+    let bottom = actual.y + actual.height;
+    displays.frames().any(|display| {
+        !display.contains_center(target)
+            && (display.y + display.height - bottom).abs() <= DISPLAY_EDGE_TOLERANCE
+    })
 }
 
 pub(in crate::app) fn record_apply_attempt(

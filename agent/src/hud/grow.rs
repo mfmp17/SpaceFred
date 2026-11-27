@@ -4,7 +4,7 @@
 use rune::{Cursor, El, Spring, Tx, el, row};
 use spaceman::{
     Rect, WorkspaceId,
-    app::{HUD_PREVIEW_RECT, UiHudWorkspace},
+    app::{HUD_PREVIEW_RECT, UiHudWorkspace, hud_preview_rect},
 };
 
 use super::pill::{INNER, Icons, ROW, Track, app_icon, presence, rgba};
@@ -13,6 +13,9 @@ use crate::controls::Paint;
 /// The current workspace's screen; the others draw at `SMALL` of it.
 pub const SCREEN_W: f32 = 50.0;
 pub const SCREEN_H: f32 = 32.0;
+/// A portrait display's screen: as tall as a landscape one, in its preview's proportions.
+pub const PORTRAIT_SCREEN_W: f32 =
+    SCREEN_H * HUD_PREVIEW_RECT.height as f32 / HUD_PREVIEW_RECT.width as f32;
 pub const SMALL: f32 = 0.62;
 pub const GAP: f32 = 8.0;
 /// From the capsule's inside edge to the first screen.
@@ -30,9 +33,24 @@ const BEHIND_SCALE: f32 = 0.7;
 const BEHIND_OPACITY: f32 = 0.55;
 const BEHIND_GAP: f32 = 3.0;
 
-/// Where each screen rests: its left edge and scale.
+/// A screen's width: narrower on a portrait display's row.
 #[must_use]
-pub fn rest(entries: &[UiHudWorkspace], focus: Option<WorkspaceId>) -> (Vec<(f32, f32)>, f32) {
+pub const fn screen_w(portrait: bool) -> f32 {
+    if portrait {
+        PORTRAIT_SCREEN_W
+    } else {
+        SCREEN_W
+    }
+}
+
+/// Where each screen rests: its left edge and scale; `portrait` for a row of tall screens.
+#[must_use]
+pub fn rest(
+    entries: &[UiHudWorkspace],
+    focus: Option<WorkspaceId>,
+    portrait: bool,
+) -> (Vec<(f32, f32)>, f32) {
+    let screen_w = screen_w(portrait);
     let mut x = EDGE;
     let cells = entries
         .iter()
@@ -43,7 +61,7 @@ pub fn rest(entries: &[UiHudWorkspace], focus: Option<WorkspaceId>) -> (Vec<(f32
                 SMALL
             };
             let cell = (x, scale);
-            x += SCREEN_W * scale + GAP;
+            x += screen_w * scale + GAP;
             cell
         })
         .collect::<Vec<_>>();
@@ -55,14 +73,17 @@ pub fn rest(entries: &[UiHudWorkspace], focus: Option<WorkspaceId>) -> (Vec<(f32
     (cells, width)
 }
 
+/// The row; `portrait` draws every screen tall, for a portrait display's row.
 pub fn track_with_mode(
     entries: &[UiHudWorkspace],
     focus: Option<WorkspaceId>,
+    portrait: bool,
     icons: &Icons,
     p: Paint,
     interactive: bool,
 ) -> Track {
-    let (rests, width) = rest(entries, focus);
+    let screen_w = screen_w(portrait);
+    let (rests, width) = rest(entries, focus, portrait);
     let mut marker = None;
     let cells = entries
         .iter()
@@ -74,15 +95,15 @@ pub fn track_with_mode(
                 marker = Some([
                     x - PAD,
                     (INNER - height) / 2.0,
-                    SCREEN_W + 2.0 * PAD,
+                    screen_w + 2.0 * PAD,
                     height,
                 ]);
             }
             // The screen keeps its full size and draws scaled about its centre, which sits in
             // the middle of the room its scaled width takes.
-            screen(entry, icons, p, interactive)
+            screen(entry, portrait, icons, p, interactive)
                 .absolute(
-                    x + SCREEN_W * scale / 2.0 - SCREEN_W / 2.0,
+                    x + screen_w * scale / 2.0 - screen_w / 2.0,
                     (INNER - SCREEN_H) / 2.0,
                 )
                 .scale(scale)
@@ -101,13 +122,21 @@ pub fn track_with_mode(
     }
 }
 
-fn screen(entry: &UiHudWorkspace, icons: &Icons, p: Paint, interactive: bool) -> El {
+fn screen(
+    entry: &UiHudWorkspace,
+    portrait: bool,
+    icons: &Icons,
+    p: Paint,
+    interactive: bool,
+) -> El {
     let workspace = entry.workspace;
-    let inner_w = SCREEN_W - 2.0 * p.hair - 2.0 * INSET;
+    let screen_w = screen_w(portrait);
+    let preview = hud_preview_rect(portrait);
+    let inner_w = screen_w - 2.0 * p.hair - 2.0 * INSET;
     let inner_h = SCREEN_H - 2.0 * p.hair - 2.0 * INSET;
     let mut base = el()
         .key(format!("ws{workspace}"))
-        .size(SCREEN_W, SCREEN_H)
+        .size(screen_w, SCREEN_H)
         .radius(5.0)
         .fill(rgba(0xffffff, 0.05))
         .border(p.hair, rgba(0xffffff, 0.22));
@@ -176,7 +205,7 @@ fn screen(entry: &UiHudWorkspace, icons: &Icons, p: Paint, interactive: bool) ->
         return base.child(
             el().key("empty")
                 .absolute(
-                    (SCREEN_W - 4.0) / 2.0 - p.hair,
+                    (screen_w - 4.0) / 2.0 - p.hair,
                     (SCREEN_H - 4.0) / 2.0 - p.hair,
                 )
                 .size(4.0, 4.0)
@@ -186,7 +215,7 @@ fn screen(entry: &UiHudWorkspace, icons: &Icons, p: Paint, interactive: bool) ->
         );
     }
     base.children(entry.tiles.iter().map(|placed| {
-        let frame = scale_tile(placed.rect, INSET, inner_w, inner_h, TILE_GAP, 2.0);
+        let frame = scale_tile_in(placed.rect, preview, INSET, inner_w, inner_h, TILE_GAP, 2.0);
         let size = icon_size(frame.2, frame.3);
         let tile = tile(&format!("t{}", placed.key), frame).motion(GROW);
         match (&placed.bundle, size) {
@@ -253,8 +282,30 @@ pub fn scale_tile(
     gap: f32,
     min_side: f32,
 ) -> (f32, f32, f32, f32) {
-    let pw = HUD_PREVIEW_RECT.width.max(1) as f32;
-    let ph = HUD_PREVIEW_RECT.height.max(1) as f32;
+    scale_tile_in(
+        rect,
+        HUD_PREVIEW_RECT,
+        inset,
+        inner_w,
+        inner_h,
+        gap,
+        min_side,
+    )
+}
+
+/// [`scale_tile`] for a `rect` in `preview` space.
+#[must_use]
+pub fn scale_tile_in(
+    rect: Rect,
+    preview: Rect,
+    inset: f32,
+    inner_w: f32,
+    inner_h: f32,
+    gap: f32,
+    min_side: f32,
+) -> (f32, f32, f32, f32) {
+    let pw = preview.width.max(1) as f32;
+    let ph = preview.height.max(1) as f32;
     (
         inset + (rect.x as f32 / pw) * inner_w + gap,
         inset + (rect.y as f32 / ph) * inner_h + gap,

@@ -1,7 +1,7 @@
 //! What the Workspace HUD shows: each display's row of workspaces, with their layouts and
 //! the apps in them. Title-free: bundle IDs and preview rects only.
 
-use super::*;
+use super::{bridge::hud_preview_rect, *};
 
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// Per display, its visible workspace and every other workspace holding windows.
@@ -10,9 +10,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         visible: &[ResolvedWorkspace],
         outputs: &macos::DisplayOutputs,
     ) -> Vec<status_item::DisplayWorkspaces> {
-        outputs
-            .displays()
-            .iter()
+        let physical = self.config.labs().physical_displays;
+        menu_displays(outputs, physical)
+            .into_iter()
             .filter_map(|display| {
                 let current = visible
                     .iter()
@@ -36,9 +36,64 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     })
                     .collect::<Vec<_>>();
                 (!workspaces.is_empty()).then(|| status_item::DisplayWorkspaces {
-                    display: display.name.clone(),
+                    display: if physical {
+                        outputs.label(display)
+                    } else {
+                        display.name.clone()
+                    },
                     workspaces,
                 })
+            })
+            .collect()
+    }
+
+    /// The menu-bar glyphs: each managed display's visible workspace. With `[labs]
+    /// physical_displays` they go left to right, a portrait display's glyph is tall, and each
+    /// names its display for VoiceOver. A compact menu bar icon (`settings.menu_bar_icon`, with
+    /// `[labs] menu_bar_icon_style`) keeps only the focused workspace's glyph.
+    pub(super) fn status_layouts(
+        &self,
+        visible: &[ResolvedWorkspace],
+        outputs: &macos::DisplayOutputs,
+    ) -> Vec<status_item::WorkspaceLayout> {
+        let physical = self.config.labs().physical_displays;
+        let ordered = menu_displays(outputs, physical);
+        let mut shown: Vec<&ResolvedWorkspace> = visible
+            .iter()
+            .filter(|resolved| self.scope.manages_selector(&resolved.selector))
+            .collect();
+        if physical {
+            shown.sort_by_key(|resolved| {
+                ordered
+                    .iter()
+                    .position(|display| display.id == resolved.display_id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        if self.config.menu_bar_icon() == crate::config::MenuBarIcon::Compact {
+            // One glyph: the focused workspace's display, or the first one before any focus.
+            let focused = self.focus.history().current;
+            let keep = shown
+                .iter()
+                .position(|resolved| Some(resolved.workspace) == focused)
+                .unwrap_or(0);
+            shown = shown.into_iter().skip(keep).take(1).collect();
+        }
+        shown
+            .into_iter()
+            .map(|resolved| {
+                let display = ordered
+                    .iter()
+                    .find(|display| display.id == resolved.display_id);
+                let portrait = display.is_some_and(|display| shows_portrait(display, physical));
+                status_item::WorkspaceLayout {
+                    workspace: resolved.workspace.to_string(),
+                    mode: self.workspace_preview(resolved.workspace, hud_preview_rect(portrait)),
+                    portrait,
+                    display: display
+                        .filter(|_| physical)
+                        .map(|display| outputs.label(display)),
+                }
             })
             .collect()
     }
@@ -53,6 +108,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: &macos::DisplayOutputs,
     ) -> UiHudEvent {
         let visible = self.visible_workspaces(outputs);
+        let physical = self.config.labs().physical_displays;
         let displays = outputs
             .displays()
             .iter()
@@ -67,6 +123,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         && current == Some(workspace)
                         && outputs.resolve(self.workspaces.assignment(*from)).id == display.id
                 });
+                let portrait = shows_portrait(display, physical);
                 UiHudDisplay {
                     id: display.id.clone(),
                     visible: current,
@@ -74,9 +131,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     workspaces: self
                         .listed_workspaces(&display.id, current, outputs)
                         .into_iter()
-                        .map(|workspace| self.hud_workspace(workspace))
+                        .map(|workspace| self.hud_workspace(workspace, hud_preview_rect(portrait)))
                         .collect(),
                     order: self.config.ordered_workspaces().collect(),
+                    portrait,
                 }
             })
             .collect();
@@ -87,11 +145,12 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
     }
 
-    fn hud_workspace(&self, workspace: WorkspaceId) -> UiHudWorkspace {
-        let fullscreen = self.workspaces.uses_fullscreen_layout(workspace);
+    /// `workspace` for the HUD, its tiles in `preview` space.
+    fn hud_workspace(&self, workspace: WorkspaceId, preview: crate::Rect) -> UiHudWorkspace {
+        let fullscreen = self.workspaces.deck(workspace).is_monocle();
         let engine = self.workspaces.engine(workspace);
         let mut tiles: Vec<UiHudTile> = engine
-            .preview_placements(HUD_PREVIEW_RECT)
+            .preview_placements(preview)
             .into_iter()
             .take(HUD_MAX_TILES)
             .map(|placement| UiHudTile {
@@ -140,4 +199,21 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             floating,
         }
     }
+}
+
+/// The displays in menu order: as macOS lists them, or left to right then top to bottom with
+/// `[labs] physical_displays` (`physical`), the order `Option+Shift+Tab` moves through.
+fn menu_displays(outputs: &macos::DisplayOutputs, physical: bool) -> Vec<&macos::DisplayOutput> {
+    if physical {
+        outputs.ordered()
+    } else {
+        outputs.displays().iter().collect()
+    }
+}
+
+/// Whether the menu bar and HUD draw `display` tall: with `[labs] physical_displays`
+/// (`physical`) on, when its frame stands taller than it is wide. The one test both use, so a
+/// nearly square display gets the same shape in each.
+const fn shows_portrait(display: &macos::DisplayOutput, physical: bool) -> bool {
+    physical && display.frame.height > display.frame.width
 }

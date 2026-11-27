@@ -1,11 +1,54 @@
 //! Pure input state: previews may be skipped, but completed gestures and key
 //! commands retain their arrival order until dispatched or explicitly cleared.
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Instant};
 
 use super::{FinalGesture, WorkerAction};
-use crate::{PhysicalWindowId, Rect};
+use crate::{PhysicalWindowId, Rect, swipe::Fingers};
 
 const MAX_PENDING_INPUTS: usize = 64;
+
+/// Axis-aligned bounding box of every pointer sample seen during a drag.
+/// A rectangle contains every sampled point iff it contains this box, so a
+/// display edge band has been left at least once iff `!entirely_inside(band)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PointerBounds {
+    pub(super) min_x: i32,
+    pub(super) max_x: i32,
+    pub(super) min_y: i32,
+    pub(super) max_y: i32,
+}
+
+impl PointerBounds {
+    pub(super) const fn point((x, y): (i32, i32)) -> Self {
+        Self {
+            min_x: x,
+            max_x: x,
+            min_y: y,
+            max_y: y,
+        }
+    }
+
+    pub(super) fn extend(&mut self, (x, y): (i32, i32)) {
+        self.min_x = self.min_x.min(x);
+        self.max_x = self.max_x.max(x);
+        self.min_y = self.min_y.min(y);
+        self.max_y = self.max_y.max(y);
+    }
+
+    pub(super) fn merge(&mut self, other: Self) {
+        self.min_x = self.min_x.min(other.min_x);
+        self.max_x = self.max_x.max(other.max_x);
+        self.min_y = self.min_y.min(other.min_y);
+        self.max_y = self.max_y.max(other.max_y);
+    }
+
+    pub(super) const fn entirely_inside(self, rect: Rect) -> bool {
+        self.min_x >= rect.x
+            && self.max_x < rect.x + rect.width
+            && self.min_y >= rect.y
+            && self.max_y < rect.y + rect.height
+    }
+}
 
 pub(super) fn is_window_drag(start: Rect, current: Rect) -> bool {
     let moved = (start.x - current.x).abs().max((start.y - current.y).abs()) >= 6;
@@ -23,6 +66,27 @@ pub(super) fn is_window_resize(start: Rect, current: Rect) -> bool {
         >= 6
 }
 
+/// The pointer carried the window: on one axis both of its edges moved the way
+/// the pointer went, even if the app changed its size as it landed (#429). A
+/// border drag leaves the opposite edge where it was, and a window Spaceman
+/// moved (parking) did not follow the pointer.
+fn carried(start: Rect, current: Rect, travel: (i32, i32)) -> bool {
+    let along = |leading: i32, trailing: i32, pointer: i32| {
+        [leading, trailing, pointer]
+            .iter()
+            .all(|delta| delta.abs() >= 6 && delta.signum() == pointer.signum())
+    };
+    along(
+        current.x - start.x,
+        current.x + current.width - (start.x + start.width),
+        travel.0,
+    ) || along(
+        current.y - start.y,
+        current.y + current.height - (start.y + start.height),
+        travel.1,
+    )
+}
+
 /// Whether a three-finger workspace swipe must be ignored because a pointer
 /// button is down or a window drag/resize gesture is in progress (such as
 /// macOS Accessibility "Three Finger Drag").
@@ -32,6 +96,71 @@ pub(super) fn should_ignore_swipe(
     gesture_active: bool,
 ) -> bool {
     mouse_down || mouse_was_down || gesture_active
+}
+
+/// Whether a worker action from the main thread enters the input queue. A swipe
+/// enters only with the configured finger count (`Config::swipe_fingers`; the
+/// other count is macOS's gesture and must not wake the worker) and while
+/// [`should_ignore_swipe`] lets it. `pointer` reads `(mouse_down,
+/// mouse_was_down, gesture_active)` and only runs for such a swipe. Every other
+/// action enters.
+pub(super) fn admits_action(
+    action: &WorkerAction,
+    swipe_fingers: Fingers,
+    pointer: impl FnOnce() -> (bool, bool, bool),
+) -> bool {
+    let WorkerAction::Swipe(_, fingers, _) = action else {
+        return true;
+    };
+    if *fingers != swipe_fingers {
+        return false;
+    }
+    let (mouse_down, mouse_was_down, gesture_active) = pointer();
+    !should_ignore_swipe(mouse_down, mouse_was_down, gesture_active)
+}
+
+/// Until when `input` waits after macOS reported a Space change at `changed`
+/// or three or four fingers last touched the trackpad at `gesture`, if it does
+/// at `now`. Background cycles hold layout for `SPACE_TRANSITION_SETTLE` after
+/// the report and `SPACE_GESTURE_SETTLE` after the touch (a swipe shows the
+/// arriving desktop about a second before macOS reports it, #777), so the
+/// arriving desktop's windows are not bound yet and the desktop just left still holds tiles; a
+/// command on the focused window or its workspace run then would hand focus to
+/// a window on the old desktop, sending macOS back there, or find the focused
+/// window unmanaged and do nothing (#770). Such commands wait for the hold to
+/// end, and run after one retile. Switches, swipes and the other commands do
+/// not wait.
+pub(super) fn held_by_space_change(
+    input: &QueuedInput,
+    changed: Option<Instant>,
+    gesture: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    let QueuedInput::Action(action) = input else {
+        return None;
+    };
+    let focused_command = matches!(
+        action,
+        WorkerAction::MoveFocused(_)
+            | WorkerAction::MoveFocusedFollow(_)
+            | WorkerAction::MoveFocusedStep { .. }
+            | WorkerAction::MoveTab { .. }
+            | WorkerAction::CycleFocus
+            | WorkerAction::CycleFocusPrevious
+            | WorkerAction::Focus(_)
+            | WorkerAction::Reorder(_)
+            | WorkerAction::ToggleLayout
+            | WorkerAction::Resize(_)
+            | WorkerAction::ResizeTo(..)
+            | WorkerAction::Balance
+            | WorkerAction::ToggleFullscreenLayout
+            | WorkerAction::ToggleFloat
+            | WorkerAction::TogglePin
+    );
+    let changed = changed.map(|at| at + super::SPACE_TRANSITION_SETTLE);
+    let gesture = gesture.map(|at| at + super::SPACE_GESTURE_SETTLE);
+    let until = changed.max(gesture)?;
+    (focused_command && now < until).then_some(until)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +213,9 @@ struct Gesture {
     /// follow this window, and that must not take the gesture over.
     chosen: Option<usize>,
     last_preview: Option<FinalGesture>,
+    bounds: Option<PointerBounds>,
+    start_point: Option<(i32, i32)>,
+    pressed_at: Option<Instant>,
 }
 
 struct Candidate {
@@ -95,7 +227,30 @@ struct Candidate {
 
 impl GestureTracker {
     /// `candidates` are front to back, each with its frame at mouse-down.
+    #[cfg(test)]
     pub(super) fn begin(&mut self, candidates: Vec<(PhysicalWindowId, Rect)>) {
+        self.begin_at(candidates, None);
+    }
+
+    /// `candidates` are front to back, each with its frame at mouse-down, and
+    /// `start_point` is the pointer location at mouse-down when known.
+    #[cfg(test)]
+    pub(super) fn begin_at(
+        &mut self,
+        candidates: Vec<(PhysicalWindowId, Rect)>,
+        start_point: Option<(i32, i32)>,
+    ) {
+        self.begin_pressed(candidates, start_point, None);
+    }
+
+    /// `candidates` are front to back, each with its frame at mouse-down, with
+    /// optional pointer location and press timestamp.
+    pub(super) fn begin_pressed(
+        &mut self,
+        candidates: Vec<(PhysicalWindowId, Rect)>,
+        start_point: Option<(i32, i32)>,
+        pressed_at: Option<Instant>,
+    ) {
         self.active = (!candidates.is_empty()).then(|| Gesture {
             candidates: candidates
                 .into_iter()
@@ -108,7 +263,21 @@ impl GestureTracker {
                 .collect(),
             chosen: None,
             last_preview: None,
+            bounds: start_point.map(PointerBounds::point),
+            start_point,
+            pressed_at,
         });
+    }
+
+    /// Record a pointer sample while the gesture is active, even when the
+    /// worker is too busy to accept a preview tick.
+    pub(super) fn observe_point(&mut self, point: (i32, i32)) {
+        if let Some(gesture) = self.active.as_mut() {
+            match &mut gesture.bounds {
+                Some(bounds) => bounds.extend(point),
+                None => gesture.bounds = Some(PointerBounds::point(point)),
+            }
+        }
     }
 
     pub(super) fn is_active(&self) -> bool {
@@ -151,9 +320,24 @@ impl Gesture {
         frame_of: impl Fn(&PhysicalWindowId) -> Option<Rect>,
         point: Option<(i32, i32)>,
     ) -> Option<FinalGesture> {
+        if let (Some(bounds), Some(point)) = (&mut self.bounds, point) {
+            bounds.extend(point);
+        }
+        let bounds = self.bounds;
+        let pressed_at = self.pressed_at;
+        let travel = self
+            .start_point
+            .zip(point)
+            .map(|(start, point)| (point.0 - start.0, point.1 - start.1));
         if let Some(index) = self.chosen {
             let candidate = &mut self.candidates[index];
-            return candidate.classify(frame_of(&candidate.window)?, point);
+            return candidate.classify(
+                frame_of(&candidate.window)?,
+                point,
+                bounds,
+                travel,
+                pressed_at,
+            );
         }
         // Until a preview is sent nothing has moved the candidates but the
         // user, so the first one that changed is the one being dragged.
@@ -161,7 +345,7 @@ impl Gesture {
             let Some(frame) = frame_of(&candidate.window) else {
                 continue;
             };
-            if let Some(gesture) = candidate.classify(frame, point) {
+            if let Some(gesture) = candidate.classify(frame, point, bounds, travel, pressed_at) {
                 self.chosen = Some(index);
                 return Some(gesture);
             }
@@ -171,13 +355,28 @@ impl Gesture {
 }
 
 impl Candidate {
-    fn classify(&mut self, frame: Rect, point: Option<(i32, i32)>) -> Option<FinalGesture> {
-        self.resized |= is_window_resize(self.start, frame);
-        self.dragged |= is_window_drag(self.start, frame);
+    fn classify(
+        &mut self,
+        frame: Rect,
+        point: Option<(i32, i32)>,
+        bounds: Option<PointerBounds>,
+        travel: Option<(i32, i32)>,
+        pressed_at: Option<Instant>,
+    ) -> Option<FinalGesture> {
+        // A window carried by its title bar stays a drag: an app that changes
+        // its own size as it lands is not a border resize (#429).
+        let carried_along = travel.is_some_and(|travel| carried(self.start, frame, travel));
+        self.resized |= !self.dragged && !carried_along && is_window_resize(self.start, frame);
+        self.dragged |= carried_along || is_window_drag(self.start, frame);
         if self.resized {
             Some(FinalGesture::Resize(self.window.clone(), frame))
         } else if self.dragged {
-            point.map(|point| FinalGesture::Drop(self.window.clone(), point))
+            point.map(|point| FinalGesture::Drop {
+                window: self.window.clone(),
+                point,
+                bounds,
+                pressed_at,
+            })
         } else {
             None
         }
@@ -339,6 +538,74 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    /// A move or focus command just after macOS reports a Space change waits
+    /// out the layout hold instead of acting on the desktop just left (#770).
+    #[test]
+    fn focused_commands_wait_out_a_reported_space_change() {
+        let changed = Instant::now();
+        let settled = changed + crate::app::SPACE_TRANSITION_SETTLE;
+        let early = changed + std::time::Duration::from_millis(60);
+        let workspace = WorkspaceId::new(3).unwrap();
+        for action in [
+            WorkerAction::MoveFocused(workspace),
+            WorkerAction::CycleFocus,
+            WorkerAction::Focus(Direction::Right),
+        ] {
+            let input = QueuedInput::Action(action);
+            assert_eq!(
+                held_by_space_change(&input, Some(changed), None, early),
+                Some(settled)
+            );
+            assert_eq!(
+                held_by_space_change(&input, Some(changed), None, settled),
+                None
+            );
+            assert_eq!(held_by_space_change(&input, None, None, early), None);
+        }
+        for action in [
+            WorkerAction::SwitchWorkspace(workspace),
+            WorkerAction::Swipe(crate::swipe::Swipe::Left, Fingers::Three, (0, 0)),
+            WorkerAction::Retile,
+        ] {
+            let input = QueuedInput::Action(action);
+            assert_eq!(
+                held_by_space_change(&input, Some(changed), None, early),
+                None
+            );
+        }
+    }
+
+    /// A move or focus command pressed after a trackpad swipe between desktops,
+    /// before macOS reports the change, waits out the touch's layout hold
+    /// instead of acting on the desktop just left (#777).
+    #[test]
+    fn focused_commands_wait_out_a_desktop_swipe_before_its_report() {
+        let touched = Instant::now();
+        let held = touched + crate::app::SPACE_GESTURE_SETTLE;
+        let early = touched + std::time::Duration::from_millis(400);
+        let workspace = WorkspaceId::new(3).unwrap();
+        let input = QueuedInput::Action(WorkerAction::MoveFocused(workspace));
+        assert_eq!(
+            held_by_space_change(&input, None, Some(touched), early),
+            Some(held)
+        );
+        assert_eq!(
+            held_by_space_change(&input, None, Some(touched), held),
+            None
+        );
+        // The report then extends the wait past the touch hold.
+        let reported = touched + std::time::Duration::from_millis(1000);
+        assert_eq!(
+            held_by_space_change(&input, Some(reported), Some(touched), held),
+            Some(reported + crate::app::SPACE_TRANSITION_SETTLE)
+        );
+        let switch = QueuedInput::Action(WorkerAction::SwitchWorkspace(workspace));
+        assert_eq!(
+            held_by_space_change(&switch, None, Some(touched), early),
+            None
+        );
+    }
+
     #[test]
     fn failed_dispatch_retains_the_head_until_it_can_be_sent() {
         let mut queue = InputQueue::default();
@@ -377,7 +644,7 @@ mod tests {
             let expected = if end.width != start().width {
                 FinalGesture::Resize(window(), end)
             } else {
-                FinalGesture::Drop(window(), (1700, 100))
+                FinalGesture::drop(window(), (1700, 100))
             };
             assert_eq!(completed, expected);
             queue.push(QueuedInput::Gesture(completed)).unwrap();
@@ -413,7 +680,7 @@ mod tests {
         queue.push(QueuedInput::Gesture(drop)).unwrap();
         assert_eq!(
             queue.pop(),
-            Some(QueuedInput::Gesture(FinalGesture::Drop(
+            Some(QueuedInput::Gesture(FinalGesture::drop(
                 window(),
                 (1700, 400)
             )))
@@ -493,7 +760,7 @@ mod tests {
         let moved = Rect { x: 200, ..start() };
         assert_eq!(
             tracker.finish(frame(moved), Some((260, 40))),
-            Some(FinalGesture::Drop(window(), (260, 40)))
+            Some(FinalGesture::drop(window(), (260, 40)))
         );
         assert!(!should_ignore_swipe(false, false, tracker.is_active()));
     }
@@ -501,7 +768,11 @@ mod tests {
     #[test]
     fn suppressed_swipes_never_enter_the_input_queue_while_normal_swipes_do() {
         let mut queue = InputQueue::default();
-        let swipe = WorkerAction::Swipe(crate::swipe::Swipe::Right, (200, 100));
+        let swipe = WorkerAction::Swipe(
+            crate::swipe::Swipe::Right,
+            crate::swipe::Fingers::Three,
+            (200, 100),
+        );
 
         // While dragging with three fingers (mouse_down = true), a swipe is dropped.
         if !should_ignore_swipe(true, true, true) {
@@ -514,5 +785,113 @@ mod tests {
             queue.push(QueuedInput::Action(swipe.clone())).unwrap();
         }
         assert_eq!(queue.pop(), Some(QueuedInput::Action(swipe)));
+    }
+
+    #[test]
+    fn only_swipes_with_the_configured_finger_count_are_admitted() {
+        use crate::swipe::{Fingers, Swipe};
+        let three = WorkerAction::Swipe(Swipe::Left, Fingers::Three, (200, 100));
+        let four = WorkerAction::Swipe(Swipe::Left, Fingers::Four, (200, 100));
+        let idle = || (false, false, false);
+        fn never() -> (bool, bool, bool) {
+            unreachable!("pointer read for a dropped swipe")
+        }
+
+        // With [labs] four_finger_swipe off, macOS's four-finger swipe never reaches
+        // the queue (and never reads the pointer); three fingers do.
+        assert!(!admits_action(&four, Fingers::Three, never));
+        assert!(admits_action(&three, Fingers::Three, idle));
+        // With it on, the other way round.
+        assert!(!admits_action(&three, Fingers::Four, never));
+        assert!(admits_action(&four, Fingers::Four, idle));
+        // A pointer drag still drops the configured swipe.
+        let dragging = || (true, false, false);
+        assert!(!admits_action(&four, Fingers::Four, dragging));
+        // Other actions are untouched.
+        let switch = WorkerAction::SwitchWorkspace(crate::WorkspaceId::TWO);
+        assert!(admits_action(&switch, Fingers::Four, never));
+    }
+
+    #[test]
+    fn gesture_tracker_records_pointer_bounds_even_when_worker_is_busy() {
+        let band = Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 800,
+        };
+        let moved = Rect { x: 60, ..start() };
+
+        // Grabbed inside the band and nudged inside it -> bounds stay inside the band.
+        let mut tracker = GestureTracker::default();
+        tracker.begin_at(vec![(window(), start())], Some((10, 40)));
+        tracker.observe_point((18, 40));
+        let Some(FinalGesture::Drop {
+            bounds: Some(nudge_bounds),
+            ..
+        }) = tracker.finish(frame(moved), Some((20, 40)))
+        else {
+            panic!("expected tracked drop");
+        };
+        assert!(nudge_bounds.entirely_inside(band));
+
+        // Grabbed inside the band, dragged outside while worker was busy (no preview),
+        // then returned inside -> bounds extend outside the band.
+        let mut tracker = GestureTracker::default();
+        tracker.begin_at(vec![(window(), start())], Some((10, 40)));
+        tracker.observe_point((300, 40));
+        tracker.observe_point((15, 40));
+        let Some(FinalGesture::Drop {
+            bounds: Some(armed_bounds),
+            ..
+        }) = tracker.finish(frame(moved), Some((15, 40)))
+        else {
+            panic!("expected tracked drop");
+        };
+        assert!(!armed_bounds.entirely_inside(band));
+    }
+
+    // #429: reproduction contributed by @coygeek. A title-bar drag whose
+    // window changes width at mouse-up is still a drop.
+    #[test]
+    fn portrait_drag_release_classification() {
+        let start = Rect {
+            x: 1707,
+            y: 30,
+            width: 853,
+            height: 1410,
+        };
+        let before_release = Rect {
+            x: -1304,
+            y: 565,
+            ..start
+        };
+        let after_release = Rect {
+            x: -1118,
+            width: 480,
+            ..before_release
+        };
+        let pointer = (-720, 550);
+        for final_frame in [before_release, after_release] {
+            let id = window();
+            let mut tracker = GestureTracker::default();
+            tracker.begin_at(vec![(id.clone(), start)], Some((2133, 44)));
+            assert!(matches!(
+                tracker.preview(|_| Some(before_release), Some(pointer)),
+                Some(FinalGesture::Drop { .. }),
+            ));
+            let final_gesture = tracker.finish(|_| Some(final_frame), Some(pointer));
+            assert!(
+                matches!(final_gesture, Some(FinalGesture::Drop { .. })),
+                "{final_frame:?}: {final_gesture:?}"
+            );
+            // Without a preview tick in between, the release alone still reads as a drop.
+            tracker.begin_at(vec![(id.clone(), start)], Some((2133, 44)));
+            let final_gesture = tracker.finish(|_| Some(final_frame), Some(pointer));
+            assert!(
+                matches!(final_gesture, Some(FinalGesture::Drop { .. })),
+                "no preview, {final_frame:?}: {final_gesture:?}"
+            );
+        }
     }
 }

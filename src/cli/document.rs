@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use spaceman::{
     DisplaySelector, WorkspaceId, Workspaces,
     config::{
-        Config, HudPosition, HudStyle, MouseFollowsFocus, UpdateChannel, config_path, lock_config,
-        write_config_atomic,
+        Config, HudPosition, HudStyle, LabFeature, LayoutMode, MenuBarIcon, MouseFollowsFocus,
+        RouteWindows, UpdateChannel, config_path, lock_config, write_config_atomic,
     },
     spacing::{Spacing, SpacingKey, check_outer},
 };
@@ -20,7 +20,7 @@ pub(crate) struct ConfigDoc {
     pub version: u32,
     #[serde(default, skip_serializing_if = "SettingsDoc::is_empty")]
     pub settings: SettingsDoc,
-    /// `[labs]`, carried through untouched: no CLI command edits it.
+    /// `[labs]`: the Lab switches, edited by `spaceman config set|reset labs.<key>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labs: Option<LabsDoc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -32,11 +32,114 @@ pub(crate) struct ConfigDoc {
     pub shortcuts: Option<ShortcutsDoc>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LabsDoc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratchpad: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portrait_edge_rows: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_displays: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_focus: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swipe_switch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_workspace_focus: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub float_follows_display: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_steps: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub four_finger_swipe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_window_height: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_all_windows: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_bar_icon_style: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_follows_mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_overlay: Option<bool>,
+}
+
+impl LabsDoc {
+    fn is_empty(&self) -> bool {
+        self.scratchpad.is_none()
+            && self.activity.is_none()
+            && self.portrait_edge_rows.is_none()
+            && self.physical_displays.is_none()
+            && self.recent_focus.is_none()
+            && self.swipe_switch.is_none()
+            && self.empty_workspace_focus.is_none()
+            && self.float_follows_display.is_none()
+            && self.workspace_steps.is_none()
+            && self.four_finger_swipe.is_none()
+            && self.single_window_height.is_none()
+            && self.route_all_windows.is_none()
+            && self.menu_bar_icon_style.is_none()
+            && self.focus_follows_mouse.is_none()
+            && self.window_overlay.is_none()
+    }
+
+    /// The switch as the file asks for it: off while unset.
+    pub(crate) fn enabled(&self, feature: LabFeature) -> bool {
+        self.slot(feature).unwrap_or(false)
+    }
+
+    /// Whether the file sets the switch at all.
+    pub(crate) fn is_set(&self, feature: LabFeature) -> bool {
+        self.slot(feature).is_some()
+    }
+
+    /// Sets the switch; off removes the key, and the table with it once empty.
+    pub(crate) fn set(&mut self, feature: LabFeature, on: bool) {
+        *self.slot_mut(feature) = on.then_some(true);
+    }
+
+    const fn slot(&self, feature: LabFeature) -> Option<bool> {
+        match feature {
+            LabFeature::Scratchpad => self.scratchpad,
+            LabFeature::Activity => self.activity,
+            LabFeature::PortraitEdgeRows => self.portrait_edge_rows,
+            LabFeature::PhysicalDisplays => self.physical_displays,
+            LabFeature::RecentFocus => self.recent_focus,
+            LabFeature::SwipeSwitch => self.swipe_switch,
+            LabFeature::EmptyWorkspaceFocus => self.empty_workspace_focus,
+            LabFeature::FloatFollowsDisplay => self.float_follows_display,
+            LabFeature::WorkspaceSteps => self.workspace_steps,
+            LabFeature::FourFingerSwipe => self.four_finger_swipe,
+            LabFeature::SingleWindowHeight => self.single_window_height,
+            LabFeature::RouteAllWindows => self.route_all_windows,
+            LabFeature::MenuBarIconStyle => self.menu_bar_icon_style,
+            LabFeature::FocusFollowsMouse => self.focus_follows_mouse,
+            LabFeature::WindowOverlay => self.window_overlay,
+        }
+    }
+
+    const fn slot_mut(&mut self, feature: LabFeature) -> &mut Option<bool> {
+        match feature {
+            LabFeature::Scratchpad => &mut self.scratchpad,
+            LabFeature::Activity => &mut self.activity,
+            LabFeature::PortraitEdgeRows => &mut self.portrait_edge_rows,
+            LabFeature::PhysicalDisplays => &mut self.physical_displays,
+            LabFeature::RecentFocus => &mut self.recent_focus,
+            LabFeature::SwipeSwitch => &mut self.swipe_switch,
+            LabFeature::EmptyWorkspaceFocus => &mut self.empty_workspace_focus,
+            LabFeature::FloatFollowsDisplay => &mut self.float_follows_display,
+            LabFeature::WorkspaceSteps => &mut self.workspace_steps,
+            LabFeature::FourFingerSwipe => &mut self.four_finger_swipe,
+            LabFeature::SingleWindowHeight => &mut self.single_window_height,
+            LabFeature::RouteAllWindows => &mut self.route_all_windows,
+            LabFeature::MenuBarIconStyle => &mut self.menu_bar_icon_style,
+            LabFeature::FocusFollowsMouse => &mut self.focus_follows_mouse,
+            LabFeature::WindowOverlay => &mut self.window_overlay,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,32 +171,26 @@ impl Default for ConfigDoc {
 pub(crate) struct SettingsDoc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hud: Option<bool>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_hud_style"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hud_style: Option<HudStyle>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_hud_position"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hud_position: Option<HudPosition>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_update_channel"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_channel: Option<UpdateChannel>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_mouse_follows_focus"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse_follows_focus: Option<MouseFollowsFocus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trackpad_swipe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_bar_icon: Option<MenuBarIcon>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_on_builtin_display: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub single_window_max_width: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_window_max_height: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_order: Option<Vec<WorkspaceId>>,
     #[serde(default, skip_serializing_if = "GapsDoc::is_empty")]
@@ -134,9 +231,14 @@ impl SettingsDoc {
         self.hud.is_none()
             && self.hud_style.is_none()
             && self.hud_position.is_none()
+            && self.layout.is_none()
             && self.update_channel.is_none()
             && self.mouse_follows_focus.is_none()
+            && self.trackpad_swipe.is_none()
+            && self.menu_bar_icon.is_none()
+            && self.pause_on_builtin_display.is_none()
             && self.single_window_max_width.is_none()
+            && self.single_window_max_height.is_none()
             && self.workspace_order.is_none()
             && self.gaps.is_empty()
     }
@@ -149,6 +251,7 @@ impl SettingsDoc {
             SpacingKey::Left => &mut self.gaps.left,
             SpacingKey::Right => &mut self.gaps.right,
             SpacingKey::SingleWindowMaxWidth => &mut self.single_window_max_width,
+            SpacingKey::SingleWindowMaxHeight => &mut self.single_window_max_height,
         }
     }
 
@@ -191,6 +294,7 @@ impl SettingsDoc {
             SpacingKey::Left => self.gaps.left.is_some(),
             SpacingKey::Right => self.gaps.right.is_some(),
             SpacingKey::SingleWindowMaxWidth => self.single_window_max_width.is_some(),
+            SpacingKey::SingleWindowMaxHeight => self.single_window_max_height.is_some(),
         }
     }
 
@@ -219,6 +323,10 @@ impl SettingsDoc {
         self.hud_position.unwrap_or_default()
     }
 
+    pub(crate) fn effective_layout(&self) -> LayoutMode {
+        self.layout.unwrap_or_default()
+    }
+
     pub(crate) fn effective_update_channel(&self) -> UpdateChannel {
         self.update_channel.unwrap_or_default()
     }
@@ -226,45 +334,21 @@ impl SettingsDoc {
     pub(crate) fn effective_mouse_follows_focus(&self) -> MouseFollowsFocus {
         self.mouse_follows_focus.unwrap_or_default()
     }
-}
 
-fn serialize_optional_hud_style<S: serde::Serializer>(
-    style: &Option<HudStyle>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match style {
-        Some(style) => serializer.serialize_str(style.as_str()),
-        None => serializer.serialize_none(),
+    /// The file's `trackpad_swipe`, `true` while unset. Swipes follow it only with
+    /// `[labs] swipe_switch` on; `config get` and `config show` report the file's value either way.
+    pub(crate) fn effective_trackpad_swipe(&self) -> bool {
+        self.trackpad_swipe.unwrap_or(true)
     }
-}
 
-fn serialize_optional_hud_position<S: serde::Serializer>(
-    position: &Option<HudPosition>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match position {
-        Some(position) => serializer.serialize_str(position.as_str()),
-        None => serializer.serialize_none(),
+    /// The file's `menu_bar_icon`, `full` while unset. The menu bar follows it only with
+    /// `[labs] menu_bar_icon_style` on; `config get` and `config show` report the file's value.
+    pub(crate) fn effective_menu_bar_icon(&self) -> MenuBarIcon {
+        self.menu_bar_icon.unwrap_or_default()
     }
-}
 
-fn serialize_optional_update_channel<S: serde::Serializer>(
-    channel: &Option<UpdateChannel>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match channel {
-        Some(channel) => serializer.serialize_str(channel.as_str()),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn serialize_optional_mouse_follows_focus<S: serde::Serializer>(
-    mode: &Option<MouseFollowsFocus>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match mode {
-        Some(mode) => serializer.serialize_str(mode.as_str()),
-        None => serializer.serialize_none(),
+    pub(crate) fn effective_pause_on_builtin_display(&self) -> bool {
+        self.pause_on_builtin_display.unwrap_or(false)
     }
 }
 
@@ -275,9 +359,14 @@ pub(crate) struct RuleDoc {
     pub bundle_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_contains: Option<String>,
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceId>,
+    /// Which of the app's new windows a route takes, as the file writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<RouteWindows>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,9 +381,14 @@ pub(crate) struct EffectiveSettings {
     pub hud: bool,
     pub hud_style: &'static str,
     pub hud_position: &'static str,
+    pub layout: &'static str,
     pub update_channel: &'static str,
     pub mouse_follows_focus: &'static str,
+    pub trackpad_swipe: bool,
+    pub menu_bar_icon: &'static str,
+    pub pause_on_builtin_display: bool,
     pub single_window_max_width: i32,
+    pub single_window_max_height: i32,
     pub workspace_order: Vec<WorkspaceId>,
     pub gaps: EffectiveGaps,
 }
@@ -315,9 +409,13 @@ pub(crate) struct RuleView {
     pub bundle_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_contains: Option<String>,
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows: Option<RouteWindows>,
 }
 
 impl RuleView {
@@ -326,8 +424,10 @@ impl RuleView {
             index,
             bundle_id: rule.bundle_id.clone(),
             title: rule.title.clone(),
+            title_contains: rule.title_contains.clone(),
             action: rule.action.clone(),
             workspace: rule.workspace,
+            windows: rule.windows,
         }
     }
 }
@@ -347,20 +447,30 @@ struct EffectiveConfigToml<'a> {
 }
 
 impl ConfigDoc {
+    /// The `[labs]` table, created when a command first edits it.
+    pub(crate) fn labs_mut(&mut self) -> &mut LabsDoc {
+        self.labs.get_or_insert_with(LabsDoc::default)
+    }
+
+    /// Drops `[labs]` once it sets no switch, the way an emptied `[settings]` table goes.
+    pub(crate) fn prune_labs(&mut self) {
+        if self.labs.is_some_and(|labs| labs.is_empty()) {
+            self.labs = None;
+        }
+    }
+
     pub(crate) fn load_or_default(path: &Path) -> Result<(Self, bool), String> {
-        let source = match fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Self::default(), false));
-            }
-            Err(error) => {
-                return Err(format!("failed to read {}: {error}", path.display()));
-            }
+        let source = read_source(path)?;
+        let exists = source.is_some();
+        Ok((Self::from_source(path, source.as_deref())?, exists))
+    }
+
+    fn from_source(path: &Path, source: Option<&str>) -> Result<Self, String> {
+        let Some(source) = source else {
+            return Ok(Self::default());
         };
-        Config::parse(&source).map_err(|error| format!("{}: {error}", path.display()))?;
-        let doc: Self =
-            toml::from_str(&source).map_err(|error| format!("{}: {error}", path.display()))?;
-        Ok((doc, true))
+        Config::parse(source).map_err(|error| format!("{}: {error}", path.display()))?;
+        toml::from_str(source).map_err(|error| format!("{}: {error}", path.display()))
     }
 
     pub(crate) fn effective_settings(&self) -> EffectiveSettings {
@@ -369,9 +479,14 @@ impl ConfigDoc {
             hud: self.settings.effective_hud(),
             hud_style: self.settings.effective_hud_style().as_str(),
             hud_position: self.settings.effective_hud_position().as_str(),
+            layout: self.settings.effective_layout().as_str(),
             update_channel: self.settings.effective_update_channel().as_str(),
             mouse_follows_focus: self.settings.effective_mouse_follows_focus().as_str(),
+            trackpad_swipe: self.settings.effective_trackpad_swipe(),
+            menu_bar_icon: self.settings.effective_menu_bar_icon().as_str(),
+            pause_on_builtin_display: self.settings.effective_pause_on_builtin_display(),
             single_window_max_width: spacing.single_window_max_width,
+            single_window_max_height: spacing.single_window_max_height,
             workspace_order: self.settings.workspace_order.clone().unwrap_or_default(),
             gaps: EffectiveGaps {
                 inner: spacing.inner,
@@ -407,26 +522,60 @@ impl ConfigDoc {
         Ok(rendered)
     }
 
-    pub(crate) fn save_atomic(&self, path: &Path) -> Result<(), String> {
-        let rendered = self.render_toml()?;
-        write_config_atomic(path, rendered.as_bytes())
-            .map_err(|error| format!("failed to write {}: {error}", path.display()))
-    }
-
     /// Acquires an exclusive config lock, reads the latest document from `path`,
-    /// runs `edit`, and writes atomically when `edit` reports a change.
+    /// runs `edit`, and writes atomically when `edit` reports a change. The write
+    /// changes only what the edit changed: the file keeps its comments, order,
+    /// and formatting everywhere else.
     pub(crate) fn edit_locked<T>(
         path: &Path,
         edit: impl FnOnce(&mut Self) -> Result<(T, bool), String>,
     ) -> Result<T, String> {
+        Self::edit_locked_removing(path, |doc| {
+            edit(doc).map(|(result, changed)| (result, changed.then(Vec::new)))
+        })
+    }
+
+    /// [`Self::edit_locked`] for an edit that removes rules: it reports the zero-based
+    /// positions, in the file as read, of the rules it removed (`None` for no change). Those
+    /// entries leave the file with their own comments even when another rule holds the same
+    /// values.
+    pub(crate) fn edit_locked_removing<T>(
+        path: &Path,
+        edit: impl FnOnce(&mut Self) -> Result<(T, Option<Vec<usize>>), String>,
+    ) -> Result<T, String> {
         let _lock = lock_config(path)
             .map_err(|error| format!("failed to lock {}: {error}", path.display()))?;
-        let (mut doc, _) = Self::load_or_default(path)?;
-        let (result, changed) = edit(&mut doc)?;
-        if changed {
-            doc.save_atomic(path)?;
+        let source = read_source(path)?;
+        let mut doc = Self::from_source(path, source.as_deref())?;
+        let (result, removed_rules) = edit(&mut doc)?;
+        if let Some(removed_rules) = removed_rules {
+            let rendered = doc.render_toml()?;
+            let text = source
+                .as_deref()
+                .and_then(|source| {
+                    if removed_rules.is_empty() {
+                        return Self::merged(source, &rendered);
+                    }
+                    let trimmed = super::merge::remove_entries(source, "rules", &removed_rules)?;
+                    Self::merged(&trimmed, &rendered)
+                })
+                .unwrap_or(rendered);
+            if source.as_deref() != Some(text.as_str()) {
+                write_config_atomic(path, text.as_bytes())
+                    .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+            }
         }
         Ok(result)
+    }
+
+    /// `source` edited to hold `rendered`'s content, when that edit is valid and
+    /// reads back as exactly `rendered`; otherwise `None`, and the caller writes
+    /// `rendered` itself.
+    fn merged(source: &str, rendered: &str) -> Option<String> {
+        let merged = super::merge::merge_into(source, rendered)?;
+        Config::parse(&merged).ok()?;
+        let reread: Self = toml::from_str(&merged).ok()?;
+        (reread.render_toml().ok()? == rendered).then_some(merged)
     }
 
     pub(crate) fn rule_views(&self) -> Vec<RuleView> {
@@ -464,6 +613,14 @@ impl ConfigDoc {
     }
 }
 
+fn read_source(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(source) => Ok(Some(source)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to read {}: {error}", path.display())),
+    }
+}
+
 pub(crate) fn resolve_config_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = override_path {
         return Ok(path.to_path_buf());
@@ -487,10 +644,20 @@ pub(crate) fn format_rule_summary(rule: &RuleDoc) -> String {
     if let Some(title) = &rule.title {
         matchers.push(format!("title={title:?}"));
     }
+    if let Some(part) = &rule.title_contains {
+        matchers.push(format!("title_contains={part:?}"));
+    }
     let target = match (rule.action.as_str(), rule.workspace) {
         ("route", Some(workspace)) => format!("workspace {workspace}"),
         (action, _) => action.to_owned(),
     };
+    if let Some(windows) = rule.windows {
+        return format!(
+            "{} -> {target} [windows={}]",
+            matchers.join(" "),
+            windows.as_str()
+        );
+    }
     format!("{} -> {target}", matchers.join(" "))
 }
 

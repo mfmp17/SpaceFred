@@ -4,6 +4,9 @@ use crate::{Axis, Direction, Rect, ResizeDirection, SlotId};
 
 use super::{Child, LayoutTree, MIN_TILE_EXTENT, Node};
 
+mod dwindle_close_open;
+mod dwindle_nested_manual_axis;
+
 #[test]
 fn edge_insertion_after_resize_uses_the_destination_weight_scale() {
     let output = Rect {
@@ -78,7 +81,6 @@ fn implicit_split_preserves_the_remaining_layout() {
 fn persisted_layout_validation_rejects_duplicate_leaves_and_zero_weights() {
     let slots = [crate::Slot {
         id: SlotId(1),
-        weight: 1,
         binding: crate::BindingState::Bound(crate::PhysicalWindowId {
             app: crate::AppInstanceId {
                 pid: 1,
@@ -237,6 +239,7 @@ fn fitting_minimums_reaches_into_nested_splits_and_leaves_impossible_splits_alon
     let mut layout = LayoutTree {
         root: Node::Split {
             axis: Axis::Horizontal,
+            auto_axis: false,
             children: vec![
                 Child {
                     weight: 1,
@@ -246,6 +249,7 @@ fn fitting_minimums_reaches_into_nested_splits_and_leaves_impossible_splits_alon
                     weight: 1,
                     node: Node::Split {
                         axis: Axis::Vertical,
+                        auto_axis: false,
                         children: vec![
                             Child {
                                 weight: 1,
@@ -425,7 +429,6 @@ fn newly_discovered_slot_uses_existing_weight_scale() {
     let slots = [
         crate::Slot {
             id: SlotId(1),
-            weight: 1480,
             binding: crate::BindingState::Unresolved {
                 previous: test_window(1),
                 candidates: Vec::new(),
@@ -434,7 +437,6 @@ fn newly_discovered_slot_uses_existing_weight_scale() {
         },
         crate::Slot {
             id: SlotId(2),
-            weight: 1,
             binding: crate::BindingState::Unresolved {
                 previous: test_window(2),
                 candidates: Vec::new(),
@@ -516,4 +518,472 @@ fn stacking_is_rejected_when_the_other_dimension_cannot_fit() {
     };
     let minimums = HashMap::from([(SlotId(1), (600, 450)), (SlotId(2), (600, 450))]);
     assert!(tree.fitted(output, &minimums).is_none());
+}
+
+fn bound_slot(id: u64) -> crate::Slot {
+    crate::Slot {
+        id: SlotId(id),
+        binding: crate::BindingState::Bound(test_window(id as u32)),
+    }
+}
+
+#[test]
+fn dwindle_landscape_splits_one_through_four_windows() {
+    let output = Rect {
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+    };
+    let mut tree = LayoutTree::default();
+
+    // 1 window -> fills display.
+    let mut slots = vec![bound_slot(1)];
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        None,
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(tree.placements(output), vec![(SlotId(1), output)]);
+
+    // 2 windows -> 50% | 50% left/right.
+    slots.push(bound_slot(2));
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        Some(SlotId(1)),
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+        ]
+    );
+
+    // 3 windows -> [ 1 | (2 / 3) ] (tile 2 is 640x800, taller than wide).
+    slots.push(bound_slot(3));
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        Some(SlotId(2)),
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 400
+                }
+            ),
+            (
+                SlotId(3),
+                Rect {
+                    x: 640,
+                    y: 400,
+                    width: 640,
+                    height: 400
+                }
+            ),
+        ]
+    );
+
+    // 4 windows -> [ 1 | (2 / (3 | 4)) ] (tile 3 is 640x400, wider than tall).
+    slots.push(bound_slot(4));
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        Some(SlotId(3)),
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 400
+                }
+            ),
+            (
+                SlotId(3),
+                Rect {
+                    x: 640,
+                    y: 400,
+                    width: 320,
+                    height: 400
+                }
+            ),
+            (
+                SlotId(4),
+                Rect {
+                    x: 960,
+                    y: 400,
+                    width: 320,
+                    height: 400
+                }
+            ),
+        ]
+    );
+}
+
+#[test]
+fn dwindle_portrait_splits_vertically_first_then_alternates() {
+    let output = Rect {
+        x: 0,
+        y: 0,
+        width: 1080,
+        height: 1920,
+    };
+    let mut tree = LayoutTree::default();
+    let slots = vec![bound_slot(1), bound_slot(2), bound_slot(3), bound_slot(4)];
+
+    // 2 windows on portrait -> 50% / 50% top/bottom (#208).
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots[..2],
+        None,
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(tree.root_axis(), Axis::Vertical);
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1080,
+                    height: 960
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 0,
+                    y: 960,
+                    width: 1080,
+                    height: 960
+                }
+            ),
+        ]
+    );
+
+    // 3rd window splits bottom 1080x960 horizontally -> [ 1 / (2 | 3) ].
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots[..3],
+        None,
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1080,
+                    height: 960
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 0,
+                    y: 960,
+                    width: 540,
+                    height: 960
+                }
+            ),
+            (
+                SlotId(3),
+                Rect {
+                    x: 540,
+                    y: 960,
+                    width: 540,
+                    height: 960
+                }
+            ),
+        ]
+    );
+
+    // 4th window splits 540x960 vertically -> [ 1 / (2 | (3 / 4)) ].
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        None,
+        crate::config::LayoutMode::Dwindle,
+        output
+    ));
+    assert_eq!(
+        tree.placements(output)[2..],
+        [
+            (
+                SlotId(3),
+                Rect {
+                    x: 540,
+                    y: 960,
+                    width: 540,
+                    height: 480
+                }
+            ),
+            (
+                SlotId(4),
+                Rect {
+                    x: 540,
+                    y: 1440,
+                    width: 540,
+                    height: 480
+                }
+            ),
+        ]
+    );
+}
+
+#[test]
+fn dwindle_splits_focused_anchor_and_collapses_on_close() {
+    let output = Rect {
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+    };
+    let mut tree = LayoutTree::default();
+    let slots = [bound_slot(1), bound_slot(2), bound_slot(3)];
+    tree.sync_near(
+        Axis::Horizontal,
+        &slots[..2],
+        None,
+        crate::config::LayoutMode::Dwindle,
+        output,
+    );
+    // Focus left tile (1): 640x800 -> splits vertically into (1 / 3) on the left.
+    tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        Some(SlotId(1)),
+        crate::config::LayoutMode::Dwindle,
+        output,
+    );
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 400
+                }
+            ),
+            (
+                SlotId(3),
+                Rect {
+                    x: 0,
+                    y: 400,
+                    width: 640,
+                    height: 400
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+        ]
+    );
+
+    // Closing tile 2 promotes the surviving auto-chosen split (1 / 3) into the
+    // landscape root and re-orients it to two columns (1 | 3); toggle_root_axis
+    // then flips it to rows.
+    tree.sync_near(
+        Axis::Horizontal,
+        &[bound_slot(1), bound_slot(3)],
+        None,
+        crate::config::LayoutMode::Dwindle,
+        output,
+    );
+    assert_eq!(tree.root_axis(), Axis::Horizontal);
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+            (
+                SlotId(3),
+                Rect {
+                    x: 640,
+                    y: 0,
+                    width: 640,
+                    height: 800
+                }
+            ),
+        ]
+    );
+    tree.toggle_root_axis();
+    assert_eq!(tree.root_axis(), Axis::Vertical);
+    assert_eq!(tree.placements(output)[0].1.height, 400);
+    assert_eq!(tree.placements(output)[1].1.height, 400);
+}
+
+#[test]
+fn columns_mode_preserves_flat_sibling_insertion() {
+    let output = Rect {
+        x: 0,
+        y: 0,
+        width: 1200,
+        height: 800,
+    };
+    let mut tree = LayoutTree::default();
+    let slots = [bound_slot(1), bound_slot(2), bound_slot(3)];
+    tree.sync_near(
+        Axis::Horizontal,
+        &slots,
+        None,
+        crate::config::LayoutMode::Columns,
+        output,
+    );
+    assert_eq!(
+        tree.placements(output),
+        vec![
+            (
+                SlotId(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 400,
+                    height: 800
+                }
+            ),
+            (
+                SlotId(2),
+                Rect {
+                    x: 400,
+                    y: 0,
+                    width: 400,
+                    height: 800
+                }
+            ),
+            (
+                SlotId(3),
+                Rect {
+                    x: 800,
+                    y: 0,
+                    width: 400,
+                    height: 800
+                }
+            ),
+        ]
+    );
+}
+
+#[test]
+fn dwindle_keeps_a_flipped_root_axis_when_one_tile_is_left_and_another_joins() {
+    let output = Rect {
+        x: 0,
+        y: 0,
+        width: 1080,
+        height: 1920,
+    };
+    let dwindle = crate::config::LayoutMode::Dwindle;
+    let (a, b, c) = (bound_slot(1), bound_slot(2), bound_slot(3));
+    let mut tree = LayoutTree::default();
+    assert!(tree.sync_near(Axis::Horizontal, &[a.clone(), b], None, dwindle, output));
+    assert_eq!(tree.root_axis(), Axis::Vertical);
+    tree.toggle_root_axis();
+
+    // B leaves: the flipped root keeps its direction with one tile (#507).
+    assert!(tree.sync_near(
+        Axis::Horizontal,
+        std::slice::from_ref(&a),
+        None,
+        dwindle,
+        output
+    ));
+    assert_eq!(tree.root_axis(), Axis::Horizontal);
+
+    // C joins: A and C finish side by side, not top and bottom.
+    assert!(tree.sync_near(Axis::Horizontal, &[a, c], Some(SlotId(1)), dwindle, output));
+    let half = |x| Rect {
+        x,
+        y: 0,
+        width: 540,
+        height: 1920,
+    };
+    assert_eq!(
+        tree.placements(output),
+        vec![(SlotId(1), half(0)), (SlotId(3), half(540))]
+    );
+
+    // A fresh portrait workspace still starts with rows.
+    let mut fresh = LayoutTree::default();
+    assert!(fresh.sync_near(Axis::Horizontal, &[bound_slot(1)], None, dwindle, output));
+    let pair = [bound_slot(1), bound_slot(2)];
+    assert!(fresh.sync_near(Axis::Horizontal, &pair, None, dwindle, output));
+    assert_eq!(fresh.root_axis(), Axis::Vertical);
 }

@@ -6,7 +6,7 @@ mod tests;
 
 use std::time::SystemTime;
 
-use rune::{El, Tx, col, row, text};
+use rune::{El, Tx, row, text};
 use spaceman::journal::{
     AnomalyKind, AnomalyState, JournalEvent, JournalLine, Summary, human_age, human_duration,
     short_bundle_name,
@@ -344,7 +344,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
         .children((!vitals.is_empty()).then(|| {
             text(vitals)
                 .key("vitals")
-                .font(p.k.ty.small)
+                .font(p.tabular(p.meta()))
                 .color(p.faint())
         }))
         .child(controls::status_dot(runtime_dot));
@@ -410,7 +410,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
                 Some((memory_desc, p.muted())),
                 text(format!("{} events", report.total_events))
                     .key("event-count")
-                    .font(p.k.ty.small)
+                    .font(p.tabular(p.meta()))
                     .color(p.faint()),
             ),
             controls::setting_row(
@@ -437,7 +437,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
             "journal-empty",
             "No arrangement events yet",
             Some((
-                "Starts, restores, recalls, and layout issues show up here.".into(),
+                "Starts, restores, recalls, and layout issues show up here".into(),
                 p.muted(),
             )),
             controls::status_dot(p.k.c.border_strong),
@@ -459,7 +459,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
                     Some((entry.detail.clone(), detail_color)),
                     text(entry.age.clone())
                         .key("age")
-                        .font(p.k.ty.small)
+                        .font(p.tabular(p.meta()))
                         .color(p.faint()),
                 )
             })
@@ -495,7 +495,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
     )];
     if ui.agent.as_ref().is_some_and(|agent| agent.automatic) {
         let snapshot_desc = report.last_snapshot.as_ref().map_or_else(
-            || "Records the current arrangement for spaceman doctor.".to_owned(),
+            || "Records the current arrangement for spaceman doctor".to_owned(),
             |age| format!("Last saved {age}"),
         );
         diagnostics.push(controls::setting_row(
@@ -506,7 +506,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
             controls::button(
                 p,
                 "save-snapshot",
-                "Save Snapshot",
+                "Save snapshot",
                 ButtonKind::Secondary,
                 |ui: &mut Ui, _: &mut Tx| ui.mark_wrong(),
             ),
@@ -519,10 +519,7 @@ pub fn pane(ui: &Ui, p: Paint) -> El {
         diagnostics,
     ));
 
-    scroll_body(
-        "activity-body",
-        col().key("sections").gap(24.0).children(sections),
-    )
+    scroll_body("activity-body", controls::page("sections", sections))
 }
 
 fn journal_stamp() -> Option<(Option<SystemTime>, u64)> {

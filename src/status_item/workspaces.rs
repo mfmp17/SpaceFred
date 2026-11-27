@@ -4,7 +4,7 @@
 
 use objc2::{AnyThread, MainThreadMarker, rc::Retained, runtime::AnyObject, sel};
 use objc2_app_kit::{
-    NSAttributedStringAttachmentConveniences, NSControlStateValueOn, NSEventModifierFlags, NSFont,
+    NSAttachmentAttributeName, NSControlStateValueOn, NSEventModifierFlags, NSFont,
     NSFontAttributeName, NSImage, NSMenuItem, NSRunningApplication, NSTextAttachment,
 };
 use objc2_foundation::{
@@ -117,6 +117,9 @@ pub(crate) fn key_equivalent(workspace: WorkspaceId) -> String {
     }
 }
 
+/// The character AppKit draws a text attachment in place of (`NSAttachmentCharacter`).
+const OBJECT_REPLACEMENT: &str = "\u{fffc}";
+
 /// `label` in the menu font followed by `icons`, centred on its cap height.
 fn title_with_icons(label: &str, icons: &[Retained<NSImage>]) -> Retained<NSAttributedString> {
     let font = NSFont::menuFontOfSize(0.0);
@@ -150,9 +153,23 @@ fn title_with_icons(label: &str, icons: &[Retained<NSImage>]) -> Retained<NSAttr
             NSPoint::new(0.0, y),
             NSSize::new(ICON_SIZE, ICON_SIZE),
         ));
-        // SAFETY: as above.
+        // Built by hand: `+attributedStringWithAttachment:attributes:` only exists on macOS 15+,
+        // and the app supports macOS 14. An attachment is the object-replacement character
+        // carrying `NSAttachmentAttributeName`, here alongside the menu font.
+        // SAFETY: `NSAttachmentAttributeName` is an immutable AppKit constant.
+        let attachment_key = unsafe { NSAttachmentAttributeName };
+        let icon_attributes = NSDictionary::<NSString, AnyObject>::from_slices(
+            &[key, attachment_key],
+            &[font.as_ref(), attachment.as_ref()],
+        );
+        // SAFETY: the dictionary maps `NSFontAttributeName` to an `NSFont` and
+        // `NSAttachmentAttributeName` to an `NSTextAttachment`, as AppKit expects.
         let icon = unsafe {
-            NSAttributedString::attributedStringWithAttachment_attributes(&attachment, &attributes)
+            NSAttributedString::initWithString_attributes(
+                NSAttributedString::alloc(),
+                &NSString::from_str(OBJECT_REPLACEMENT),
+                Some(&icon_attributes),
+            )
         };
         title.appendAttributedString(&icon);
     }

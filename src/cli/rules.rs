@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use serde::Serialize;
-use spaceman::WorkspaceId;
+use spaceman::{WorkspaceId, config::RouteWindows};
 
 use super::{
     Outcome,
@@ -34,14 +34,20 @@ struct RuleRemovedOutput {
 enum ActionArg {
     Workspace(WorkspaceId),
     Float,
+    Pin,
     Tile,
     Ignore,
 }
 
+const ONE_ACTION: &str = "specify only one of --workspace, --float, --pin, --tile, or --ignore";
+
 struct AddOptions {
     app: Option<String>,
     title: Option<String>,
+    title_contains: Option<String>,
     action: ActionArg,
+    /// `--windows first|all`, written as the route rule's `windows` key.
+    windows: Option<RouteWindows>,
     position: Option<usize>,
     json: bool,
 }
@@ -121,7 +127,13 @@ fn add_requests_help(args: &[&str]) -> bool {
         }
         if matches!(
             arg,
-            "--app" | "--bundle-id" | "--title" | "--workspace" | "--position"
+            "--app"
+                | "--bundle-id"
+                | "--title"
+                | "--title-contains"
+                | "--workspace"
+                | "--windows"
+                | "--position"
         ) {
             index += 2;
         } else {
@@ -134,8 +146,10 @@ fn add_requests_help(args: &[&str]) -> bool {
 fn parse_add_options(args: &[&str]) -> Result<AddOptions, String> {
     let mut app: Option<String> = None;
     let mut title: Option<String> = None;
+    let mut title_contains: Option<String> = None;
     let mut action: Option<ActionArg> = None;
     let mut position: Option<usize> = None;
+    let mut windows: Option<RouteWindows> = None;
     let mut json = false;
 
     let mut index = 0;
@@ -177,11 +191,19 @@ fn parse_add_options(args: &[&str]) -> Result<AddOptions, String> {
                 }
                 title = Some(value);
             }
+            "--title-contains" => {
+                if title_contains.is_some() {
+                    return Err("--title-contains specified more than once".into());
+                }
+                let value = next_value(flag, inline_value, &mut index)?;
+                if value.is_empty() {
+                    return Err("--title-contains cannot be empty".into());
+                }
+                title_contains = Some(value);
+            }
             "--workspace" => {
                 if action.is_some() {
-                    return Err(
-                        "specify only one of --workspace, --float, --tile, or --ignore".into(),
-                    );
+                    return Err(ONE_ACTION.into());
                 }
                 let value = next_value(flag, inline_value, &mut index)?;
                 let workspace = WorkspaceId::parse(&value)?;
@@ -192,20 +214,25 @@ fn parse_add_options(args: &[&str]) -> Result<AddOptions, String> {
                     return Err("--float does not take a value".into());
                 }
                 if action.is_some() {
-                    return Err(
-                        "specify only one of --workspace, --float, --tile, or --ignore".into(),
-                    );
+                    return Err(ONE_ACTION.into());
                 }
                 action = Some(ActionArg::Float);
+            }
+            "--pin" => {
+                if inline_value.is_some() {
+                    return Err("--pin does not take a value".into());
+                }
+                if action.is_some() {
+                    return Err(ONE_ACTION.into());
+                }
+                action = Some(ActionArg::Pin);
             }
             "--tile" => {
                 if inline_value.is_some() {
                     return Err("--tile does not take a value".into());
                 }
                 if action.is_some() {
-                    return Err(
-                        "specify only one of --workspace, --float, --tile, or --ignore".into(),
-                    );
+                    return Err(ONE_ACTION.into());
                 }
                 action = Some(ActionArg::Tile);
             }
@@ -214,11 +241,18 @@ fn parse_add_options(args: &[&str]) -> Result<AddOptions, String> {
                     return Err("--ignore does not take a value".into());
                 }
                 if action.is_some() {
-                    return Err(
-                        "specify only one of --workspace, --float, --tile, or --ignore".into(),
-                    );
+                    return Err(ONE_ACTION.into());
                 }
                 action = Some(ActionArg::Ignore);
+            }
+            "--windows" => {
+                if windows.is_some() {
+                    return Err("--windows specified more than once".into());
+                }
+                let value = next_value(flag, inline_value, &mut index)?;
+                windows = Some(RouteWindows::parse(&value).ok_or_else(|| {
+                    format!("--windows takes \"first\" or \"all\", got {value:?}")
+                })?);
             }
             "--position" => {
                 if position.is_some() {
@@ -245,19 +279,26 @@ fn parse_add_options(args: &[&str]) -> Result<AddOptions, String> {
         index += 1;
     }
 
-    if app.is_none() && title.is_none() {
+    if app.is_none() && title.is_none() && title_contains.is_none() {
         return Err("rules add requires --app <bundle-id> (or --title <title>)".into());
     }
     let Some(action) = action else {
         return Err(
-            "rules add requires one of --workspace <ws>, --float, --tile, or --ignore".into(),
+            "rules add requires one of --workspace <ws>, --float, --pin, --tile, or --ignore"
+                .into(),
         );
     };
+
+    if windows.is_some() && !matches!(action, ActionArg::Workspace(_)) {
+        return Err("--windows applies only to a route rule; add --workspace <ws>".into());
+    }
 
     Ok(AddOptions {
         app,
         title,
+        title_contains,
         action,
+        windows,
         position,
         json,
     })
@@ -269,14 +310,17 @@ fn run_add(args: &[&str], path_override: Option<&Path>) -> Result<String, String
     let (action, workspace) = match options.action {
         ActionArg::Workspace(workspace) => ("route".to_owned(), Some(workspace)),
         ActionArg::Float => ("float".to_owned(), None),
+        ActionArg::Pin => ("pin".to_owned(), None),
         ActionArg::Tile => ("tile".to_owned(), None),
         ActionArg::Ignore => ("ignore".to_owned(), None),
     };
     let rule = RuleDoc {
         bundle_id: options.app,
         title: options.title,
+        title_contains: options.title_contains,
         action,
         workspace,
+        windows: options.windows,
     };
 
     let display_index = ConfigDoc::edit_locked(&path, |doc| {
@@ -397,8 +441,9 @@ fn run_remove(args: &[&str], path_override: Option<&Path>) -> Result<String, Str
     let (target, json) = parse_remove_args(args)?;
     let path = resolve_config_path(path_override)?;
 
-    let (removed, remaining) = ConfigDoc::edit_locked(&path, |doc| {
+    let (removed, remaining) = ConfigDoc::edit_locked_removing(&path, |doc| {
         let mut removed = Vec::new();
+        let mut positions = Vec::new();
         match target {
             RemoveTarget::Index(position) => {
                 if position == 0 || position > doc.rules.len() {
@@ -409,12 +454,14 @@ fn run_remove(args: &[&str], path_override: Option<&Path>) -> Result<String, Str
                 }
                 let rule = doc.rules.remove(position - 1);
                 removed.push(RuleView::from_doc(position, &rule));
+                positions.push(position - 1);
             }
             RemoveTarget::App(bundle_id) => {
                 let mut kept = Vec::with_capacity(doc.rules.len());
                 for (index, rule) in doc.rules.drain(..).enumerate() {
                     if rule.bundle_id.as_deref() == Some(bundle_id.as_str()) {
                         removed.push(RuleView::from_doc(index + 1, &rule));
+                        positions.push(index);
                     } else {
                         kept.push(rule);
                     }
@@ -426,7 +473,7 @@ fn run_remove(args: &[&str], path_override: Option<&Path>) -> Result<String, Str
             }
         }
         let remaining = doc.rules.len();
-        Ok(((removed, remaining), true))
+        Ok(((removed, remaining), Some(positions)))
     })?;
     if json {
         to_json_pretty(&RuleRemovedOutput {
@@ -439,8 +486,10 @@ fn run_remove(args: &[&str], path_override: Option<&Path>) -> Result<String, Str
         let rule = RuleDoc {
             bundle_id: entry.bundle_id.clone(),
             title: entry.title.clone(),
+            title_contains: entry.title_contains.clone(),
             action: entry.action.clone(),
             workspace: entry.workspace,
+            windows: entry.windows,
         };
         Ok(format!(
             "removed rule {}: {}",

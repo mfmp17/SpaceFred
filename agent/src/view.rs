@@ -5,20 +5,17 @@ use rune::{Anim, Cx, El, ScrollSpec, Tx, col, el, icon, row, text};
 
 use crate::{
     Pane, Ui,
-    controls::{self, Paint},
-    hud, onboarding,
+    controls::{self, METRICS, Paint, WINDOW},
+    hud, onboarding, panes,
 };
 
 /// The traffic lights sit over the sidebar, so the navigation starts below them.
 const SIDEBAR_TOP: f32 = 52.0;
-/// OpenCode Desktop's settings navigation: 28 pt rows with a 4 pt gap.
-const NAV_ROW_HEIGHT: f32 = 28.0;
+/// OpenCode Desktop's settings navigation: compact rows with a 4 pt gap.
 const NAV_ROW_GAP: f32 = 4.0;
-pub const SIDEBAR_WIDTH: f32 = 220.0;
-/// The panel's inset from the window's top, right and bottom.
-pub const PANEL_INSET: f32 = 8.0;
-pub const HEADER_HEIGHT: f32 = 56.0;
-pub const CONTENT_PADDING: f32 = 24.0;
+/// The sidebar's inset, and a navigation item's inside it: icons and the version stamp share
+/// the second.
+const SIDEBAR_PX: f32 = 8.0;
 /// How far a pane body's content dissolves as it scrolls under the header (top) and off the
 /// panel's foot (bottom), as Hex's list-and-detail panes do. Resting content sits clear of both.
 const SCROLL_FADE: (f32, f32) = (18.0, 28.0);
@@ -34,9 +31,9 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
         .key("panel")
         .grow(1.0)
         .shrink()
-        .mt(PANEL_INSET)
-        .mr(PANEL_INSET)
-        .mb(PANEL_INSET)
+        .mt(WINDOW.panel_inset)
+        .mr(WINDOW.panel_inset)
+        .mb(WINDOW.panel_inset)
         .radius(p.k.radius.lg)
         .fill(p.k.c.bg_base)
         .border(p.hair, p.k.c.border_weak)
@@ -52,7 +49,8 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
         .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
         .child(sidebar(ui, p))
         .child(panel);
-    if let Some(tour) = onboarding::overlay(ui, p) {
+    panes::sheet(ui, p, cx.is_reduced_motion(), &mut layer);
+    if let Some(tour) = onboarding::overlay(ui, p, cx.is_reduced_motion()) {
         layer.push(tour);
     }
     if let Some(hud_preview) = &ui.hud_preview {
@@ -63,27 +61,26 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
 
 fn sidebar(ui: &Ui, p: Paint) -> El {
     let mut nav = col().key("nav").role("list").focus_group().focus_follows();
-    for pane in Pane::ALL {
+    for pane in Pane::listed(ui.doc.labs()) {
         nav = nav.child(nav_slot(p, pane, ui.pane == pane));
     }
     col()
         .window_drag()
         .key("sidebar")
         .role("navigation")
-        .w(SIDEBAR_WIDTH)
+        .w(METRICS.sidebar_w)
         .h_full()
         .pt(SIDEBAR_TOP - NAV_ROW_GAP / 2.0)
         .pb(16.0)
-        .pl(10.0)
-        .pr(6.0)
+        .px(SIDEBAR_PX)
         .child(nav)
         .child(el().key("spacer").grow(1.0))
         .child(
             text(format!("Version {}", spaceman::build_version()))
                 .key("version")
-                .font(p.k.ty.small)
+                .font(p.tabular(p.meta()))
                 .color(p.faint())
-                .pl(6.0),
+                .pl(SIDEBAR_PX),
         )
         .child(crate::updates::sidebar(ui, p))
 }
@@ -110,8 +107,8 @@ fn nav_item(p: Paint, pane: Pane, on: bool) -> El {
         .key(pane.key())
         .role("button")
         .label(pane.title())
-        .h(NAV_ROW_HEIGHT)
-        .px(6.0)
+        .h(METRICS.row_h_compact)
+        .px(SIDEBAR_PX)
         .gap(8.0)
         .center_y()
         .radius(p.k.radius.sm)
@@ -124,7 +121,7 @@ fn nav_item(p: Paint, pane: Pane, on: bool) -> El {
                 .fill(c.hover)
                 .group_opacity(0.0, 1.0),
         )
-        .child(icon(pane.icon(), 16.0).key("icon").color(if on {
+        .child(icon(pane.icon(), METRICS.icon).key("icon").color(if on {
             c.icon_base
         } else {
             c.icon_muted
@@ -132,7 +129,7 @@ fn nav_item(p: Paint, pane: Pane, on: bool) -> El {
         .child(
             text(pane.title())
                 .key("label")
-                .font(p.k.ty.ui)
+                .font(p.row_title())
                 .color(if on { c.text_base } else { c.text_muted })
                 .truncate(),
         );
@@ -144,21 +141,41 @@ fn nav_item(p: Paint, pane: Pane, on: bool) -> El {
         .focus_ring(2.0, -2.0, c.border_focus)
 }
 
-/// The panel's title bar, which also moves the window.
+/// The panel's content column: as wide as the panel until the cards reach `content_max`, then
+/// centred. The header, the error banner and the pane body all sit in one, so the title stays on
+/// the cards' text rail at every window size.
+fn column(key: &str) -> El {
+    col()
+        .key(key)
+        .w_full()
+        .max_w(METRICS.content_max + 2.0 * METRICS.card_edge())
+        .self_center()
+}
+
+/// The panel's title bar, which also moves the window. The title sits on the text rail.
 fn pane_header(p: Paint, title: &str) -> El {
-    row()
+    col()
         .window_drag()
         .key("pane-header")
-        .h(HEADER_HEIGHT)
-        .px(CONTENT_PADDING)
-        .center_y()
+        .h(METRICS.header_h)
         .child(
-            text(title)
-                .key("pane-title")
-                .font(p.k.ty.body_medium)
-                .color(p.text())
-                .shrink()
-                .truncate(),
+            column("rail").h_full().child(
+                row()
+                    .key("title-row")
+                    .h_full()
+                    .px(METRICS.gutter)
+                    .center_y()
+                    .child(
+                        text(title)
+                            .key("pane-title")
+                            .role("heading")
+                            .level(1)
+                            .font(p.title())
+                            .color(p.text())
+                            .shrink()
+                            .truncate(),
+                    ),
+            ),
         )
 }
 
@@ -168,37 +185,42 @@ fn error_banner(ui: &Ui, p: Paint) -> Option<El> {
     let agent_error = ui
         .agent
         .as_ref()
-        .and_then(|agent| agent.last_error.as_deref());
+        .and_then(|agent| agent.last_error.as_deref())
+        // A cycle's window-operation failure is transient and already shown in the
+        // menu and `ctl status`; it is not a Settings error (#694).
+        .filter(|error| !spaceman::app::is_window_operations_failed_error(error));
     let copy = ui
         .error
         .as_deref()
         .or(ui.doc.error.as_deref())
         .or(agent_error)?;
+    // A card-shaped notice on the card edge, its copy on the text rail.
     Some(
-        row()
-            .key("error")
-            .mx(CONTENT_PADDING)
-            .mb(8.0)
-            .px(12.0)
-            .py(8.0)
-            .gap(8.0)
-            .center_y()
-            .radius(p.k.radius.md)
-            .fill(p.k.c.danger.bg)
-            .child(controls::status_dot(p.k.c.danger.fg))
-            .child(
-                text(copy)
-                    .key("copy")
-                    .font(controls::DESCRIPTION)
-                    .color(p.text())
-                    .wrap()
-                    .grow(1.0)
-                    .shrink(),
-            ),
+        column("error-rail").px(METRICS.card_edge()).pb(8.0).child(
+            row()
+                .key("error")
+                .px(METRICS.row_px)
+                .py(8.0)
+                .gap(8.0)
+                .center_y()
+                .radius(p.k.radius.lg)
+                .fill(p.k.c.danger.bg)
+                .child(
+                    text(copy)
+                        .key("copy")
+                        .font(p.description())
+                        .color(p.text())
+                        .wrap()
+                        .grow(1.0)
+                        .shrink(),
+                )
+                .child(controls::status_dot(p.k.c.danger.fg)),
+        ),
     )
 }
 
-/// A vertically scrolling pane body whose content fades out under the header and at the
+/// A vertically scrolling pane body on the page's rails: cards at the card edge, capped at
+/// `content_max` and centred past it. Its content fades out under the header and at the
 /// panel's foot instead of clipping on a straight line. The body reaches up under the header by
 /// the fade's extra height, and its inset matches the fade, so resting content keeps its place
 /// and only content scrolled into either edge dissolves.
@@ -215,11 +237,14 @@ pub fn scroll_body(key: &str, content: El) -> El {
             stick_bottom: false,
         })
         .child(
-            col()
-                .key("inset")
-                .px(CONTENT_PADDING)
+            column("inset")
+                .px(METRICS.card_edge())
                 .pt(top)
                 .pb(bottom)
+                // The Rules map lays itself out from the cards' width.
+                .on_layout(|ui: &mut Ui, [_, _, width, _]| {
+                    ui.card_w = width - 2.0 * METRICS.card_edge();
+                })
                 .child(content),
         )
 }

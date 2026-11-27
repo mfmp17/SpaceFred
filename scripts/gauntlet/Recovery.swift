@@ -63,21 +63,30 @@ extension Gauntlet {
         }
         let doctor = agent.doctor()
         try? doctor.out.write(to: options.out.appendingPathComponent("doctor.txt"), atomically: true, encoding: .utf8)
-        try? step("no window title reaches any file or output Spaceman wrote") {
+        try? step("no window title reaches logs, snapshots, doctor, or non-memory state files") {
             var scanned = 0
             var leaks: [String] = []
             let roots = [agent.state, options.out.appendingPathComponent("snapshots")]
             for root in roots {
                 let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
                 while let url = files?.nextObject() as? URL {
+                    if url.lastPathComponent == "window-memory.json", root == agent.state {
+                        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                            let posix = (attrs[.posixPermissions] as? NSNumber)?.intValue,
+                            posix & 0o777 != 0o600
+                        {
+                            leaks.append("window-memory.json mode \(String(posix & 0o777, radix: 8))")
+                        }
+                        continue
+                    }
                     guard let data = try? Data(contentsOf: url) else { continue }
                     scanned += 1
                     if data.range(of: Data(titleToken.utf8)) != nil { leaks.append(url.lastPathComponent) }
                 }
             }
             if doctor.out.contains(titleToken) { leaks.append("spaceman doctor") }
-            try require(leaks.isEmpty ? nil : "title found in \(leaks.joined(separator: ", "))", expected: "0 files", measured: leaks.joined(separator: ", "))
-            return Outcome(expected: "title token in 0 files", measured: "0 of \(scanned) files and doctor output")
+            try require(leaks.isEmpty ? nil : "violation in \(leaks.joined(separator: ", "))", expected: "0 leaks (window-memory.json 0600)", measured: leaks.joined(separator: ", "))
+            return Outcome(expected: "title token in 0 non-memory files", measured: "0 of \(scanned) files and doctor output")
         }
         try? step("spaceman doctor reports a healthy run") {
             try require(doctor.status == 0 ? nil : "doctor exited \(doctor.status)", expected: "exit 0", measured: doctor.out)

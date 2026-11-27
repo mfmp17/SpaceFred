@@ -5,7 +5,7 @@
 use std::f32::consts::PI;
 
 use rune::{Color, El, Shadow, Spring, col, el, oklch, oklcha, row};
-use spaceman::{Rect, spacing::Spacing};
+use spaceman::{Rect, config::LayoutMode, spacing::Spacing};
 
 use crate::controls::{self, Paint};
 
@@ -35,29 +35,54 @@ const WINDOW_RADIUS: f32 = 3.5;
 const LIGHT: f32 = 3.5;
 const SETTLE: Spring = Spring::new(0.22, 0.0);
 
-/// Three tiles as the engine places them: one column on the left, two stacked on the right.
-pub(super) fn three_tiles(spacing: Spacing, display: Rect) -> Vec<Rect> {
+/// Three tiles as the engine places them for `layout`: left half + two stacked on the right
+/// for Dwindle, or three equal columns for Columns.
+pub(super) fn three_tiles(layout: LayoutMode, spacing: Spacing, display: Rect) -> Vec<Rect> {
     let usable = spacing.usable(display);
     let canvas = spacing.canvas(usable);
-    let half = canvas.width / 2;
-    let cells = vec![
-        Rect {
-            width: half,
-            ..canvas
-        },
-        Rect {
-            x: canvas.x + half,
-            width: canvas.width - half,
-            height: canvas.height / 2,
-            ..canvas
-        },
-        Rect {
-            x: canvas.x + half,
-            y: canvas.y + canvas.height / 2,
-            width: canvas.width - half,
-            height: canvas.height - canvas.height / 2,
-        },
-    ];
+    let cells = match layout {
+        LayoutMode::Dwindle => {
+            let half = canvas.width / 2;
+            vec![
+                Rect {
+                    width: half,
+                    ..canvas
+                },
+                Rect {
+                    x: canvas.x + half,
+                    width: canvas.width - half,
+                    height: canvas.height / 2,
+                    ..canvas
+                },
+                Rect {
+                    x: canvas.x + half,
+                    y: canvas.y + canvas.height / 2,
+                    width: canvas.width - half,
+                    height: canvas.height - canvas.height / 2,
+                },
+            ]
+        }
+        LayoutMode::Columns => {
+            let first = canvas.width / 3;
+            let second = canvas.width * 2 / 3;
+            vec![
+                Rect {
+                    width: first,
+                    ..canvas
+                },
+                Rect {
+                    x: canvas.x + first,
+                    width: second - first,
+                    ..canvas
+                },
+                Rect {
+                    x: canvas.x + second,
+                    width: canvas.width - second,
+                    ..canvas
+                },
+            ]
+        }
+    };
     spacing
         .place(usable, cells.into_iter().map(|cell| ((), cell)).collect())
         .into_iter()
@@ -66,8 +91,8 @@ pub(super) fn three_tiles(spacing: Spacing, display: Rect) -> Vec<Rect> {
 }
 
 /// The preview card: the three-window display, joined by an ultrawide holding one capped window
-/// while a single-window width is set.
-pub(super) fn card(p: Paint, spacing: Spacing) -> El {
+/// while a single-window width or height is set.
+pub(super) fn card(p: Paint, layout: LayoutMode, spacing: Spacing) -> El {
     let mut displays = row()
         .key("displays")
         .gap(28.0)
@@ -79,9 +104,9 @@ pub(super) fn card(p: Paint, spacing: Spacing) -> El {
             "Three windows",
             DISPLAY,
             DISPLAY_WIDTH,
-            &three_tiles(spacing, DISPLAY),
+            &three_tiles(layout, spacing, DISPLAY),
         ));
-    if spacing.single_window_max_width > 0 {
+    if spacing.single_window_max_width > 0 || spacing.single_window_max_height > 0 {
         displays = displays.child(display(
             p,
             "single",
@@ -254,7 +279,7 @@ mod tests {
             top: 30,
             ..Spacing::NONE
         };
-        let [left, top, bottom] = three_tiles(spacing, DISPLAY)[..] else {
+        let [left, top, bottom] = three_tiles(LayoutMode::Dwindle, spacing, DISPLAY)[..] else {
             panic!("three tiles")
         };
         assert_eq!((left.x, left.y), (0, 30));
@@ -262,5 +287,16 @@ mod tests {
         assert_eq!(bottom.y - (top.y + top.height), 10);
         assert_eq!(bottom.y + bottom.height, DISPLAY.height);
         assert_eq!(top.x + top.width, DISPLAY.width);
+
+        let [first, middle, last] = three_tiles(LayoutMode::Columns, spacing, DISPLAY)[..] else {
+            panic!("three columns")
+        };
+        assert_eq!((first.x, first.y), (0, 30));
+        assert_eq!(first.height, DISPLAY.height - 30);
+        assert_eq!(middle.height, first.height);
+        assert_eq!(last.height, first.height);
+        assert_eq!(middle.x - (first.x + first.width), 10);
+        assert_eq!(last.x - (middle.x + middle.width), 10);
+        assert_eq!(last.x + last.width, DISPLAY.width);
     }
 }

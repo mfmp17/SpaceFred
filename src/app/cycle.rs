@@ -1,10 +1,22 @@
 mod affinity;
+mod deck;
+mod float_tab;
+mod hidden_tab;
+mod moved_tab;
 mod omission;
 mod readback;
+mod routing;
+mod tab_handoff;
+pub(super) use deck::SetAsideTiles;
+pub(super) use moved_tab::DepartedTile;
+#[cfg(test)]
+pub(super) use moved_tab::MOVED_TAB_SETTLE;
 pub(super) use omission::Omission;
 #[cfg(test)]
 pub(super) use readback::ASYNC_BOUNCE_SETTLE;
 pub(super) use readback::{APPLY_ATTEMPT_LIMIT, AppliedFrame, record_apply_attempt};
+#[cfg(test)]
+pub(super) use tab_handoff::TAB_HANDOFF_SETTLE;
 
 use affinity::{FrozenAffinityPolicy, FrozenWindowAffinity};
 
@@ -19,14 +31,14 @@ use crate::journal::PlacementSource;
 pub(super) const OMISSION_SETTLE: Duration = Duration::from_secs(2);
 
 struct ReconcileDisplayContext<'a> {
-    outputs: &'a macos::DisplayOutputs,
-    observation: &'a mut crate::NativeObservation,
+    observation: &'a crate::NativeObservation,
     affinity_policy: &'a FrozenAffinityPolicy,
     server_frames: Option<&'a HashMap<u32, crate::Rect>>,
     onscreen_frames: Option<&'a HashMap<u32, crate::Rect>>,
     cancelled: &'a AtomicBool,
     failed: &'a mut usize,
     close_recheck: &'a mut Option<Instant>,
+    fullscreen_hud: &'a mut Option<WorkspaceId>,
 }
 
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
@@ -39,9 +51,16 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if self.parked.is_empty() {
             return;
         }
+        // A window pinned while it was parked (a pin rule reloaded) shows wherever it lives.
         let windows: Vec<_> = visible
             .iter()
             .flat_map(|resolved| self.workspaces.windows(resolved.workspace))
+            .chain(
+                self.parked
+                    .keys()
+                    .filter(|window| self.workspaces.is_pinned(window))
+                    .cloned(),
+            )
             .collect();
         for window in windows {
             if cancelled.load(Ordering::Acquire) {
@@ -50,11 +69,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             if !self.parked.contains_key(&window) {
                 continue;
             }
-            let retry_throttled = self
-                .recently_parked
-                .get(&window)
-                .is_some_and(|attempted_at| attempted_at.elapsed() < RESTORE_RETRY_INTERVAL);
-            if let Some(target) = self.scratchpad.pending_summon(&window) {
+            let now = self.backend.now();
+            let retry_throttled = self.parked.last_write(&window).is_some_and(|attempted_at| {
+                now.saturating_duration_since(attempted_at) < RESTORE_RETRY_INTERVAL
+            });
+            if let Some(target) = self.parked.summon_destination(&window) {
                 if !matches!(
                     self.finish_scratchpad_summon(&window, target, retry_throttled),
                     macos::ApplyOutcome::Applied | macos::ApplyOutcome::Gone
@@ -86,7 +105,15 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if cancelled.load(Ordering::Acquire) {
             return Err("workspace operation cancelled".into());
         }
+        if !self.backend.mouse_down() {
+            self.gesture = None;
+        }
+        self.focus.note_pointer(self.backend.pointer_location());
+        if let Some(until) = self.space_transition_until() {
+            return Ok(self.defer_for_space_transition(until, &outputs));
+        }
         self.note_outputs(&outputs);
+        self.follow_displays(&outputs);
         // Parking is durable before workspace ownership. A crash between those
         // writes must not strand an unowned window behind an otherwise valid state.
         // Hidden scratchpad windows are unowned on purpose until summoned.
@@ -95,7 +122,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .keys()
             .filter(|window| {
                 self.workspaces.workspace_of_any(window).is_none()
-                    && !self.scratchpad.contains(window)
+                    && !self.workspaces.scratchpad().contains(window)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -105,8 +132,6 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 "Recovery pending for {pending} unowned parked window(s)"
             ));
         }
-        self.synchronize_foreground(&outputs);
-        self.follow_displays(&outputs);
         let visible = self.visible_workspaces(&outputs);
         let frontmost = self.backend.frontmost_application();
         let focused = self.backend.focused_window();
@@ -115,25 +140,40 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 .as_ref()
                 .is_none_or(|frontmost| &focused.app == frontmost)
         });
+        // One window-server snapshot serves every authoritative-frame check in
+        // this cycle; per-window queries would each copy the full window list.
+        let server_snapshot = self.backend.window_server_frames();
+        // A pinned window shows on every workspace, so focusing it never switches.
         let focus_workspace = if focused_is_frontmost {
             focused
                 .as_ref()
+                .filter(|focused| !self.workspaces.is_pinned(focused))
                 .and_then(|focused| self.workspaces.workspace_of_any(focused))
         } else {
-            frontmost
-                .as_ref()
-                .and_then(|app| self.workspaces.workspace_for_app(app))
+            // Only windows the window server still lists count: an app whose
+            // windows all just closed has nothing on a hidden workspace to
+            // follow (#516). No snapshot proves nothing closed.
+            frontmost.as_ref().and_then(|app| {
+                self.workspaces.workspace_for_live_app(app, |window| {
+                    server_snapshot
+                        .as_ref()
+                        .is_none_or(|frames| frames.contains_key(&window.window_id))
+                })
+            })
         };
-        // Suppression lasts until Accessibility reports a different focus. When
-        // the focused window is missing or lags the frontmost app, the app is
-        // the evidence; with neither reported nothing has changed.
-        let suppressed = if focused_is_frontmost {
-            focused.as_ref() == self.suppressed_focus.as_ref()
-        } else if let Some(frontmost) = frontmost.as_ref() {
-            self.suppressed_app.as_ref() == Some(frontmost)
-        } else {
-            true
-        };
+        // A guard lasts until Accessibility reports a different focus, and a
+        // report a focus request in flight explains is no focus change at all:
+        // it must neither switch a display nor rewrite history (#399).
+        self.retry_follow_after_space_change();
+        if focused_is_frontmost && let Some(reported) = focused.as_ref() {
+            self.reclaim_from_sibling(reported, &visible);
+        }
+        let suppressed = self.focus.holds_back(
+            self.backend.now(),
+            focused.as_ref(),
+            frontmost.as_ref(),
+            focused_is_frontmost,
+        );
         if !suppressed {
             self.clear_suppressed_focus();
             if let Some(workspace) = focus_workspace {
@@ -152,14 +192,31 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         workspace,
                         input
                     );
-                    let followed = self.switch(workspace, outputs, cancelled);
+                    let follow_started = self.backend.now();
+                    // A follow answers focus the user already moved: the pointer stays.
+                    let followed = self.switch_with(
+                        workspace,
+                        outputs.clone(),
+                        cancelled,
+                        super::switching::RepeatSwitch::KeepFocus,
+                        super::commands::CommandOrigin::Passive,
+                    );
                     // An activation (or a finished drag) cancels background
                     // cycles, often the very one this follow answers (a
                     // notification click). A cancelled follow lets the next cycle
                     // follow again; a switch that fails for any other reason keeps
-                    // focus suppressed so it can't loop.
+                    // focus suppressed so it can't loop, unless a macOS Space
+                    // slide explains the failure.
                     if matches!(&followed, Err(error) if error.ends_with("cancelled")) {
                         self.clear_suppressed_focus();
+                    } else if followed.is_err() {
+                        self.focus.follow_failed(follow_started);
+                        if self.retry_follow_after_space_change() {
+                            let until = self
+                                .space_transition_until()
+                                .unwrap_or_else(|| self.backend.now() + SPACE_TRANSITION_SETTLE);
+                            return Ok(self.defer_for_space_transition(until, &outputs));
+                        }
                     }
                     return followed;
                 }
@@ -169,36 +226,43 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             }
         }
         for resolved in &visible {
-            self.foreground_lanes
-                .insert(resolved.display_id.clone(), resolved.selector.clone());
+            self.workspaces
+                .seed_display_front(&resolved.display_id, &resolved.selector);
         }
-        // One window-server snapshot serves every authoritative-frame check in
-        // this cycle; per-window queries would each copy the full window list.
-        let server_snapshot = self.backend.window_server_frames();
         let empty_server_frames = HashMap::new();
         let server_frames = server_snapshot.as_ref().unwrap_or(&empty_server_frames);
-        self.recover_frontmost_stale_parked_window(
-            &outputs,
-            frontmost.as_ref(),
-            focused.as_ref(),
-            server_frames,
-        );
+        // Recovery records this cycle did not create: a hidden tab group's outgoing tab may
+        // only hand over its tile when it was on screen going in (#753).
+        let parked_before: HashSet<_> = self.parked.keys().cloned().collect();
+        self.recover_stale_parked_windows(&outputs, server_frames);
+        self.pin_parked_windows_by_rule();
         self.restore_visible(&visible, cancelled, &mut failed);
-        self.park_inactive(&outputs, &visible, server_frames, cancelled, &mut failed);
+        let mut fullscreen_hud =
+            self.park_inactive(&outputs, &visible, server_frames, cancelled, &mut failed);
         self.recover_stranded_visible(&outputs, &visible, server_frames, cancelled, &mut failed);
         if cancelled.load(Ordering::Acquire) {
             return Err("workspace operation cancelled".into());
         }
-        let mut observation = self
+        let observation = self
             .backend
             .snapshot(0, &outputs)
             .map_err(|error| format!("Observation error: {error}"))?;
-        let affinity_policy =
-            self.freeze_window_affinities(&observation, &visible, server_frames)?;
+        let mut affinity_policy =
+            self.freeze_window_affinities(&observation, &visible, server_frames, &parked_before)?;
+        self.route_before_reconcile(
+            &mut affinity_policy,
+            &observation,
+            &visible,
+            &outputs,
+            &mut failed,
+        );
+        if let Some(workspace) = affinity_policy.fullscreen_hud {
+            fullscreen_hud = Some(workspace);
+        }
         // Taken after the Accessibility snapshot so a window listed here was
         // on screen no earlier than the snapshot that may have omitted it.
         let onscreen_snapshot = self.backend.onscreen_window_frames();
-        let mut close_recheck = None;
+        let mut close_recheck = affinity_policy.handoff_recheck;
         for resolved in &visible {
             if !self.scope.manages_selector(&resolved.selector) {
                 continue;
@@ -206,29 +270,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             self.reconcile_display(
                 resolved,
                 ReconcileDisplayContext {
-                    outputs: &outputs,
-                    observation: &mut observation,
+                    observation: &observation,
                     affinity_policy: &affinity_policy,
                     server_frames: server_snapshot.as_ref(),
                     onscreen_frames: onscreen_snapshot.as_ref(),
                     cancelled,
                     failed: &mut failed,
                     close_recheck: &mut close_recheck,
+                    fullscreen_hud: &mut fullscreen_hud,
                 },
             )?;
         }
         let mut attempted_focus_restore = HashSet::new();
         for resolved in &visible {
-            if !self
-                .pending_fullscreen_focus_restore
-                .contains(&resolved.workspace)
-            {
+            if !self.focus.restores_fullscreen(resolved.workspace) {
                 continue;
             }
             attempted_focus_restore.insert(resolved.workspace);
             let Some(window) = self.workspaces.preferred_focus(resolved.workspace) else {
-                self.pending_fullscreen_focus_restore
-                    .remove(&resolved.workspace);
+                self.focus.settle_fullscreen(resolved.workspace);
                 continue;
             };
             let restored = if focus_workspace == Some(resolved.workspace) {
@@ -236,25 +296,26 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             } else {
                 self.backend.raise_window(&window)
             };
-            self.pending_fullscreen_focus_restore
-                .remove(&resolved.workspace);
+            self.focus.settle_fullscreen(resolved.workspace);
             if !restored {
                 failed += 1;
             }
         }
+        // New tiles split the effectively focused tile: a report that lags a
+        // focus command must not move the split back to the tile it left (#411).
+        let remembered_focus = self.resolve_focus(focused.clone());
         if focused_is_frontmost
-            && let Some(focused) = focused.as_ref()
+            && let Some(focused) = remembered_focus.as_ref()
             && let Some(workspace) = self.workspaces.workspace_of(focused)
         {
             self.workspaces
                 .engine_mut(workspace)
                 .remember_insertion_focus(focused);
         }
-        let remembered_focus = self.resolve_focus(focused.clone());
         if focused_is_frontmost
             && let Some(focused) = remembered_focus.as_ref()
             && let Some(workspace) = self.workspaces.workspace_of(focused)
-            && self.workspaces.uses_fullscreen_layout(workspace)
+            && self.workspaces.deck(workspace).is_monocle()
             && !attempted_focus_restore.contains(&workspace)
             && visible
                 .iter()
@@ -262,7 +323,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         {
             self.workspaces.remember_focus(workspace, focused);
         }
-        self.record_window_memory(server_frames);
+        self.record_window_memory(server_frames, &observation);
         // Creation can wake the worker before CG orders the window on screen.
         // Only a recent create/activation on the main thread enables retries.
         let missing_frontmost_window = frontmost.filter(|app| {
@@ -275,9 +336,17 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         self.journal.observation = Some(observation);
         self.persist_workspace_state_if_changed()?;
         let mut status = self.status_for_visible(failed, &visible, &outputs);
+        if let Some(workspace) = fullscreen_hud.filter(|&ws| self.is_stacked_fullscreen(ws)) {
+            status.hud = Some(self.hud_for(
+                workspace,
+                UiHudKind::Fullscreen { enabled: true },
+                None,
+                &outputs,
+            ));
+        }
         status.close_recheck = close_recheck;
         status.missing_frontmost_window = missing_frontmost_window;
-        Ok(status)
+        self.settle_tab_detach(status, &outputs, cancelled)
     }
 
     /// Bookkeeping shared by every path that moves a window between workspaces.
@@ -301,7 +370,6 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         context: ReconcileDisplayContext<'_>,
     ) -> Result<(), String> {
         let ReconcileDisplayContext {
-            outputs,
             observation,
             affinity_policy,
             server_frames,
@@ -309,9 +377,13 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             cancelled,
             failed,
             close_recheck,
+            fullscreen_hud,
         } = context;
         let workspace = resolved.workspace;
         let output = resolved.output;
+        // A new window centered over this display's Dock or menu-bar strip is
+        // on this display, though outside its tiling area (#394).
+        let screen = resolved.screen;
         let ticket = {
             let engine = self.workspaces.engine_mut(workspace);
             engine.invalidate();
@@ -321,6 +393,17 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         scoped_observation.cycle = ticket.cycle;
         let settings = self.layout_settings(output);
         for app in &mut scoped_observation.applications {
+            // An app with a native tab held mid-handoff keeps its tiles and focus history
+            // until the handoff settles (#706).
+            if let crate::AppObservation::Complete { app: observed, .. } = app
+                && let Some(held) = affinity_policy.held_apps.get(&observed.id).cloned()
+            {
+                *app = crate::AppObservation::Unavailable {
+                    app: held,
+                    error: "native tab handoff settling".into(),
+                };
+                continue;
+            }
             if let crate::AppObservation::Complete {
                 app: _,
                 focused,
@@ -345,9 +428,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                             target == workspace
                         }
                         FrozenWindowAffinity::ExplicitRoute(_)
+                        | FrozenWindowAffinity::DetachedTab(_)
                         | FrozenWindowAffinity::Inferred(_)
                         | FrozenWindowAffinity::CurrentDisplay => {
-                            output.contains_center(window.frame)
+                            screen.contains_center(window.frame)
                                 && self
                                     .workspaces
                                     .workspace_of(&window.id)
@@ -366,6 +450,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         self.guard_omitted_windows(
             workspace,
             &mut scoped_observation,
+            server_frames,
             onscreen_frames,
             close_recheck,
         );
@@ -382,53 +467,13 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             |app| self.backend.is_process_running(app),
             |app| server_frames.is_none() || apps_with_window_server_evidence.contains(app),
         );
+        let fullscreen_before = self.fullscreen_tiles_before(workspace);
         let reconciliation = self
             .workspaces
             .engine_mut(workspace)
             .accept(ticket, &scoped_observation, &settings)
             .map_err(|error| format!("stale workspace cycle: {error:?}"))?;
         self.log_binding_decisions(workspace, &reconciliation.decisions, affinity_policy);
-        let routes: Vec<_> = reconciliation
-            .decisions
-            .iter()
-            .filter_map(|decision| match decision {
-                Decision::WindowInserted { window, .. } => affinity_policy
-                    .windows
-                    .get(window)
-                    .copied()
-                    .and_then(|affinity| match affinity {
-                        FrozenWindowAffinity::ExplicitRoute(target)
-                        | FrozenWindowAffinity::Inferred(target)
-                            if target != workspace =>
-                        {
-                            Some((window.clone(), target))
-                        }
-                        _ => None,
-                    }),
-                _ => None,
-            })
-            .collect();
-        let mut routed_targets = HashSet::new();
-        for (window, target) in &routes {
-            if !affinity_policy.visible_workspaces.contains(target) {
-                let target_output = output_for(&self.workspaces, *target, outputs);
-                match self.park_window_across(window, output, target_output, outputs) {
-                    macos::ApplyOutcome::Applied => {}
-                    macos::ApplyOutcome::Gone => {
-                        self.forget_window(workspace, window);
-                        continue;
-                    }
-                    _ => {
-                        *failed += 1;
-                        continue;
-                    }
-                }
-            }
-            if self.workspaces.move_window(window, *target).is_none() {
-                continue;
-            }
-            routed_targets.insert(*target);
-        }
         for decision in &reconciliation.decisions {
             let Decision::WindowInserted { window, .. } = decision else {
                 continue;
@@ -443,30 +488,27 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 self.note_placement(window, source, owner);
             }
         }
-        let inserted_here = reconciliation.decisions.iter().any(|decision| {
-            matches!(
-                decision,
-                Decision::WindowInserted { window, .. }
-                    if !routes.iter().any(|(routed, _)| routed == window)
-            )
-        });
+        let inserted: Vec<_> = reconciliation
+            .decisions
+            .iter()
+            .filter_map(|decision| match decision {
+                Decision::WindowInserted { window, .. } => Some(window),
+                _ => None,
+            })
+            .collect();
+        let inserted_here = !inserted.is_empty();
+        self.settle_fullscreen_set_aside(workspace, &fullscreen_before, &inserted);
         let bound: HashSet<_> = self
             .workspaces
             .engine(workspace)
             .bound_windows()
             .into_iter()
             .collect();
-        if inserted_here {
-            self.exit_fullscreen_if_split(workspace);
-        }
-        for target in &routed_targets {
-            self.exit_fullscreen_if_split(*target);
+        if inserted_here && self.workspaces.deck(workspace).is_monocle() {
+            *fullscreen_hud = Some(workspace);
         }
         self.workspaces.prune_intents(workspace);
         self.clear_fullscreen_restore_if_inactive(workspace);
-        for target in &routed_targets {
-            self.clear_fullscreen_restore_if_inactive(*target);
-        }
         self.constrained[workspace.index()].retain(|window, _| bound.contains(window));
         self.applied[workspace.index()].retain(|window, _| bound.contains(window));
         self.apply_attempts[workspace.index()].retain(|window, _| bound.contains(window));
@@ -474,14 +516,14 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         self.minimum_sizes
             .retain(|window, _| workspaces.workspace_of(window).is_some());
         let observed_frames = live::observed_frames(&scoped_observation);
-        let filter_unchanged = routes.is_empty();
         let engine = self.workspaces.engine_mut(workspace);
         engine.fit_minimums(&settings, &self.minimum_sizes);
         let mut placements = engine.placements(&settings);
         for placement in &placements {
             engine.record_placement_target(placement.slot, placement.frame);
         }
-        self.apply_fullscreen_layout(workspace, &mut placements, &settings);
+        self.project_deck(workspace, &mut placements, &settings);
+        let now = self.backend.now();
         if !scoped_observation.mouse_down {
             for placement in &placements {
                 let Some(window) = placement.window.as_ref() else {
@@ -494,7 +536,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 if observed.approximately_equals(target, settings.frame_tolerance) {
                     let settling = self.applied[workspace.index()]
                         .get(window)
-                        .is_some_and(|applied| applied.is_settling(target));
+                        .is_some_and(|applied| applied.is_settling(target, now));
                     if !settling {
                         self.applied[workspace.index()].remove(window);
                         self.constrained[workspace.index()].remove(window);
@@ -514,11 +556,28 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 {
                     self.apply_attempts[workspace.index()].remove(window);
                 }
+                // A window that kept its size but left this display was moved
+                // there, not refused its frame: the next write brings it back (#392).
+                let moved_away = observed.width.abs_diff(target.width)
+                    <= settings.frame_tolerance.unsigned_abs()
+                    && observed.height.abs_diff(target.height)
+                        <= settings.frame_tolerance.unsigned_abs()
+                    && !screen.contains_center(observed);
+                // A late clamp (an Electron aspect ratio) only resizes the window
+                // where it was put; a frame whose top-left corner moved too is
+                // the app placing the window itself, not refusing its tile, so it
+                // is written again, within the usual attempt limit (#723).
+                let clamped_in_place =
+                    observed.position_approximately_equals(target, settings.frame_tolerance);
                 if self.applied[workspace.index()]
                     .remove(window)
                     .is_some_and(|applied| applied.target == target)
+                    && !moved_away
                 {
-                    self.constrained[workspace.index()].insert(window.clone(), (target, observed));
+                    if clamped_in_place {
+                        self.constrained[workspace.index()]
+                            .insert(window.clone(), (target, observed));
+                    }
                     record_apply_attempt(
                         &mut self.apply_attempts[workspace.index()],
                         workspace,
@@ -538,11 +597,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 }
             }
         }
-        if filter_unchanged {
-            placements.retain(|placement| {
-                live::needs_application(placement, &observed_frames, settings.frame_tolerance)
-            });
-        }
+        placements.retain(|placement| {
+            live::needs_application(placement, &observed_frames, settings.frame_tolerance)
+        });
         placements.retain(|placement| {
             let Some(window) = placement.window.as_ref() else {
                 return false;
@@ -568,22 +625,14 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 .backend
                 .apply_observed(&placements, &settings, cancelled);
             self.record_results(workspace, &results);
+            // A tile still parked (its workspace revealed by a config reload, its
+            // restore not yet confirmed) is on screen now: retire its recovery
+            // frame, or a restore retry writes it back over the tile (#701).
+            self.retire_laid_out(&results);
             let initially_failed = failed_results(&results);
             *failed += self
                 .refit_minimum_sizes(workspace, output, results, cancelled)
                 .map_or(initially_failed, |status| status.failed);
-        }
-        for target in routed_targets {
-            if affinity_policy.visible_workspaces.contains(&target) {
-                let target_output = output_for(&self.workspaces, target, outputs);
-                let layout = self.layout_workspace(target, target_output, cancelled);
-                *failed += layout.failed;
-                let settings = self.layout_settings(target_output);
-                update_observed_frames(
-                    observation,
-                    &self.workspaces.engine(target).placements(&settings),
-                );
-            }
         }
         Ok(())
     }
@@ -624,30 +673,6 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 Decision::NativeTabAmbiguous { .. }
                 | Decision::ObservationUnavailable { .. }
                 | Decision::MouseDownDeferred => {}
-            }
-        }
-    }
-}
-
-fn update_observed_frames(
-    observation: &mut crate::NativeObservation,
-    placements: &[crate::Placement],
-) {
-    let frames: HashMap<_, _> = placements
-        .iter()
-        .filter_map(|placement| {
-            placement
-                .window
-                .as_ref()
-                .map(|window| (window, placement.frame))
-        })
-        .collect();
-    for application in &mut observation.applications {
-        if let crate::AppObservation::Complete { windows, .. } = application {
-            for window in windows {
-                if let Some(frame) = frames.get(&window.id) {
-                    window.frame = *frame;
-                }
             }
         }
     }

@@ -5,7 +5,7 @@
 //! release isn't the running build it downloads the zip from the release
 //! service's own `files/`, checks its size and SHA-256 against the manifest,
 //! unpacks it beside the installed bundle and checks its code signature
-//! (`bundle`). The update then waits for Install & Restart, which restores every
+//! (`bundle`). The update then waits for Install & restart, which restores every
 //! parked window first (`ExitIntent::Update`) and only then swaps the bundles.
 //! Quitting with an update ready installs it the same way, after the restore,
 //! for the next launch. Manifest polls revalidate with `If-None-Match`, and an
@@ -89,7 +89,7 @@ enum Phase {
     Installed,
 }
 
-/// A verified update waiting for Install & Restart.
+/// A verified update waiting for Install & restart.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StagedUpdate {
     channel: UpdateChannel,
@@ -314,7 +314,7 @@ impl Updater {
     }
 
     /// Quitting with an update ready installs it for the next launch, as
-    /// Install & Restart does but without relaunching. Call only once every
+    /// Install & restart does but without relaunching. Call only once every
     /// parked window has been restored. `None` when no update was ready.
     pub(crate) fn install_on_quit(&self) -> Option<Result<String, String>> {
         self.install_on_quit_for(channel(), updates_dir(), |staged| {
@@ -498,7 +498,7 @@ enum Plan {
 }
 
 /// `confirmed` is the switch the user agreed to; `staged` the SHA-256 of the
-/// update waiting for Install & Restart.
+/// update waiting for Install & restart.
 fn plan(decision: Decision, method: Method, confirmed: Option<&str>, staged: Option<&str>) -> Plan {
     match decision {
         Decision::Reject { reason } => Plan::Reject(reason),

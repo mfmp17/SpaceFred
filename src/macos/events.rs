@@ -17,8 +17,9 @@ use block2::RcBlock;
 use objc2::{rc::Retained, rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_app_kit::{
     NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace,
-    NSWorkspaceDidActivateApplicationNotification, NSWorkspaceDidLaunchApplicationNotification,
-    NSWorkspaceDidTerminateApplicationNotification,
+    NSWorkspaceActiveSpaceDidChangeNotification, NSWorkspaceDidActivateApplicationNotification,
+    NSWorkspaceDidHideApplicationNotification, NSWorkspaceDidLaunchApplicationNotification,
+    NSWorkspaceDidTerminateApplicationNotification, NSWorkspaceDidUnhideApplicationNotification,
 };
 use objc2_application_services::{AXError, AXObserver, AXUIElement};
 use objc2_core_foundation::{
@@ -75,6 +76,12 @@ struct EventInvalidation {
 }
 
 impl EventInvalidation {
+    /// An application was hidden or unhidden: its windows left or rejoined the
+    /// screen, so the next tick observes at once.
+    fn app_visibility_changed(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
     fn take_dirty(&self, last_title_refresh: &Cell<Option<Instant>>, now: Instant) -> bool {
         let dirty = self.dirty.swap(false, Ordering::AcqRel);
         let titles = !dirty
@@ -207,9 +214,10 @@ fn title_refresh_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= TITLE_REFRESH_INTERVAL)
 }
 
-/// Subscribes to application activation, launch, and termination. `NSWorkspace`
-/// posts these on the main thread; each block only sets a flag and, for launch
-/// and termination, wakes the AX thread to re-read the running applications.
+/// Subscribes to application activation, hiding, launch, and termination.
+/// `NSWorkspace` posts these on the main thread; each block only sets a flag
+/// and, for launch and termination, wakes the AX thread to re-read the running
+/// applications.
 fn observe_workspace(
     invalidation: &Arc<EventInvalidation>,
     waker: &Arc<Waker>,
@@ -228,12 +236,38 @@ fn observe_workspace(
         let activate = RcBlock::new(move |_: NonNull<NSNotification>| {
             activated.frontmost_changed.store(true, Ordering::Release);
         });
-        let mut observers = Vec::with_capacity(3);
+        let mut observers = Vec::with_capacity(6);
         // SAFETY: AppKit's notification name constants are immutable statics.
         observers.push(observe(
             unsafe { NSWorkspaceDidActivateApplicationNotification },
             activate,
         ));
+        // A Space slide shows both Spaces' windows at once; the worker holds
+        // layout until it settles (#334, #329).
+        let space_changed = RcBlock::new(|_: NonNull<NSNotification>| {
+            super::spaces::note_active_space_change();
+        });
+        // SAFETY: Same as above.
+        observers.push(observe(
+            unsafe { NSWorkspaceActiveSpaceDidChangeNotification },
+            space_changed,
+        ));
+        // ⌘H posts no window notification (unlike ⌘M's `AXWindowMiniaturized`), so without
+        // these the siblings waited for the fallback refresh before re-filling the hole.
+        // SAFETY: Same as above.
+        let visibility = unsafe {
+            [
+                NSWorkspaceDidHideApplicationNotification,
+                NSWorkspaceDidUnhideApplicationNotification,
+            ]
+        };
+        for name in visibility {
+            let invalidation = Arc::clone(invalidation);
+            let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+                invalidation.app_visibility_changed();
+            });
+            observers.push(observe(name, block));
+        }
         // SAFETY: Same as above.
         let lifecycle = unsafe {
             [
@@ -746,6 +780,18 @@ mod schedule_tests {
         let soon = due + Duration::from_millis(1);
         assert!(invalidation.take_dirty(&last, soon));
         assert!(!invalidation.take_dirty(&last, soon + TITLE_REFRESH_INTERVAL));
+    }
+
+    #[test]
+    fn hiding_an_app_refreshes_on_the_next_tick() {
+        let invalidation = EventInvalidation::default();
+        let last = Cell::new(None);
+        let now = Instant::now();
+        assert!(!invalidation.take_dirty(&last, now));
+        invalidation.app_visibility_changed();
+        // Not held back like a title change: the next tick refreshes.
+        assert!(invalidation.take_dirty(&last, now + Duration::from_millis(1)));
+        assert!(!invalidation.take_dirty(&last, now + Duration::from_millis(2)));
     }
 
     #[test]

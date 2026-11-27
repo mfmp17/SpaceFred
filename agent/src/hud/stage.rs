@@ -2,7 +2,7 @@
 //! same flow and view as the live overlay, so their motion can be tried without switching a
 //! real workspace.
 
-use rune::{El, Play, Playground, col, el};
+use rune::{Cursor, El, Play, Playground, col, el};
 use spaceman::{
     Rect, WorkspaceId,
     app::{UiHudDisplay, UiHudTile, UiHudWorkspace},
@@ -71,6 +71,11 @@ impl HudPreview {
         preview
     }
 
+    /// The demo desktop for Settings' Customize sheet, on its first workspace.
+    pub(crate) fn sample() -> Self {
+        Self::showing(1, demo())
+    }
+
     /// The row the runtime would send: every occupied workspace and the visible one.
     fn row(&self, from: Option<u8>) -> UiHudDisplay {
         UiHudDisplay {
@@ -85,6 +90,7 @@ impl HudPreview {
                 .filter_map(|(workspace, number)| hud_workspace(number, workspace))
                 .collect(),
             order: Vec::new(),
+            portrait: false,
         }
     }
 
@@ -211,6 +217,99 @@ pub fn stage(preview: &HudPreview, p: Paint, reduce_motion: bool) -> El {
         .padding(32.0)
         .center()
         .child(mock)
+}
+
+/// From the miniature's edge to the capsule resting on it.
+const MINIATURE_EDGE: f32 = 16.0;
+/// Around and between the miniature's windows: half on the display, half on each window.
+const MINIATURE_GAP: f32 = 2.0;
+
+/// The Customize sheet's miniature: a display `size` big showing the demo workspace's windows
+/// and the real capsule at full size, in `style`, resting `MINIATURE_EDGE` from the edge
+/// `position` names. It is also the control: pressing its top or bottom half moves the capsule
+/// there, on the row's own spring.
+pub fn miniature(
+    preview: &HudPreview,
+    position: HudPosition,
+    style: HudStyle,
+    (width, height): (f32, f32),
+    p: Paint,
+    reduce_motion: bool,
+) -> El {
+    preview.flow.mark_drawn();
+    let view = preview.flow.view(reduce_motion);
+    let mut display = el()
+        .key("hud-miniature")
+        .role("group")
+        .label("Workspace HUD preview")
+        .size(width, height)
+        .radius(p.k.radius.lg)
+        .clip_rounded(p.k.radius.lg)
+        .fill(p.k.c.bg_deep)
+        .border(p.hair, p.k.c.border_weak);
+    let visible = view.as_ref().and_then(|view| {
+        let visible = view.row.visible?;
+        view.row
+            .workspaces
+            .iter()
+            .find(|entry| entry.workspace == visible)
+    });
+    for tile in visible.map_or(&[][..], |entry| &entry.tiles[..]) {
+        let (x, y, w, h) = grow::scale_tile(
+            tile.rect,
+            MINIATURE_GAP,
+            width - 2.0 * MINIATURE_GAP,
+            height - 2.0 * MINIATURE_GAP,
+            MINIATURE_GAP,
+            12.0,
+        );
+        // Windows sit 4 pt inside the display's 8 pt corner, so theirs is 4.
+        display = display.child(
+            el().key(format!("window{}", tile.key))
+                .absolute(x, y)
+                .size(w, h)
+                .radius(p.k.radius.sm)
+                .fill(p.k.c.layer_01)
+                .border(p.hair, p.k.c.border_weak)
+                .a11y_hidden(),
+        );
+    }
+    let half = |key: &str, label: &str, top: bool, to: HudPosition| {
+        el().key(key)
+            .role("button")
+            .label(label)
+            .pin(
+                Some(0.0),
+                top.then_some(0.0),
+                Some(0.0),
+                (!top).then_some(0.0),
+            )
+            .h(height / 2.0)
+            .cursor(Cursor::Pointer)
+            .on_press(move |ui: &mut Ui| ui.set_hud_position(to))
+    };
+    let rest = match position {
+        HudPosition::Bottom => height - MINIATURE_EDGE - pill::PILL_HEIGHT,
+        HudPosition::Top => MINIATURE_EDGE,
+    };
+    display
+        .child(half("show-top", "Show at the top", true, HudPosition::Top))
+        .child(half(
+            "show-bottom",
+            "Show at the bottom",
+            false,
+            HudPosition::Bottom,
+        ))
+        .child(
+            el().key("capsule")
+                .absolute(0.0, rest)
+                .w(width)
+                .motion(pill::ROW)
+                .children(
+                    view.as_ref()
+                        .map(|view| pill::slot(view, position, style, &preview.icons, width, p)),
+                ),
+        )
 }
 
 fn stage_window(key: u64, (x, y, w, h): (f32, f32, f32, f32), p: Paint) -> El {

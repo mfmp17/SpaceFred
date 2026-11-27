@@ -3,8 +3,16 @@ use super::*;
 /// Size difference, in points, below which a constrained readback is noise.
 const MINIMUM_TOLERANCE: i32 = 2;
 /// Refitting can shrink a sibling below a minimum nobody knew yet, which the
-/// next write reveals. A few rounds settle that; a bound keeps it finite.
-const MAX_REFITS: usize = 3;
+/// next write reveals. Each round learns at least one window's minimum, so a
+/// row settles within one round per tile; a bound keeps it finite (#413).
+const MIN_REFITS: usize = 3;
+
+/// Maximum minimum-learning rounds for a workspace with `tiles` bound windows:
+/// each round learns at least one window's minimum, so a row settles within one
+/// round per tile (#413, #492).
+pub(super) fn learning_rounds(tiles: usize) -> usize {
+    MIN_REFITS.max(tiles + 1)
+}
 
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// Refit and re-apply while writes keep revealing refused sizes. Returns
@@ -18,13 +26,27 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     ) -> Option<LayoutStatus> {
         let mut results = results;
         let mut status = None;
-        for _ in 0..MAX_REFITS {
+        let tiles = self.workspaces.engine(workspace).bound_windows().len();
+        let was_exact = self.exact_spacing_workspaces.contains(&workspace);
+        let mut deferred = false;
+        for _ in 0..learning_rounds(tiles) {
             if !self.fit_minimum_sizes(workspace, output, &results) {
                 break;
             }
+            // A refit moves seams by a point or two, so a tile an earlier
+            // round already wrote can sit inside the write tolerance of its
+            // new target while its neighbor moves: write the refit exactly so
+            // seams meet (#629).
+            self.exact_spacing_workspaces.insert(workspace);
             let (applied, next) = self.apply_layout(workspace, output, None, cancelled);
+            deferred = next
+                .iter()
+                .any(|result| matches!(result.outcome, macos::ApplyOutcome::Deferred));
             status = Some(applied);
             results = next;
+        }
+        if !was_exact && !deferred {
+            self.exact_spacing_workspaces.remove(&workspace);
         }
         status
     }
@@ -39,7 +61,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         output: crate::Rect,
         results: &[macos::ApplyResult],
     ) -> bool {
-        if self.workspaces.uses_fullscreen_layout(workspace) {
+        if self.workspaces.deck(workspace).is_monocle() {
             return false;
         }
         let mut refused = false;

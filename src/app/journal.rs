@@ -16,6 +16,28 @@ const JOURNAL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// size in character cells) before they count as misplaced.
 const MISPLACED_TOLERANCE: i32 = 16;
 
+/// What the screen held when the user marked it wrong, read on the main thread
+/// as the mark is accepted: the worker may still be busy with a switch, and by
+/// the time it gets to the mark the screen has settled into something else.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WrongMoment {
+    pub(super) t: u64,
+    pub(super) active: Vec<WorkspaceId>,
+    pub(super) frames: HashMap<u32, crate::Rect>,
+}
+
+impl WrongMoment {
+    /// One window-server list copy (Core Graphics, not Accessibility), or
+    /// `None` when the window server didn't answer.
+    pub(super) fn capture(active: &[WorkspaceId]) -> Option<Box<Self>> {
+        Some(Box::new(Self {
+            t: crate::journal::unix_millis(),
+            active: active.to_vec(),
+            frames: macos::window_server_frames()?,
+        }))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct JournalState {
     last_written: Option<Arrangement>,
@@ -73,28 +95,58 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         });
     }
 
-    /// The user noticed something wrong. Mark the moment and force a full
-    /// snapshot on the next arrangement check, which follows every action.
-    pub(super) fn mark_wrong(&mut self) {
+    /// The user noticed something wrong. Mark the moment with a full snapshot
+    /// of what the screen held when the mark was accepted, even if a busy
+    /// switch settled since (#715); the arrangement check that follows every
+    /// action then journals what changed after it. Without a captured moment,
+    /// force a full snapshot on that check instead.
+    pub(super) fn mark_wrong(
+        &mut self,
+        moment: Option<Box<WrongMoment>>,
+        outputs: &macos::DisplayOutputs,
+    ) {
         log_event!("marked arrangement wrong");
-        self.journal_event(JournalEvent::MarkedWrong);
         self.journal.last_check = None;
-        self.journal.last_snapshot = None;
+        let Some(moment) = moment else {
+            self.journal_event(JournalEvent::MarkedWrong);
+            self.journal.last_snapshot = None;
+            return;
+        };
+        let WrongMoment { t, active, frames } = *moment;
+        self.backend.journal(&JournalLine {
+            t,
+            event: JournalEvent::MarkedWrong,
+        });
+        let arrangement = Arrangement {
+            displays: outputs.frames().collect(),
+            active,
+            windows: self
+                .arranged_windows(&frames)
+                .into_iter()
+                .map(|(_, window)| window)
+                .collect(),
+        };
+        self.backend.journal(&JournalLine {
+            t,
+            event: JournalEvent::Snapshot {
+                arrangement: arrangement.clone(),
+            },
+        });
+        self.journal.last_snapshot = Some(self.backend.now());
+        self.journal.last_written = Some(arrangement);
     }
 
     /// Compare the model with the window server and journal what changed.
     pub(super) fn check_arrangement(&mut self, outputs: &macos::DisplayOutputs) {
-        if self
-            .journal
-            .last_check
-            .is_some_and(|checked| checked.elapsed() < JOURNAL_CHECK_INTERVAL)
-        {
+        if self.journal.last_check.is_some_and(|checked| {
+            self.backend.now().saturating_duration_since(checked) < JOURNAL_CHECK_INTERVAL
+        }) {
             return;
         }
         let Some(server_frames) = self.backend.window_server_frames() else {
             return;
         };
-        let now = Instant::now();
+        let now = self.backend.now();
         self.journal.last_check = Some(now);
         let visible = self.visible_workspaces(outputs);
         let windows = self.arranged_windows(&server_frames);
@@ -104,10 +156,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             active: visible.iter().map(|resolved| resolved.workspace).collect(),
             windows: windows.into_iter().map(|(_, window)| window).collect(),
         };
-        let snapshot_due = self
-            .journal
-            .last_snapshot
-            .is_none_or(|written| written.elapsed() >= JOURNAL_SNAPSHOT_INTERVAL);
+        let snapshot_due = self.journal.last_snapshot.is_none_or(|written| {
+            now.saturating_duration_since(written) >= JOURNAL_SNAPSHOT_INTERVAL
+        });
         let event = match &self.journal.last_written {
             Some(previous) if !snapshot_due => crate::journal::diff(previous, &arrangement),
             _ => {
@@ -164,9 +215,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     if !server_frames.contains_key(&window.id.window_id) {
                         continue;
                     }
-                    let role = if self.config.disposition(&app.bundle_id, window)
-                        == WindowDisposition::Ignored
-                    {
+                    let role = if self.config.patch(&app.bundle_id, window).is_ignored() {
                         WindowRole::Ignored
                     } else {
                         WindowRole::Unowned
@@ -203,7 +252,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             });
         };
         for (id, arranged) in windows {
-            let exempt = self.parking_exempt.contains(id);
+            let exempt = self.parked.is_exempt(id);
             if exempt {
                 report(AnomalyKind::ParkingExempt, arranged, None);
             }
@@ -243,7 +292,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 continue;
             };
             if self.constrained[tile.workspace.index()].contains_key(&tile.window) {
-                if !self.workspaces.uses_fullscreen_layout(tile.workspace)
+                if !self.workspaces.deck(tile.workspace).is_monocle()
                     && let Some((_, arranged)) = windows.iter().find(|(id, _)| id == &tile.window)
                     && windows.iter().any(|(other, entry)| {
                         other != &tile.window

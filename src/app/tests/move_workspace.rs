@@ -157,7 +157,7 @@ fn option_tab_after_moving_the_focused_workspace_never_reveals_the_displaced_one
         Some(WorkspaceId::THREE)
     );
     assert_eq!(runtime.backend.focused, Some(c.clone()));
-    assert_eq!(runtime.previous_focused_workspace, Some(WorkspaceId::TWO));
+    assert_eq!(runtime.focus.history().previous, Some(WorkspaceId::TWO));
 
     // Option+Tab focuses B on Main and leaves C on screen: empty workspace 9
     // never appears and nothing is parked.
@@ -317,14 +317,14 @@ fn move_workspace_preserves_fullscreen_layout_and_focused_tile() {
     bind(&mut runtime, WorkspaceId::ONE, &second);
     runtime
         .workspaces
-        .set_fullscreen_layout(WorkspaceId::ONE, true);
+        .set_deck(WorkspaceId::ONE, crate::workspace::DeckMode::Monocle);
 
     runtime
         .move_workspace_to_display(DisplayTarget::Next, outputs(), &AtomicBool::new(false))
         .unwrap();
 
     let secondary_frame = outputs().secondary().unwrap().frame;
-    assert!(runtime.workspaces.uses_fullscreen_layout(WorkspaceId::ONE));
+    assert!(runtime.workspaces.deck(WorkspaceId::ONE).is_monocle());
     assert_eq!(runtime.backend.frames[&first], secondary_frame);
     assert_eq!(runtime.backend.frames[&second], secondary_frame);
     assert_eq!(runtime.backend.focused, Some(second));
@@ -403,10 +403,9 @@ fn move_workspace_replaces_unplugged_assignment_and_rolls_back_on_error() {
     let nine = WorkspaceId::new(9).unwrap();
     bind(&mut runtime, WorkspaceId::ONE, &w1);
     bind(&mut runtime, nine, &w9);
-    runtime.foreground_lanes.insert(
-        "main-id".into(),
-        DisplaySelector::Preferred("unplugged-id".into()),
-    );
+    runtime
+        .workspaces
+        .bring_forward("main-id", DisplaySelector::Preferred("unplugged-id".into()));
     let cancelled = AtomicBool::new(false);
 
     runtime
@@ -499,12 +498,13 @@ fn cycle_records_a_click_on_another_display_for_option_tab() {
     runtime
         .switch(WorkspaceId::SIX, outputs(), &cancelled)
         .unwrap();
-    // Click workspace 1's other window on Main. No switch happens; the cycle
-    // only watches the focus move.
+    // Click workspace 1's other window on Main, after the switch's focus request has settled:
+    // while one is in flight a sibling taking focus is the app's doing and is reclaimed (#591).
+    runtime.backend.advance(Duration::from_millis(300));
     runtime.backend.focused = Some(clicked.clone());
     runtime.cycle(outputs(), &cancelled).unwrap();
-    assert_eq!(runtime.last_focused_workspace, Some(WorkspaceId::ONE));
-    assert_eq!(runtime.previous_focused_workspace, Some(WorkspaceId::SIX));
+    assert_eq!(runtime.focus.history().current, Some(WorkspaceId::ONE));
+    assert_eq!(runtime.focus.history().previous, Some(WorkspaceId::SIX));
 
     runtime
         .workspace_back_and_forth(outputs(), &cancelled)
@@ -522,7 +522,7 @@ fn cycle_records_a_click_on_another_display_for_option_tab() {
     runtime
         .workspace_back_and_forth(outputs(), &cancelled)
         .unwrap();
-    assert_eq!(runtime.backend.focused, Some(first));
+    assert_eq!(runtime.backend.focused, Some(clicked));
 }
 
 #[test]
@@ -551,7 +551,7 @@ fn workspace_back_and_forth_switches_a_hidden_workspace_on_another_display() {
     runtime
         .workspaces
         .move_to_display(WorkspaceId::THREE, DisplaySelector::Secondary, None);
-    assert_eq!(runtime.previous_focused_workspace, Some(WorkspaceId::SIX));
+    assert_eq!(runtime.focus.history().previous, Some(WorkspaceId::SIX));
 
     runtime
         .workspace_back_and_forth(outputs(), &cancelled)
@@ -562,4 +562,65 @@ fn workspace_back_and_forth_switches_a_hidden_workspace_on_another_display() {
         Some(WorkspaceId::SIX)
     );
     assert_eq!(runtime.backend.focused, Some(six));
+}
+
+#[test]
+fn move_workspace_leaves_a_replacement_tile_minimized_while_away_alone() {
+    let moved = window(10);
+    let minimized = window(20);
+    let kept = window(21);
+    let (minimized_normal, kept_normal) = (frame(100), frame(600));
+    let mut backend = FakeBackend {
+        focused: Some(moved.clone()),
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(moved.clone(), frame(50));
+    backend
+        .frames
+        .insert(minimized.clone(), main_parked_frame(minimized_normal));
+    backend
+        .frames
+        .insert(kept.clone(), main_parked_frame(kept_normal));
+    let mut runtime = runtime_with_parked(
+        backend,
+        [
+            (minimized.clone(), minimized_normal),
+            (kept.clone(), kept_normal),
+        ],
+    );
+    bind(&mut runtime, WorkspaceId::ONE, &moved);
+    bind(&mut runtime, WorkspaceId::THREE, &minimized);
+    bind(&mut runtime, WorkspaceId::THREE, &kept);
+    runtime
+        .workspaces
+        .set_deck(WorkspaceId::THREE, crate::workspace::DeckMode::Monocle);
+    runtime
+        .workspaces
+        .remember_focus(WorkspaceId::THREE, &minimized);
+    runtime.workspaces.switch(WorkspaceId::THREE);
+    runtime.workspaces.switch(WorkspaceId::ONE);
+
+    // Minimized from the Dock while workspace 3 is away.
+    runtime.backend.set_aside.insert(minimized.clone());
+    runtime.backend.ordered_out.insert(minimized.window_id);
+    runtime
+        .move_workspace_to_display(DisplayTarget::Next, outputs(), &AtomicBool::new(false))
+        .unwrap();
+
+    assert_eq!(
+        runtime.workspaces.active_for(&DisplaySelector::Main),
+        Some(WorkspaceId::THREE)
+    );
+    assert!(!runtime.parked.contains_key(&minimized));
+    assert_eq!(runtime.workspaces.workspace_of(&minimized), None);
+    assert_eq!(
+        runtime.workspaces.workspace_of(&kept),
+        Some(WorkspaceId::THREE)
+    );
+    assert_eq!(runtime.backend.frames[&kept], outputs().main().frame);
+    assert!(runtime.backend.calls.iter().all(|call| !matches!(
+        call,
+        BackendCall::Focus(window) | BackendCall::Raise(window) | BackendCall::Apply(window, _)
+            if window == &minimized
+    )));
 }

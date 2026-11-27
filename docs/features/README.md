@@ -13,12 +13,13 @@ docs/features/
 ├── tiling.md               // split layouts: focus, reorder, drag, resize, balance, axis
 ├── fullscreen-layout.md    // workspace-wide stacked "every window fills the display" mode
 ├── scratchpad.md           // Lab: windows hidden off-screen until summoned
+├── setup-tour.md           // first run: permission, the suggested arrangement, Try it
 └── restarts-and-recovery.md // what survives restarts/relaunches/reboots, restoration, doctor
 ```
 
 ## Availability 📦
 
-Baseline: `dev` at 0.3.2 (`93897a4`). Everything below except named workspaces and
+Baseline: `dev` at 0.3.5 (`0d1b39f`). Everything below except named workspaces and
 secondary-display workspaces ships in the notarized preview at
 <https://anoma.ly/spaceman/download/macos-arm64> and in source builds.
 
@@ -26,10 +27,25 @@ secondary-display workspaces ships in the notarized preview at
 | --- | --- |
 | Workspaces, tiling, Fullscreen Layout, parking/restoration | Preview artifact and source builds |
 | Parking exemption, remembered placements (`window-memory.json`), arrangement journal, `spaceman doctor` | Preview artifact and source builds |
-| Single-process Rune Settings (`Activity`), three-step setup tour, non-activating Workspace HUD (`[settings] hud`) | Preview artifact and source builds |
+| Settings › Labs | One off-by-default switch per `[labs]` feature, written to `config.toml`; `spaceman://labs/<slug>` highlights a row. Covered by `agent/src/panes/labs.rs` and `agent/src/panes/tests.rs` |
+| Single-process Rune Settings, four-step [setup tour](setup-tour.md), non-activating Workspace HUD (`[settings] hud`), dimmed paused menu bar glyph & `[settings] pause_on_builtin_display` auto-pause/resume with transient HUD toast | Preview artifact and source builds |
 | Named workspaces A-Z | Opt-in: enabled by a `route` rule or `[[workspaces]]` entry |
 | Custom shortcuts (`[shortcuts]`) | Preview artifact and source builds; rebind, unbind, or replace the built-in keys in `config.toml` or by recording a chord in Settings › Shortcuts, with a base `modifier` for the built-ins, applied live without a restart. Switch to space 1–10 defaults to Control+number (not Option+number) while the base is Option, and each one is its own recorder under Settings › Shortcuts › Switching, including clear and Reset to Defaults. An enabled Mission Control shortcut on the same chord is left for macOS. Covered by unit tests in `src/shortcuts.rs`, `src/hotkeys.rs`, `src/config.rs`, `src/app/app_loop/live_shortcuts.rs`, `agent/src/rules/shortcuts/tests.rs`, and `agent/src/panes/shortcuts/`; no live harness exercises a rebound chord or live re-registration yet |
 | Scratchpad (`[labs] scratchpad`) | Opt-in Lab in source builds; off by default, shortcuts register only when on |
+| Empty workspace focus (`[labs] empty_workspace_focus`, Settings › Labs › Workspaces › `Focus empty workspaces on other displays`) | Opt-in Lab in source builds; off by default, an empty workspace chosen on another display is the focused one for commands until another window takes focus ([Workspaces](workspaces.md)) |
+| Dragged floats join their display's workspace (`[labs] float_follows_display`) | Opt-in Lab in source builds; off by default, switched in Settings › Labs › Windows. Covered by `src/app/tests/three_display.rs` |
+| Settings › Activity (`[labs] activity`) | Opt-in Lab in source builds; off by default, the pane stays out of the sidebar while `spaceman doctor` and the journal keep recording |
+| Portrait edge rows (`[labs] portrait_edge_rows`) | Opt-in Lab in source builds; off by default, top/bottom display edge drop bands on portrait displays only when on |
+| Physical display order and shape (`[labs] physical_displays`) | Opt-in Lab in source builds; off by default, switched in Settings › Labs › Menu bar & HUD. Menu-bar glyphs and menu sections left to right, portrait glyphs and HUD Layouts previews tall, same-named displays labelled by position. Covered by `src/app/tests/physical_displays.rs`, `src/macos/displays.rs` and `src/status_item.rs` unit tests; no live harness checks the drawn glyphs |
+| Recent focus (`[labs] recent_focus`) | Opt-in Lab, switched in Settings › Labs or `config.toml`; off by default, `Option+H/J/K/L` picks the most recently focused of several bordering tiles |
+| Swipe switch (`[labs] swipe_switch`) | Opt-in Lab; off by default, switched in Settings › Labs › Workspaces. With it on, `[settings] trackpad_swipe = false` (or Settings › Shortcuts › Swipe to switch workspace) stops the three-finger swipe; with it off the setting is ignored |
+| Single-window height (`[labs] single_window_height`) | Opt-in Lab; off by default, switched in Settings › Labs › Windows. With it on, `[settings] single_window_max_height` (or Settings › Layout › Wide displays › Single-window height) centers a lone tile, and Fullscreen Layout, at that height on a taller display; with it off the key is ignored. Covered by `src/spacing/tests.rs`, `src/config.rs` and `src/cli/tests.rs`; no live harness |
+| Menu bar icon style (`[labs] menu_bar_icon_style`) | Opt-in Lab; off by default, switched in Settings › Labs › Menu bar & HUD. With it on, `[settings] menu_bar_icon` (or Settings › General › Menu bar icon) picks `full`, `compact` (one glyph, the focused workspace's) or `off` (no status item; relaunching Spaceman opens Settings); with it off the key is ignored and the icon is shown in full. Covered by `src/app/tests/physical_displays.rs`, `src/config.rs`, `src/cli/tests/labs.rs` and `agent/src/panes/general.rs`; no live harness checks the hidden status item |
+| Route every window (`[labs] route_all_windows`) | Opt-in Lab; off by default, switched in Settings › Labs › Windows. With it on, a `route` rule with `windows = "all"` routes every new window of its app, not only the first; with it off the key is ignored. `spaceman rules add --workspace <ws> --windows all` writes it. Covered by `src/app/tests/rules.rs`, `src/app/tests/reported/route_after_manual_float.rs` (issue 551), `src/app/tests/reported/route_after_rule_float.rs` (issue 664), `src/config.rs`, `src/cli/tests/labs.rs` and `agent/src/rules/filters_tests.rs`; no live harness |
+| Focus follows mouse (`[labs] focus_follows_mouse`) | Opt-in Lab; off by default, switched in Settings › Labs › Windows. With it on, the visible tile the pointer moves to and rests on for about 150 ms takes focus, without moving the pointer; floats, the Scratchpad, menus, the menu bar, the Dock, the HUD and Settings never do, and nothing changes while a button is held. Covered by `src/app/tests/focus_follows_mouse.rs`, `src/app/app_loop/hover.rs` and `src/macos/tests.rs`; no live harness |
+| Window overlay (`[labs] window_overlay`) | Opt-in Lab; off by default, switched in Settings › Labs › Windows. With it on and tiling on, holding the base modifier and Shift (`Option+Shift`) alone for 180 ms shows a card over every visible window with Float/Tile, Pin, Fullscreen Layout, swap and send-to-workspace buttons that act on that window without focusing it; any key or hotkey hides it until the keys are let go. Covered by `src/window_overlay.rs`, `src/app/tests/window_overlay.rs`, `agent/src/window_overlay/place.rs` and `agent/src/window_overlay/card.rs`; no live harness ([Workspaces](workspaces.md)) |
+| Four-finger swipe (`[labs] four_finger_swipe`) | Opt-in Lab; off by default, switched in Settings › Labs › Workspaces. With it on, the workspace swipe takes four fingers and three-finger swipes are left to macOS (for Accessibility "Three Finger Drag"). Covered by `src/swipe.rs` and `src/app/tests/workspace_order.rs`; no live harness |
+| Workspace steps (`[labs] workspace_steps`) | Opt-in Lab in source builds; off by default. `switch next\|prev` and `move next\|prev [--follow]` in `spaceman ctl` and `[shortcuts.bindings]` (no built-in chord), listed in Settings › Shortcuts while on; bindings are skipped while off. Covered by `src/app/tests/workspace_steps.rs`, `src/workspace/tests.rs`, `src/hotkeys.rs`, `src/shortcuts.rs`, `src/control.rs`; no live harness yet |
 | Secondary-display workspaces 6-10 | Require a second display; with one display they fall back to `main` |
 | Three or more displays | Assign workspaces in Settings › Workspaces (each display past `secondary` by UUID) or with `[[workspaces]] monitor = "<uuid>"` |
 

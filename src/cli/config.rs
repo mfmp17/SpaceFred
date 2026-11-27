@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use spaceman::{
-    config::{HudPosition, HudStyle, MouseFollowsFocus, UpdateChannel, load_path},
+    config::{
+        HudPosition, HudStyle, LabFeature, LayoutMode, MenuBarIcon, MouseFollowsFocus,
+        UpdateChannel, load_path,
+    },
     spacing::{self, SpacingKey},
 };
 
@@ -55,8 +58,12 @@ enum SettingKey {
     Hud,
     HudStyle,
     HudPosition,
+    Layout,
     UpdateChannel,
     MouseFollowsFocus,
+    TrackpadSwipe,
+    MenuBarIcon,
+    PauseOnBuiltinDisplay,
     Outer,
     Spacing(SpacingKey),
 }
@@ -67,14 +74,19 @@ impl SettingKey {
             "hud" => Ok(Self::Hud),
             "hud_style" => Ok(Self::HudStyle),
             "hud_position" => Ok(Self::HudPosition),
+            "layout" => Ok(Self::Layout),
             "update_channel" => Ok(Self::UpdateChannel),
             "mouse_follows_focus" => Ok(Self::MouseFollowsFocus),
+            "trackpad_swipe" => Ok(Self::TrackpadSwipe),
+            "menu_bar_icon" => Ok(Self::MenuBarIcon),
+            "pause_on_builtin_display" => Ok(Self::PauseOnBuiltinDisplay),
             spacing::OUTER => Ok(Self::Outer),
             other => SpacingKey::parse(other).map(Self::Spacing).ok_or_else(|| {
                 format!(
-                    "unknown setting {raw:?}; valid keys: hud, hud_style, hud_position, \
-                     update_channel, mouse_follows_focus, gaps.inner, gaps.outer, gaps.top, \
-                     gaps.bottom, gaps.left, gaps.right, single_window_max_width"
+                    "unknown setting {raw:?}; valid keys: hud, hud_style, hud_position, layout, \
+                     update_channel, mouse_follows_focus, trackpad_swipe, menu_bar_icon, \
+                     pause_on_builtin_display, gaps.inner, gaps.outer, gaps.top, gaps.bottom, \
+                     gaps.left, gaps.right, single_window_max_width, single_window_max_height"
                 )
             }),
         }
@@ -85,8 +97,12 @@ impl SettingKey {
             Self::Hud => "hud",
             Self::HudStyle => "hud_style",
             Self::HudPosition => "hud_position",
+            Self::Layout => "layout",
             Self::UpdateChannel => "update_channel",
             Self::MouseFollowsFocus => "mouse_follows_focus",
+            Self::TrackpadSwipe => "trackpad_swipe",
+            Self::MenuBarIcon => "menu_bar_icon",
+            Self::PauseOnBuiltinDisplay => "pause_on_builtin_display",
             Self::Outer => spacing::OUTER,
             Self::Spacing(key) => key.path(),
         }
@@ -113,6 +129,13 @@ impl SettingKey {
                     serde_json::Value::String(position.to_owned()),
                 )
             }
+            Self::Layout => {
+                let layout = settings.effective_layout().as_str();
+                (
+                    layout.to_owned(),
+                    serde_json::Value::String(layout.to_owned()),
+                )
+            }
             Self::UpdateChannel => {
                 let channel = settings.effective_update_channel().as_str();
                 (
@@ -123,6 +146,18 @@ impl SettingKey {
             Self::MouseFollowsFocus => {
                 let mode = settings.effective_mouse_follows_focus().as_str();
                 (mode.to_owned(), serde_json::Value::String(mode.to_owned()))
+            }
+            Self::TrackpadSwipe => {
+                let on = settings.effective_trackpad_swipe();
+                (on.to_string(), serde_json::Value::Bool(on))
+            }
+            Self::MenuBarIcon => {
+                let icon = settings.effective_menu_bar_icon().as_str();
+                (icon.to_owned(), serde_json::Value::String(icon.to_owned()))
+            }
+            Self::PauseOnBuiltinDisplay => {
+                let on = settings.effective_pause_on_builtin_display();
+                (on.to_string(), serde_json::Value::Bool(on))
             }
             Self::Outer => {
                 let value = settings.effective_outer();
@@ -141,8 +176,12 @@ impl SettingKey {
             Self::Hud => settings.hud.is_some(),
             Self::HudStyle => settings.hud_style.is_some(),
             Self::HudPosition => settings.hud_position.is_some(),
+            Self::Layout => settings.layout.is_some(),
             Self::UpdateChannel => settings.update_channel.is_some(),
             Self::MouseFollowsFocus => settings.mouse_follows_focus.is_some(),
+            Self::TrackpadSwipe => settings.trackpad_swipe.is_some(),
+            Self::MenuBarIcon => settings.menu_bar_icon.is_some(),
+            Self::PauseOnBuiltinDisplay => settings.pause_on_builtin_display.is_some(),
             Self::Outer => settings.gaps.outer.is_some(),
             Self::Spacing(key) => settings.has_spacing(key),
         }
@@ -154,10 +193,69 @@ impl SettingKey {
             Self::Hud => settings.hud = None,
             Self::HudStyle => settings.hud_style = None,
             Self::HudPosition => settings.hud_position = None,
+            Self::Layout => settings.layout = None,
             Self::UpdateChannel => settings.update_channel = None,
             Self::MouseFollowsFocus => settings.mouse_follows_focus = None,
+            Self::TrackpadSwipe => settings.trackpad_swipe = None,
+            Self::MenuBarIcon => settings.menu_bar_icon = None,
+            Self::PauseOnBuiltinDisplay => settings.pause_on_builtin_display = None,
             Self::Outer => settings.gaps.outer = None,
             Self::Spacing(key) => settings.clear_spacing(key),
+        }
+    }
+}
+
+/// A `config.toml` key the CLI can read and write: a `[settings]` key or a `[labs]` switch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Key {
+    Setting(SettingKey),
+    Lab(LabFeature),
+}
+
+impl Key {
+    fn parse(raw: &str) -> Result<Self, String> {
+        if let Some(lab) = raw.strip_prefix("labs.") {
+            return LabFeature::parse(lab).map(Self::Lab).ok_or_else(|| {
+                let valid = LabFeature::ALL
+                    .iter()
+                    .map(|feature| format!("labs.{}", feature.key()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("unknown Lab {raw:?}; valid Labs: {valid}")
+            });
+        }
+        SettingKey::parse(raw).map(Self::Setting)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Setting(key) => key.as_str(),
+            Self::Lab(LabFeature::Scratchpad) => "labs.scratchpad",
+            Self::Lab(LabFeature::Activity) => "labs.activity",
+            Self::Lab(LabFeature::PortraitEdgeRows) => "labs.portrait_edge_rows",
+            Self::Lab(LabFeature::PhysicalDisplays) => "labs.physical_displays",
+            Self::Lab(LabFeature::RecentFocus) => "labs.recent_focus",
+            Self::Lab(LabFeature::SwipeSwitch) => "labs.swipe_switch",
+            Self::Lab(LabFeature::EmptyWorkspaceFocus) => "labs.empty_workspace_focus",
+            Self::Lab(LabFeature::FloatFollowsDisplay) => "labs.float_follows_display",
+            Self::Lab(LabFeature::WorkspaceSteps) => "labs.workspace_steps",
+            Self::Lab(LabFeature::FourFingerSwipe) => "labs.four_finger_swipe",
+            Self::Lab(LabFeature::SingleWindowHeight) => "labs.single_window_height",
+            Self::Lab(LabFeature::RouteAllWindows) => "labs.route_all_windows",
+            Self::Lab(LabFeature::MenuBarIconStyle) => "labs.menu_bar_icon_style",
+            Self::Lab(LabFeature::FocusFollowsMouse) => "labs.focus_follows_mouse",
+            Self::Lab(LabFeature::WindowOverlay) => "labs.window_overlay",
+        }
+    }
+
+    /// What the file asks for, every unset key at its default, as text and as JSON.
+    fn read(self, doc: &ConfigDoc) -> (String, serde_json::Value) {
+        match self {
+            Self::Setting(key) => key.read(&doc.settings),
+            Self::Lab(feature) => {
+                let on = doc.labs.is_some_and(|labs| labs.enabled(feature));
+                (on.to_string(), serde_json::Value::Bool(on))
+            }
         }
     }
 }
@@ -259,10 +357,10 @@ fn run_get(args: &[&str], path_override: Option<&Path>) -> Result<String, String
     let [raw_key] = positional.as_slice() else {
         return Err("usage: spaceman config get <key> [--json]".into());
     };
-    let key = SettingKey::parse(raw_key)?;
+    let key = Key::parse(raw_key)?;
     let path = resolve_config_path(path_override)?;
     let (doc, _) = ConfigDoc::load_or_default(&path)?;
-    let (text, value) = key.read(&doc.settings);
+    let (text, value) = key.read(&doc);
     if json {
         to_json_pretty(&SettingOutput {
             path: None,
@@ -278,10 +376,15 @@ enum SettingValue {
     Hud(bool),
     HudStyle(HudStyle),
     HudPosition(HudPosition),
+    Layout(LayoutMode),
     UpdateChannel(UpdateChannel),
     MouseFollowsFocus(MouseFollowsFocus),
+    TrackpadSwipe(bool),
+    MenuBarIcon(MenuBarIcon),
+    PauseOnBuiltinDisplay(bool),
     Outer(i64),
     Spacing(SpacingKey, i64),
+    Lab(LabFeature, bool),
 }
 
 impl SettingValue {
@@ -308,6 +411,13 @@ impl SettingValue {
                         "invalid value for hud_position: expected 'bottom' or 'top', got {raw_value:?}"
                     )
                 }),
+            SettingKey::Layout => LayoutMode::parse(raw_value)
+                .map(Self::Layout)
+                .ok_or_else(|| {
+                    format!(
+                        "invalid value for layout: expected 'dwindle' or 'columns', got {raw_value:?}"
+                    )
+                }),
             SettingKey::UpdateChannel => UpdateChannel::parse(raw_value)
                 .map(Self::UpdateChannel)
                 .ok_or_else(|| {
@@ -322,6 +432,27 @@ impl SettingValue {
                         "invalid value for mouse_follows_focus: expected 'off', 'display', or 'window', got {raw_value:?}"
                     )
                 }),
+            SettingKey::TrackpadSwipe => match raw_value {
+                "true" => Ok(Self::TrackpadSwipe(true)),
+                "false" => Ok(Self::TrackpadSwipe(false)),
+                _ => Err(format!(
+                    "invalid value for trackpad_swipe: expected 'true' or 'false', got {raw_value:?}"
+                )),
+            },
+            SettingKey::MenuBarIcon => MenuBarIcon::parse(raw_value)
+                .map(Self::MenuBarIcon)
+                .ok_or_else(|| {
+                    format!(
+                        "invalid value for menu_bar_icon: expected 'full', 'compact', or 'off', got {raw_value:?}"
+                    )
+                }),
+            SettingKey::PauseOnBuiltinDisplay => match raw_value {
+                "true" => Ok(Self::PauseOnBuiltinDisplay(true)),
+                "false" => Ok(Self::PauseOnBuiltinDisplay(false)),
+                _ => Err(format!(
+                    "invalid value for pause_on_builtin_display: expected 'true' or 'false', got {raw_value:?}"
+                )),
+            },
             SettingKey::Outer => {
                 let parsed = parse_points(key, raw_value)?;
                 spacing::check_outer(parsed)?;
@@ -341,8 +472,11 @@ fn run_set(args: &[&str], path_override: Option<&Path>) -> Result<String, String
     let [raw_key, raw_value] = positional.as_slice() else {
         return Err("usage: spaceman config set <key> <value> [--json]".into());
     };
-    let key = SettingKey::parse(raw_key)?;
-    let parsed_value = SettingValue::parse(key, raw_value)?;
+    let key = Key::parse(raw_key)?;
+    let parsed_value = match key {
+        Key::Setting(setting) => SettingValue::parse(setting, raw_value)?,
+        Key::Lab(feature) => SettingValue::Lab(feature, parse_switch(key, raw_value)?),
+    };
     let path = resolve_config_path(path_override)?;
 
     let (text, value) = ConfigDoc::edit_locked(&path, |doc| {
@@ -368,6 +502,13 @@ fn run_set(args: &[&str], path_override: Option<&Path>) -> Result<String, String
                     serde_json::Value::String(parsed.as_str().to_owned()),
                 )
             }
+            SettingValue::Layout(parsed) => {
+                doc.settings.layout = Some(parsed);
+                (
+                    format!("set layout = {}", parsed.as_str()),
+                    serde_json::Value::String(parsed.as_str().to_owned()),
+                )
+            }
             SettingValue::UpdateChannel(parsed) => {
                 doc.settings.update_channel = Some(parsed);
                 (
@@ -382,6 +523,27 @@ fn run_set(args: &[&str], path_override: Option<&Path>) -> Result<String, String
                     serde_json::Value::String(parsed.as_str().to_owned()),
                 )
             }
+            SettingValue::TrackpadSwipe(parsed) => {
+                doc.settings.trackpad_swipe = Some(parsed);
+                (
+                    format!("set trackpad_swipe = {parsed}"),
+                    serde_json::Value::Bool(parsed),
+                )
+            }
+            SettingValue::MenuBarIcon(parsed) => {
+                doc.settings.menu_bar_icon = Some(parsed);
+                (
+                    format!("set menu_bar_icon = {}", parsed.as_str()),
+                    serde_json::Value::String(parsed.as_str().to_owned()),
+                )
+            }
+            SettingValue::PauseOnBuiltinDisplay(parsed) => {
+                doc.settings.pause_on_builtin_display = Some(parsed);
+                (
+                    format!("set pause_on_builtin_display = {parsed}"),
+                    serde_json::Value::Bool(parsed),
+                )
+            }
             SettingValue::Outer(parsed) => {
                 let value = doc.settings.set_outer(parsed)?;
                 (
@@ -394,6 +556,14 @@ fn run_set(args: &[&str], path_override: Option<&Path>) -> Result<String, String
                 (
                     format!("set {} = {value}", key.as_str()),
                     serde_json::Value::from(value),
+                )
+            }
+            SettingValue::Lab(feature, on) => {
+                doc.labs_mut().set(feature, on);
+                doc.prune_labs();
+                (
+                    format!("set {} = {on}", key.as_str()),
+                    serde_json::Value::Bool(on),
                 )
             }
         };
@@ -415,14 +585,29 @@ fn run_reset(args: &[&str], path_override: Option<&Path>) -> Result<String, Stri
     let [raw_key] = positional.as_slice() else {
         return Err("usage: spaceman config reset <key> [--json]".into());
     };
-    let key = SettingKey::parse(raw_key)?;
+    let key = Key::parse(raw_key)?;
     let path = resolve_config_path(path_override)?;
     let (text, value) = ConfigDoc::edit_locked(&path, |doc| {
-        let changed = key.is_set(&doc.settings);
-        if changed {
-            key.clear(&mut doc.settings);
-        }
-        let (effective, value) = key.read(&doc.settings);
+        let changed = match key {
+            Key::Setting(setting) => {
+                let changed = setting.is_set(&doc.settings);
+                if changed {
+                    setting.clear(&mut doc.settings);
+                }
+                changed
+            }
+            Key::Lab(feature) => {
+                let changed = doc.labs.is_some_and(|labs| labs.is_set(feature));
+                if changed {
+                    if let Some(labs) = &mut doc.labs {
+                        labs.set(feature, false);
+                    }
+                    doc.prune_labs();
+                }
+                changed
+            }
+        };
+        let (effective, value) = key.read(doc);
         Ok((
             (format!("reset {} = {effective}", key.as_str()), value),
             changed,
@@ -436,6 +621,18 @@ fn run_reset(args: &[&str], path_override: Option<&Path>) -> Result<String, Stri
         })
     } else {
         Ok(text)
+    }
+}
+
+/// `true` or `false`, the only values a `[labs]` switch takes.
+fn parse_switch(key: Key, raw: &str) -> Result<bool, String> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!(
+            "invalid value for {}: expected 'true' or 'false', got {raw:?}",
+            key.as_str()
+        )),
     }
 }
 
@@ -477,5 +674,66 @@ fn run_check(args: &[&str], path_override: Option<&Path>) -> Result<String, Stri
             "configuration is valid (using defaults; no file at {})",
             path.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spaceman::config::{Config, now};
+
+    use super::*;
+
+    #[test]
+    fn every_lab_feature_round_trips_through_cli_config() {
+        let nanos = now().as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "spaceman-cli-labs-round-trip-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let help = help::config_help("spaceman");
+
+        for feature in LabFeature::ALL {
+            let key = format!("labs.{}", feature.key());
+            assert_eq!(Key::parse(&key), Ok(Key::Lab(feature)));
+            assert_eq!(Key::Lab(feature).as_str(), key);
+            assert!(help.contains(&key), "config_help is missing {key}");
+
+            let set = run("spaceman", &["set", &key, "true"], Some(&path));
+            assert_eq!(set.exit_code, 0, "{key}: {set:?}");
+            assert_eq!(
+                set.stdout.as_deref(),
+                Some(format!("set {key} = true").as_str())
+            );
+
+            let get = run("spaceman", &["get", &key], Some(&path));
+            assert_eq!(get.exit_code, 0, "{key}: {get:?}");
+            assert_eq!(get.stdout.as_deref(), Some("true"));
+
+            let saved = std::fs::read_to_string(&path).unwrap();
+            let parsed = Config::parse(&saved).unwrap();
+            assert!(parsed.labs().enabled(feature), "{key} should be enabled");
+
+            let reset = run("spaceman", &["reset", &key], Some(&path));
+            assert_eq!(reset.exit_code, 0, "{key}: {reset:?}");
+            assert_eq!(
+                reset.stdout.as_deref(),
+                Some(format!("reset {key} = false").as_str())
+            );
+
+            let get_after = run("spaceman", &["get", &key], Some(&path));
+            assert_eq!(get_after.exit_code, 0, "{key}: {get_after:?}");
+            assert_eq!(get_after.stdout.as_deref(), Some("false"));
+
+            let saved_after = std::fs::read_to_string(&path).unwrap();
+            let parsed_after = Config::parse(&saved_after).unwrap();
+            assert!(
+                !parsed_after.labs().enabled(feature),
+                "{key} should be disabled after reset"
+            );
+        }
+
+        drop(std::fs::remove_dir_all(dir));
     }
 }

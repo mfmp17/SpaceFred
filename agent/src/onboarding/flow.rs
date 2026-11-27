@@ -1,4 +1,4 @@
-//! Pure state machine and owner-only persistence for Spaceman's 3-step setup tour.
+//! Pure state machine and owner-only persistence for Spaceman's four-step setup tour.
 
 use std::{fs, path::Path};
 
@@ -9,12 +9,16 @@ use crate::controls::PermissionControl;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Step {
     Welcome,
+    /// Accessibility, and nothing else.
     Setup,
-    Done,
+    /// The suggested arrangement of the open windows; its primary button starts tiling.
+    Arrange,
+    /// A few real shortcuts on the real workspaces.
+    TryIt,
 }
 
 impl Step {
-    pub const TOUR: [Self; 3] = [Self::Welcome, Self::Setup, Self::Done];
+    pub const TOUR: [Self; 4] = [Self::Welcome, Self::Setup, Self::Arrange, Self::TryIt];
 
     pub fn position(self) -> usize {
         Self::TOUR
@@ -27,7 +31,8 @@ impl Step {
         match self {
             Self::Welcome => "welcome",
             Self::Setup => "setup",
-            Self::Done => "done",
+            Self::Arrange => "arrange",
+            Self::TryIt => "try",
         }
     }
 }
@@ -36,6 +41,8 @@ impl Step {
 pub struct SetupState {
     pub accessibility: bool,
     pub launch_at_login: bool,
+    /// Automatic tiling is on.
+    pub tiling: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +51,10 @@ pub enum Input {
     Back,
     GrantAccessibility,
     ToggleLaunchAtLogin,
+    /// Arrange's Skip: leave the windows where they are.
+    Skip,
+    /// Try it's Undo & restore: pause, and put every window back.
+    Undo,
     Status(SetupState),
     Dismiss,
 }
@@ -55,6 +66,10 @@ pub enum Effect {
     ToggleLaunchAtLogin,
     /// Accessibility just turned on: hold for a beat so the checkmark settles, then advance.
     AdvanceSoon,
+    /// Apply the plan and start tiling.
+    Arrange,
+    /// Pause tiling and restore every window.
+    Undo,
     Finish,
 }
 
@@ -63,12 +78,13 @@ pub struct View {
     pub step: Step,
     /// `1` when moving forward, `-1` when going back, `0` on initial paint.
     pub direction: i8,
-    /// Position among the dotted steps (`Welcome`, `Setup`, `Done`).
+    /// Position among the dotted steps.
     pub index: usize,
     pub count: usize,
     pub accessibility: PermissionControl,
     pub launch_at_login: bool,
     pub ready: bool,
+    pub tiling: bool,
     pub can_go_back: bool,
     pub manual: bool,
 }
@@ -86,8 +102,9 @@ pub struct Flow {
 impl Flow {
     pub fn new(start: Step, status: SetupState, manual: bool) -> Self {
         let step = if !manual && start == Step::Setup && status.accessibility {
-            // Resuming after macOS Quit & Reopen once Accessibility is granted lands on Done.
-            Step::Done
+            // Resuming after macOS Quit & Reopen once Accessibility is granted lands on the
+            // arrangement, which is what starts tiling.
+            Step::Arrange
         } else if start.position() > Step::Setup.position() && !status.accessibility {
             Step::Setup
         } else {
@@ -129,33 +146,45 @@ impl Flow {
             accessibility,
             launch_at_login: self.status.launch_at_login,
             ready: self.status.accessibility,
-            can_go_back: self.step != Step::Welcome,
+            tiling: self.status.tiling,
+            // Try it goes back with Undo & restore, which also puts the windows back.
+            can_go_back: matches!(self.step, Step::Setup | Step::Arrange),
             manual: self.manual,
         }
     }
 
+    fn go(&mut self, step: Step) {
+        self.direction = if step.position() > self.step.position() {
+            1
+        } else {
+            -1
+        };
+        self.advance_due = false;
+        self.step = step;
+    }
+
     pub fn on(&mut self, input: Input) -> Effect {
         match input {
-            Input::Continue => {
-                if self.step == Step::Setup && !self.status.accessibility {
-                    return Effect::None;
+            Input::Continue => match self.step {
+                Step::Welcome => {
+                    self.go(Step::Setup);
+                    Effect::None
                 }
-                if self.step == Step::Done {
-                    return Effect::Finish;
+                Step::Setup if !self.status.accessibility => Effect::None,
+                Step::Setup => {
+                    self.go(Step::Arrange);
+                    Effect::None
                 }
-                self.direction = 1;
-                self.advance_due = false;
-                self.step = Step::TOUR[self.step.position() + 1];
-                Effect::None
-            }
+                Step::Arrange => {
+                    self.go(Step::TryIt);
+                    Effect::Arrange
+                }
+                Step::TryIt => Effect::Finish,
+            },
             Input::Back => {
-                let pos = self.step.position();
-                if pos == 0 {
-                    return Effect::None;
+                if self.view().can_go_back {
+                    self.go(Step::TOUR[self.step.position() - 1]);
                 }
-                self.direction = -1;
-                self.advance_due = false;
-                self.step = Step::TOUR[pos - 1];
                 Effect::None
             }
             Input::GrantAccessibility => {
@@ -166,21 +195,35 @@ impl Flow {
                     Effect::None
                 }
             }
-            Input::ToggleLaunchAtLogin => Effect::ToggleLaunchAtLogin,
+            // Launch at login is Try it's: the permission step asks for one thing.
+            Input::ToggleLaunchAtLogin if self.step == Step::TryIt => Effect::ToggleLaunchAtLogin,
+            Input::ToggleLaunchAtLogin => Effect::None,
+            Input::Skip if self.step != Step::Arrange => Effect::None,
+            // With tiling already on there is still something to try; otherwise the windows
+            // stay where they are and the tour is over.
+            Input::Skip if self.status.tiling => {
+                self.go(Step::TryIt);
+                Effect::None
+            }
+            Input::Skip => Effect::Finish,
+            Input::Undo if self.step == Step::TryIt => {
+                self.go(Step::Arrange);
+                Effect::Undo
+            }
+            Input::Undo => Effect::None,
             Input::Status(next) => {
                 let was_ready = self.status.accessibility;
                 self.status = next;
                 if self.step == Step::Setup && !was_ready && next.accessibility {
                     self.advance_due = true;
                 }
+                // Only the permission step moves on by itself. Try it never does.
                 if std::mem::take(&mut self.advance_due) && self.step == Step::Setup {
                     Effect::AdvanceSoon
                 } else {
                     Effect::None
                 }
             }
-            // Dismissing ends the tour whether it was the first-run setup or a
-            // manual re-open; finishing a first-run tour is what starts tiling.
             Input::Dismiss => Effect::Finish,
         }
     }
@@ -233,10 +276,9 @@ pub(crate) fn saved_step_at(directory: &Path) -> Option<Step> {
         .trim()
     {
         "setup" => Some(Step::Setup),
-        // Step::Rules was removed in 0.3.2; an in-progress tour from before then
-        // has already granted Accessibility, so it resumes at Done.
-        "rules" => Some(Step::Done),
-        "done" => Some(Step::Done),
+        // `rules` (removed in 0.3.2) and `done` (0.3.4's last step) were both past the
+        // Accessibility grant with tiling still held: they resume at the arrangement.
+        "rules" | "done" | "arrange" | "try" => Some(Step::Arrange),
         _ => None,
     }
 }

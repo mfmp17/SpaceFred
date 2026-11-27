@@ -42,16 +42,27 @@ struct DebugTargets {
 }
 
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
+    /// The result of a restore, carrying the debug state it leaves behind on
+    /// the last known displays.
+    pub(in crate::app) fn restored(&mut self, failed: usize) -> WorkerResult {
+        let debug = self
+            .displays
+            .known_outputs()
+            .cloned()
+            .map(|outputs| Box::new(self.debug_state(&outputs)));
+        WorkerResult::Restored { failed, debug }
+    }
+
     pub(in crate::app) fn debug_state(&mut self, outputs: &macos::DisplayOutputs) -> RuntimeDebug {
         let visible = self.visible_workspaces(outputs);
         let tiles = self.navigation_tiles_for(&visible);
         let focused = self.backend.focused_window();
-        let target = |direction| {
-            focused.as_ref().and_then(|focused| {
-                crate::navigation::target(&tiles, focused, direction)
-                    .map(|tile| tile.window.clone())
-            })
-        };
+        // The same resolver the focus command runs, from the same effective
+        // focus, so these never drift from what the keys do (#382).
+        let origin = self
+            .effective_focus(focused.clone())
+            .filter(|_| !self.empty_choice_stands(focused.as_ref()));
+        let mut target = |direction| self.focus_target(origin.as_ref(), direction, outputs);
         let targets = DebugTargets {
             left: target(Direction::Left),
             down: target(Direction::Down),
@@ -84,9 +95,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         frame: display.frame,
                         workspace: resolved.workspace,
                         axis: self.workspaces.engine(resolved.workspace).root_axis(),
-                        fullscreen_layout: self
-                            .workspaces
-                            .uses_fullscreen_layout(resolved.workspace),
+                        fullscreen_layout: self.workspaces.deck(resolved.workspace).is_monocle(),
                         layout: self.preview_layout(resolved.workspace, HUD_PREVIEW_RECT),
                     })
                 })
@@ -94,7 +103,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             tiles,
             floating,
             parking_exempt: {
-                let mut windows: Vec<_> = self.parking_exempt.iter().cloned().collect();
+                let mut windows: Vec<_> = self.parked.exempt_windows().cloned().collect();
                 windows.sort_by_key(|window| (window.app.pid, window.window_id));
                 windows
             },

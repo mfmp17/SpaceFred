@@ -1,8 +1,11 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     journal::{CORRECTION_WINDOW, PlacementSource},
-    window_memory::{RememberedWindow, WindowMemory},
+    window_memory::{
+        MAX_DOCUMENT_LEN, MAX_TITLE_LEN, RememberedWindow, WindowCandidate, WindowMemory,
+        same_placement_list, same_window_list,
+    },
 };
 
 use super::*;
@@ -18,13 +21,31 @@ pub(super) const RELAUNCH_WINDOW: Duration = Duration::from_secs(30);
 /// process exits; those intermediate states must not overwrite the memory.
 pub(super) const MEMORY_SETTLE: Duration = Duration::from_secs(10);
 
+/// The placement fields a recalled window needs once it has claimed an entry.
+#[derive(Clone, Copy)]
+pub(super) struct RecalledPlacement {
+    pub(super) workspace: WorkspaceId,
+    pub(super) frame: crate::Rect,
+    pub(super) floating: bool,
+}
+
+/// Last observed local `AXDocument` and title for a live window, retained while
+/// the window is parked off-screen so inactive workspaces keep their identity.
+#[derive(Clone, Default)]
+pub(super) struct WindowIdentity {
+    document: Option<Arc<str>>,
+    /// The full observed title: title rules match all of it, so it is bounded to
+    /// [`MAX_TITLE_LEN`] only when it is written to window memory (#650).
+    title: Option<Arc<str>>,
+}
+
 /// One relaunched application instance claiming its remembered placements.
 pub(super) struct Recall {
     bundle_id: String,
     pub(super) opened: Instant,
     /// Remembered placements not yet claimed by a window.
     remaining: Vec<RememberedWindow>,
-    claimed: HashMap<crate::PhysicalWindowId, RememberedWindow>,
+    claimed: HashMap<crate::PhysicalWindowId, RecalledPlacement>,
 }
 
 /// Where and why Spaceman put a window it just saw, kept for
@@ -57,10 +78,34 @@ pub(super) struct MemoryState {
     pub(super) considered: HashSet<AppInstanceId>,
     /// Recent placements of newly seen windows.
     pub(super) placements: HashMap<crate::PhysicalWindowId, Placement>,
+    /// Last observed local `AXDocument` and title for managed windows.
+    pub(super) identities: HashMap<crate::PhysicalWindowId, WindowIdentity>,
 }
 
 impl MemoryState {
-    pub(super) fn recalled(&self, window: &crate::PhysicalWindowId) -> Option<RememberedWindow> {
+    /// The last title observed for `window`, kept while it is parked.
+    pub(super) fn last_title(&self, window: &crate::PhysicalWindowId) -> Option<&str> {
+        self.identities
+            .get(window)
+            .and_then(|identity| identity.title.as_deref())
+    }
+
+    /// Record the title read for `window` from its running app when no observation in this
+    /// run has listed it; a later observation replaces it.
+    pub(super) fn note_probed_title(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        title: Option<Arc<str>>,
+    ) {
+        self.identities
+            .entry(window.clone())
+            .or_insert_with(|| WindowIdentity {
+                document: None,
+                title: title.filter(|title| !title.trim().is_empty()),
+            });
+    }
+
+    pub(super) fn recalled(&self, window: &crate::PhysicalWindowId) -> Option<RecalledPlacement> {
         self.recalls
             .get(&window.app)
             .and_then(|recall| recall.claimed.get(window))
@@ -69,16 +114,24 @@ impl MemoryState {
 }
 
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
-    /// Close recalls whose window lapsed, whose placements are all claimed,
-    /// or whose process exited.
+    /// Close recalls whose window lapsed, whose placements are all claimed and
+    /// joined, or whose process exited. A claimed window no workspace holds yet (its
+    /// first park failed) keeps the recall open so a later cycle sends it to the
+    /// placement it claimed instead of the workspace on screen (#689).
     pub(super) fn close_recalls(&mut self) {
+        let now = self.backend.now();
         let backend = &mut self.backend;
+        let workspaces = &self.workspaces;
         let closed: Vec<_> = self
             .memory
             .recalls
             .extract_if(|app, recall| {
-                recall.opened.elapsed() >= RECALL_WINDOW
-                    || recall.remaining.is_empty()
+                now.saturating_duration_since(recall.opened) >= RECALL_WINDOW
+                    || (recall.remaining.is_empty()
+                        && recall
+                            .claimed
+                            .keys()
+                            .all(|window| workspaces.workspace_of_any(window).is_some()))
                     || !backend.is_process_running(app)
             })
             .map(|(_, recall)| recall)
@@ -112,7 +165,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
         if self.memory.considered.insert(app.id.clone()) {
             let first_seen = self.memory.seen_bundles.insert(app.bundle_id.clone());
-            self.open_recall(app, first_seen);
+            self.open_recall(app, first_seen, windows.len());
         }
         let Some(recall) = self.memory.recalls.get_mut(&app.id) else {
             return;
@@ -127,12 +180,17 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         .replacement_workspaces(&window.id)
                         .next()
                         .is_none()
-                    && !matches!(
-                        self.config.disposition(&app.bundle_id, window),
-                        WindowDisposition::Ignored | WindowDisposition::Route(_)
-                    )
+                    && {
+                        let patch = self.config.patch(&app.bundle_id, window);
+                        !patch.is_ignored() && patch.home.is_none()
+                    }
             })
-            .map(|window| (window.id.clone(), window.frame))
+            .map(|window| WindowCandidate {
+                id: window.id.clone(),
+                frame: window.frame,
+                document: window.document.as_deref(),
+                title: window.title.as_deref(),
+            })
             .collect();
         if candidates.is_empty() {
             return;
@@ -141,7 +199,12 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let mut claimed_indices = Vec::new();
         let mut events = Vec::new();
         for (window, index) in assignments {
-            let placement = recall.remaining[index];
+            let entry = &recall.remaining[index];
+            let placement = RecalledPlacement {
+                workspace: entry.workspace,
+                frame: entry.frame,
+                floating: entry.floating,
+            };
             log_event!(
                 "recall: {:?} ({}) -> workspace {}{}",
                 window,
@@ -159,11 +222,6 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 workspace: placement.workspace,
                 floating: placement.floating,
             });
-            // A floated window floats again, like one restored on an agent
-            // restart, until the user toggles it back into the tiles.
-            if placement.floating {
-                self.manual_floating.insert(window.clone());
-            }
             recall.claimed.insert(window, placement);
             claimed_indices.push(index);
         }
@@ -183,7 +241,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if let Some(bundle_id) = self.memory.bundles.remove(app)
             && is_rememberable_bundle_id(&bundle_id)
         {
-            self.memory.departed.insert(bundle_id, Instant::now());
+            let now = self.backend.now();
+            self.memory.departed.insert(bundle_id, now);
         }
     }
 
@@ -217,15 +276,16 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         source: PlacementSource,
         workspace: WorkspaceId,
     ) {
+        let now = self.backend.now();
         self.memory
             .placements
-            .retain(|_, placement| placement.at.elapsed() < CORRECTION_WINDOW);
+            .retain(|_, placement| now.saturating_duration_since(placement.at) < CORRECTION_WINDOW);
         self.memory.placements.insert(
             window.clone(),
             Placement {
                 source,
                 workspace,
-                at: Instant::now(),
+                at: now,
             },
         );
     }
@@ -243,7 +303,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let Some(placement) = self.memory.placements.remove(window) else {
             return;
         };
-        let elapsed = placement.at.elapsed();
+        let elapsed = self.backend.now().saturating_duration_since(placement.at);
         if elapsed >= CORRECTION_WINDOW || placement.workspace != from {
             return;
         }
@@ -276,9 +336,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// quit within [`RELAUNCH_WINDOW`], or still owns windows (a relaunch that
     /// starts the new process before quitting the old one).
     fn relaunched(&mut self, app: &crate::ObservedApplication) -> bool {
+        let now = self.backend.now();
         self.memory
             .departed
-            .retain(|_, quit| quit.elapsed() < RELAUNCH_WINDOW);
+            .retain(|_, quit| now.saturating_duration_since(*quit) < RELAUNCH_WINDOW);
         if self.workspaces.app_owns_windows(&app.id) {
             return false;
         }
@@ -292,18 +353,26 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
 
     /// Open a recall for an instance that owns no windows yet and whose bundle
     /// has remembered placements it may claim: one seen for the first time
-    /// during startup, a relaunch, or any new instance of a returning app.
-    fn open_recall(&mut self, app: &crate::ObservedApplication, first_seen: bool) {
+    /// during startup, a relaunch, any new instance of a returning app, or one
+    /// restoring a multi-workspace arrangement however long it was closed.
+    fn open_recall(
+        &mut self,
+        app: &crate::ObservedApplication,
+        first_seen: bool,
+        presented: usize,
+    ) {
         if !is_rememberable_bundle_id(&app.bundle_id) {
             return;
         }
+        let now = self.backend.now();
         let startup = first_seen
             && self
                 .memory
                 .started_at
-                .is_some_and(|started| started.elapsed() < RECALL_WINDOW);
+                .is_some_and(|started| now.saturating_duration_since(started) < RECALL_WINDOW);
         let returning = self.memory.memory.returns(&app.bundle_id);
-        if !(startup || returning || self.relaunched(app))
+        let restoring = self.restores_arrangement(&app.bundle_id, presented);
+        if !(startup || returning || restoring || self.relaunched(app))
             || self.config.has_bundle_route(&app.bundle_id)
         {
             return;
@@ -321,7 +390,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     .windows
                     .iter()
                     .filter(|placement| self.can_recall_to(placement.workspace))
-                    .copied()
+                    .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -338,11 +407,28 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             app.id.clone(),
             Recall {
                 bundle_id: app.bundle_id.clone(),
-                opened: Instant::now(),
+                opened: now,
                 remaining: remembered,
                 claimed: HashMap::new(),
             },
         );
+    }
+
+    /// Whether a new instance presenting `presented` windows at once is macOS restoring a
+    /// multi-workspace arrangement: it opened two or more windows together and its memory spans
+    /// two or more workspaces. A cold launch opens one window, which stays on the active
+    /// workspace.
+    fn restores_arrangement(&self, bundle_id: &str, presented: usize) -> bool {
+        presented >= 2
+            && self.memory.memory.get(bundle_id).is_some_and(|remembered| {
+                let mut workspaces = remembered
+                    .windows
+                    .iter()
+                    .map(|placement| placement.workspace);
+                workspaces
+                    .next()
+                    .is_some_and(|first| workspaces.any(|workspace| workspace != first))
+            })
     }
 
     fn can_recall_to(&self, workspace: WorkspaceId) -> bool {
@@ -354,34 +440,70 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
 
     /// Fold settled ownership back into the memory once it has held for
     /// [`MEMORY_SETTLE`], then persist any change.
-    pub(super) fn record_window_memory(&mut self, server_frames: &HashMap<u32, crate::Rect>) {
+    pub(super) fn record_window_memory(
+        &mut self,
+        server_frames: &HashMap<u32, crate::Rect>,
+        observation: &crate::NativeObservation,
+    ) {
+        if server_frames.is_empty() && !observation.applications.is_empty() {
+            return;
+        }
+        for app in &observation.applications {
+            let crate::AppObservation::Complete { windows, .. } = app else {
+                continue;
+            };
+            for window in windows {
+                self.memory.identities.insert(
+                    window.id.clone(),
+                    WindowIdentity {
+                        document: normalize_arc(window.document.as_ref(), MAX_DOCUMENT_LEN),
+                        title: window
+                            .title
+                            .as_ref()
+                            .filter(|title| !title.trim().is_empty())
+                            .cloned(),
+                    },
+                );
+            }
+        }
         let recalling: HashSet<_> = self
             .memory
             .recalls
             .values()
             .map(|recall| recall.bundle_id.clone())
             .collect();
+        let mut live_windows: HashSet<crate::PhysicalWindowId> =
+            self.parked.keys().cloned().collect();
         let mut current: BTreeMap<String, Vec<(u32, RememberedWindow)>> = BTreeMap::new();
+        let identities = &self.memory.identities;
+        let bundles = &self.memory.bundles;
+        let parked = &self.parked;
         let mut add = |window: &crate::PhysicalWindowId, workspace, floating| {
-            let Some(bundle_id) = self.memory.bundles.get(&window.app).filter(|bundle_id| {
+            live_windows.insert(window.clone());
+            let Some(bundle_id) = bundles.get(&window.app).filter(|bundle_id| {
                 is_rememberable_bundle_id(bundle_id) && !recalling.contains(*bundle_id)
             }) else {
                 return;
             };
-            let Some(frame) = self
-                .parked
+            let Some(frame) = parked
                 .get(window)
                 .or_else(|| server_frames.get(&window.window_id))
                 .copied()
             else {
                 return;
             };
+            let identity = identities.get(window);
             current.entry(bundle_id.clone()).or_default().push((
                 window.window_id,
                 RememberedWindow {
                     workspace,
                     frame,
                     floating,
+                    document: identity
+                        .and_then(|entry| entry.document.as_deref().map(str::to_owned)),
+                    title: identity.and_then(|entry| {
+                        normalize_arc(entry.title.as_ref(), MAX_TITLE_LEN).map(|t| t.to_string())
+                    }),
                 },
             ));
         };
@@ -393,7 +515,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         for (window, workspace) in self.workspaces.floating_entries() {
             add(window, workspace, true);
         }
-        let now = Instant::now();
+        self.memory
+            .identities
+            .retain(|window, _| live_windows.contains(window));
+        let now = self.backend.now();
         self.memory
             .pending
             .retain(|bundle_id, _| current.contains_key(bundle_id));
@@ -409,19 +534,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 .memory
                 .memory
                 .get(&bundle_id)
-                .is_some_and(|remembered| remembered.windows == windows)
+                .is_some_and(|remembered| same_window_list(&remembered.windows, &windows))
             {
                 self.memory.pending.remove(&bundle_id);
                 continue;
             }
-            match self.memory.pending.get(&bundle_id) {
-                Some((pending, since)) if *pending == windows => {
+            match self.memory.pending.get_mut(&bundle_id) {
+                // Order-insensitive: a newer native tab taking an older
+                // window's slot reorders the creation-ordered list without
+                // moving anything, and must not restart the settle timer.
+                Some((pending, since)) if same_placement_set(pending, &windows) => {
+                    *pending = windows;
                     if now.duration_since(*since) >= MEMORY_SETTLE {
-                        self.memory.pending.remove(&bundle_id);
-                        let count = windows.len();
+                        let Some((settled, _)) = self.memory.pending.remove(&bundle_id) else {
+                            continue;
+                        };
+                        let count = settled.len();
                         if self.memory.memory.record(
                             &bundle_id,
-                            windows,
+                            settled,
                             crate::journal::unix_millis() / 1_000,
                         ) {
                             recorded.push((bundle_id, count));
@@ -445,6 +576,47 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             log_event!("failed to persist window memory: {error}");
         }
     }
+}
+
+/// Whether two placement lists hold the same placements in any order.
+fn same_placement_set(left: &[RememberedWindow], right: &[RememberedWindow]) -> bool {
+    if same_placement_list(left, right) {
+        return true;
+    }
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut used = vec![false; right.len()];
+    left.iter().all(|placement| {
+        let found = right
+            .iter()
+            .zip(used.iter_mut())
+            .find(|(other, taken)| !**taken && placement.same_placement(other));
+        found.is_some_and(|(_, taken)| {
+            *taken = true;
+            true
+        })
+    })
+}
+
+/// Trim and bound an observed `Arc<str>` without allocating when it is already
+/// clean and within `max_chars`.
+fn normalize_arc(raw: Option<&Arc<str>>, max_chars: usize) -> Option<Arc<str>> {
+    let arc = raw?;
+    let trimmed = arc.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == arc.len()
+        && (arc.len() <= max_chars || arc.chars().nth(max_chars).is_none())
+    {
+        return Some(Arc::clone(arc));
+    }
+    let bounded = match trimmed.char_indices().nth(max_chars) {
+        Some((byte_index, _)) => trimmed[..byte_index].trim_end(),
+        None => trimmed,
+    };
+    (!bounded.is_empty()).then(|| Arc::from(bounded))
 }
 
 /// Bare executables without a macOS bundle identifier all observe as `"unknown"`.

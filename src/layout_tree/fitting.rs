@@ -34,10 +34,12 @@ fn same_shape(left: &Node, right: &Node) -> bool {
             Node::Split {
                 axis: left_axis,
                 children: left,
+                ..
             },
             Node::Split {
                 axis: right_axis,
                 children: right,
+                ..
             },
         ) => {
             left_axis == right_axis
@@ -55,7 +57,7 @@ fn same_shape(left: &Node, right: &Node) -> bool {
 /// required extents, and costs the sum of their cross-axis minimums. Prefer
 /// the trailing pair to keep the leading tile in place.
 fn group_if_needed(node: &mut Node, output: Rect, minimums: &HashMap<SlotId, (i32, i32)>) {
-    let Node::Split { children, axis } = node else {
+    let Node::Split { children, axis, .. } = node else {
         return;
     };
     let cross = match axis {
@@ -88,6 +90,7 @@ fn group_if_needed(node: &mut Node, output: Rect, minimums: &HashMap<SlotId, (i3
     right.weight = 1;
     let stack = Node::Split {
         axis: cross,
+        auto_axis: false,
         children: vec![left, right],
     };
     if children.is_empty() {

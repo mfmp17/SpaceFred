@@ -8,6 +8,9 @@ use spaceman::macos::DisplayOutputs;
 pub(crate) const MAIN: &str = "main";
 /// The built-in selector for the first non-main display.
 pub(crate) const SECONDARY: &str = "secondary";
+/// The longest display name a picker segment shows. A longer one ("Built-in Retina Display")
+/// gets its position in the segment and keeps its name in its card's heading.
+const SEGMENT_NAME_MAX: usize = 16;
 
 /// One connected display, read from `spaceman::macos::outputs`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,10 +56,16 @@ pub(crate) fn connected(outputs: &DisplayOutputs) -> Vec<ConnectedDisplay> {
 pub(crate) struct Choice {
     /// The selector written to `config.toml` when this choice is picked.
     pub selector: String,
-    /// The picker segment's label, kept short so segments never overflow.
+    /// The picker segment's label, kept short so segments never overflow: the display's name,
+    /// or its position ("Display 3") when the name is long or four displays share the picker.
     pub label: String,
-    /// The section heading above the workspaces assigned to it.
+    /// The section heading above the workspaces assigned to it: the display's own name at any
+    /// length, so a numbered segment always has a card that says which screen it is.
     pub title: String,
+    /// How a row's `Default:` note names this display: the built-in word (`Main`, `Secondary`)
+    /// while the picker uses it, else the display's own name, so the note points at a card the
+    /// reader can find.
+    pub note: String,
     /// The heading's trailing caption.
     pub caption: String,
     /// The display's UUID, so a saved `monitor` naming it resolves here.
@@ -65,27 +74,45 @@ pub(crate) struct Choice {
     pub name: Option<String>,
     /// Whether a display is plugged in for this choice.
     pub connected: bool,
+    /// The display's position in discovery order (`DisplayOutputs::displays`), which decides
+    /// which display a name shared by several screens resolves to.
+    pub discovery: Option<usize>,
 }
 
 impl Choice {
-    /// Whether the `monitor` value `selector` names this display, exactly as
-    /// `DisplayOutputs::resolve_exact` does: by built-in selector, UUID, or name.
-    fn matches(&self, selector: &str) -> bool {
-        self.selector == selector
-            || self.id.as_deref() == Some(selector)
-            || self.name.as_deref() == Some(selector)
+    /// Whether the `monitor` value `selector` names this display by UUID or name.
+    fn names(&self, selector: &str) -> bool {
+        self.id.as_deref() == Some(selector) || self.name.as_deref() == Some(selector)
     }
 }
 
 /// The choice `selector` (a `config.toml` `monitor` value) resolves to, if any display here
-/// answers to it.
+/// answers to it, exactly as `DisplayOutputs::resolve_exact` does: a built-in selector first,
+/// then the first display in discovery order whose UUID or name it is. Choices are sorted by
+/// position, so a name two screens share must not resolve to the leftmost one. Issue 420.
 pub(crate) fn index_of(choices: &[Choice], selector: &str) -> Option<usize> {
-    choices.iter().position(|choice| choice.matches(selector))
+    if let Some(index) = choices
+        .iter()
+        .position(|choice| choice.selector == selector)
+    {
+        return Some(index);
+    }
+    choices
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| choice.names(selector))
+        .min_by_key(|(_, choice)| choice.discovery)
+        .map(|(index, _)| index)
 }
 
 /// Main, then Secondary, then every further display left to right. Main and Secondary are always
 /// offered, even when nothing is plugged into them, because workspaces fall back to main.
 pub(crate) fn choices(displays: &[ConnectedDisplay]) -> Vec<Choice> {
+    let discovery = |display: &ConnectedDisplay| {
+        displays
+            .iter()
+            .position(|other| std::ptr::eq(other, display))
+    };
     let mut ordered: Vec<&ConnectedDisplay> = displays.iter().collect();
     ordered.sort_by(|left, right| {
         rank(left).cmp(&rank(right)).then_with(|| {
@@ -102,6 +129,8 @@ pub(crate) fn choices(displays: &[ConnectedDisplay]) -> Vec<Choice> {
         built_in(MAIN, "Main", "Main display", main),
         built_in(SECONDARY, "Secondary", "Secondary display", secondary),
     ];
+    choices[0].discovery = main.and_then(discovery);
+    choices[1].discovery = secondary.and_then(discovery);
     choices[0].caption = match &main {
         Some(display) if !display.name.is_empty() => {
             format!("{} · Default for 1–5", display.name)
@@ -121,17 +150,36 @@ pub(crate) fn choices(displays: &[ConnectedDisplay]) -> Vec<Choice> {
         .filter(|display| !display.is_built_in())
         .collect();
     for display in &extras {
-        let title = extra_name(choices.len() + 1, display, &ordered);
-        let label = extra_label(choices.len() + 1, &title, ordered.len());
+        let position = choices.len() + 1;
+        let title = extra_name(position, display, &ordered);
+        let label = extra_label(position, &title, ordered.len());
         choices.push(Choice {
             selector: display.selector.clone(),
-            title,
+            title: title.clone(),
+            note: title,
             label,
-            caption: format!("Display {}", choices.len() + 1),
+            caption: format!("Display {position}"),
             id: Some(display.id.clone()),
             name: Some(display.name.clone()),
             connected: true,
+            discovery: discovery(display),
         });
+    }
+    // Past two displays the picker names every screen, so Secondary names its own too: with two
+    // identically named monitors that reads "Studio Display 1" | "Studio Display 2" rather than
+    // "Secondary" | "Studio Display 2", and a row saved by its UUID says the same thing the card
+    // and the picker do.
+    if !extras.is_empty()
+        && let Some(display) = secondary
+    {
+        let title = extra_name(2, display, &ordered);
+        let label = extra_label(2, &title, ordered.len());
+        // A numbered segment is found by its number, so the card says the number too.
+        let role = if label == title { "Secondary" } else { &label };
+        choices[1].caption = format!("{role} · Default for 6–10");
+        choices[1].label = label;
+        choices[1].note = title.clone();
+        choices[1].title = title;
     }
     choices
 }
@@ -156,15 +204,17 @@ fn built_in(
         selector: selector.to_owned(),
         label: label.to_owned(),
         title: title.to_owned(),
+        note: label.to_owned(),
         caption: String::new(),
         id: display.map(|display| display.id.clone()),
         name: display.map(|display| display.name.clone()),
         connected: display.is_some(),
+        discovery: None,
     }
 }
 
-/// The heading for a display past Secondary: its own name, "Studio Display 2" when two monitors
-/// share one, and its position ("Display 3") for a long or missing name.
+/// The heading for a display past Main: its own name at any length, "Studio Display 2" when
+/// two monitors share one, and its position ("Display 3") only when it has no name. Issue 349.
 fn extra_name(
     position: usize,
     display: &ConnectedDisplay,
@@ -183,17 +233,18 @@ fn extra_name(
             + 1;
         return format!("{name} {ordinal}");
     }
-    if name.is_empty() || name.chars().count() > 16 {
+    if name.is_empty() {
         format!("Display {position}")
     } else {
         name.to_owned()
     }
 }
 
-/// The picker segment for a display past Secondary. With four or more displays even short names
-/// crowd the segmented control, so those get their position and the heading keeps the name.
+/// The picker segment for a display past Main. A long name, or any name once four displays
+/// share the segmented control, would crowd the row's title, so the segment gets the display's
+/// position and the heading keeps the name.
 fn extra_label(position: usize, name: &str, displays: usize) -> String {
-    if displays > 3 {
+    if displays > 3 || name.chars().count() > SEGMENT_NAME_MAX {
         format!("Display {position}")
     } else {
         name.to_owned()
@@ -258,6 +309,20 @@ pub(crate) fn fixture_three() -> Vec<ConnectedDisplay> {
             is_secondary: false,
         },
     ]
+}
+
+/// Three displays where a MacBook's own screen is the third: a Studio Display as main, an LG
+/// as Secondary, and "Built-in Retina Display", whose name is too long for a segment.
+pub(crate) fn fixture_long_name() -> Vec<ConnectedDisplay> {
+    let mut displays = fixture_three();
+    for (display, name) in displays.iter_mut().zip([
+        "Studio Display",
+        "LG UltraFine 5K",
+        "Built-in Retina Display",
+    ]) {
+        name.clone_into(&mut display.name);
+    }
+    displays
 }
 
 /// Four displays: the three-display pair plus a differently named external on the right.

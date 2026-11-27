@@ -72,7 +72,7 @@ impl MainThreadAgent {
                 let error = format!("Hotkeys unavailable: {error}");
                 log_event!("{error}");
                 self.last_error = Some(error.clone());
-                self.stop_automatic_and_restore();
+                self.stop_automatic_and_restore(RestoreKind::Restore);
                 status_item::set_status(&error);
             }
         }

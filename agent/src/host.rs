@@ -38,6 +38,8 @@ thread_local! {
     static STARTUP_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Settings › Shortcuts is recording a chord; the next tick holds the hotkeys off.
     static RECORDING_SHORTCUT: Cell<bool> = const { Cell::new(false) };
+    /// The setup tour's Try it step is showing; each tick its window is key holds the hotkeys off.
+    static PRACTICING_SHORTCUTS: Cell<bool> = const { Cell::new(false) };
     /// A `[shortcuts]` table Settings just saved, for the next tick to register.
     static SAVED_SHORTCUTS: RefCell<Option<spaceman::shortcuts::Shortcuts>> =
         const { RefCell::new(None) };
@@ -50,6 +52,22 @@ pub fn set_shortcut_recording(recording: bool) {
     RECORDING_SHORTCUT.with(|slot| slot.set(recording));
 }
 
+/// Holds the global hotkeys off while the setup tour's Try it step is showing and its window has
+/// the keyboard, so the step's shortcuts drive its miniature desktop instead of the real
+/// windows. With another window in front the shortcuts work as usual.
+pub fn set_shortcut_practice(practicing: bool) {
+    PRACTICING_SHORTCUTS.with(|slot| slot.set(practicing));
+}
+
+/// Whether the Settings window, which the setup tour draws in, is the key window.
+fn setup_window_is_key() -> bool {
+    MainThreadMarker::new().is_some_and(|mtm| {
+        NSApplication::sharedApplication(mtm)
+            .keyWindow()
+            .is_some_and(|window| window.title().to_string() == "Spaceman")
+    })
+}
+
 /// Registers a `[shortcuts]` table Settings saved, without waiting for the config probe.
 pub fn shortcuts_saved(shortcuts: spaceman::shortcuts::Shortcuts) {
     SAVED_SHORTCUTS.with(|slot| *slot.borrow_mut() = Some(shortcuts));
@@ -58,9 +76,49 @@ pub fn shortcuts_saved(shortcuts: spaceman::shortcuts::Shortcuts) {
 pub fn bring_window_forward(window: &rune::AppHandle<Ui>) {
     window.set_dock_icon(true);
     if let Some(mtm) = MainThreadMarker::new() {
+        move_settings_to_active_space(mtm);
         NSApplication::sharedApplication(mtm).activate();
     }
     window.open();
+}
+
+/// Lets an already-open Settings window come to the desktop (Space) in use when Spaceman
+/// activates, instead of macOS switching to the desktop it was left on. A window not yet
+/// created opens on the active desktop anyway.
+fn move_settings_to_active_space(mtm: MainThreadMarker) {
+    use objc2_app_kit::NSWindowCollectionBehavior;
+    for window in NSApplication::sharedApplication(mtm).windows().iter() {
+        // The HUD's panels keep their own behavior; only the titled Settings window moves.
+        if window.title().to_string() != "Spaceman" {
+            continue;
+        }
+        let behavior = window.collectionBehavior();
+        if !behavior.contains(NSWindowCollectionBehavior::MoveToActiveSpace) {
+            window.setCollectionBehavior(behavior | NSWindowCollectionBehavior::MoveToActiveSpace);
+        }
+    }
+}
+
+/// Keeps the setup window above other apps' windows without activating it, so the Try it
+/// step stays in view while its shortcuts bring real windows forward. Off puts it back.
+pub fn float_setup_window(floating: bool) {
+    use objc2_app_kit::{NSFloatingWindowLevel, NSNormalWindowLevel};
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let level = if floating {
+        NSFloatingWindowLevel
+    } else {
+        NSNormalWindowLevel
+    };
+    for window in NSApplication::sharedApplication(mtm).windows().iter() {
+        // The HUD's panels keep their own level; only the titled Settings window moves.
+        let ours = window.title().to_string() == "Spaceman";
+        if ours && window.level() != level && (floating || window.level() == NSFloatingWindowLevel)
+        {
+            window.setLevel(level);
+        }
+    }
 }
 
 fn launch_links() -> Vec<spaceman::deep_link::DeepLink> {
@@ -214,6 +272,7 @@ fn start_main_thread() {
 
 fn tick_pump() {
     let recording = RECORDING_SHORTCUT.with(Cell::get);
+    let practicing = PRACTICING_SHORTCUTS.with(Cell::get) && setup_window_is_key();
     let saved = SAVED_SHORTCUTS.with(|slot| slot.borrow_mut().take());
     let outcome = PUMP.with(|slot| {
         slot.borrow_mut().as_mut().map(|state| {
@@ -222,7 +281,7 @@ fn tick_pump() {
             if let Some(shortcuts) = saved {
                 state.agent.apply_shortcuts(shortcuts);
             }
-            state.agent.set_shortcut_recording(recording);
+            state.agent.hold_hotkeys(recording, practicing);
             state.agent.tick()
         })
     });

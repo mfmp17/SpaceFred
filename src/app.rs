@@ -13,12 +13,12 @@ use std::{
 use crate::{
     AppInstanceId, BindingState, Decision, Direction, DisplaySelector, DisplayTarget,
     NavigationTile, ResizeDirection, Settings, WorkspaceId, Workspaces,
-    config::{Config, WindowDisposition},
+    config::Config,
     control::{self, Command as ControlCommand, Request as ControlRequest},
     deep_link::OpenTarget,
     hotkeys::{DeliveryWatch, HotkeyPlan, Hotkeys},
     live, login_item, macos, permission_guide, status_item,
-    swipe::Swipe,
+    swipe::{Fingers, Swipe},
     termination, url_handler,
 };
 
@@ -42,11 +42,14 @@ macro_rules! log_event {
 }
 
 mod app_loop;
+mod arrange;
 mod backend;
 mod bridge;
 mod commands;
 mod cycle;
+mod detach_tab;
 mod displays;
+mod focus;
 mod hud_event;
 mod input;
 mod journal;
@@ -54,17 +57,26 @@ mod memory;
 mod minimums;
 mod move_workspace;
 mod parking;
+mod pins;
 mod runtime;
 mod scratchpad;
+mod space_transition;
+mod stale_parked;
 mod state_writer;
 mod switching;
+mod window_overlay;
 mod worker;
 
 pub use app_loop::{MainThreadAgent, TickOutcome};
 pub use bridge::{
-    HUD_MAX_DISPLAYS, HUD_MAX_FLOATING, HUD_MAX_TILES, HUD_PREVIEW_RECT, UiAction, UiAgentSnapshot,
-    UiBridge, UiHudDisplay, UiHudEvent, UiHudKind, UiHudLayout, UiHudTile, UiHudWorkspace,
-    UiLaunchAtLogin, UiNews, UiUpdateStatus,
+    HUD_MAX_DISPLAYS, HUD_MAX_FLOATING, HUD_MAX_TILES, HUD_PORTRAIT_PREVIEW_RECT, HUD_PREVIEW_RECT,
+    UiAction, UiAgentSnapshot, UiBridge, UiHudDisplay, UiHudEvent, UiHudKind, UiHudLayout,
+    UiHudTile, UiHudToast, UiHudWorkspace, UiLaunchAtLogin, UiNews, UiUpdateStatus,
+    UiWindowOverlayNews, hud_preview_rect,
+};
+pub use window_overlay::{
+    UiWindowOverlay, UiWindowOverlayDisplay, UiWindowOverlayWindow, UiWindowOverlayWorkspace,
+    WindowOverlayCommand,
 };
 
 pub struct HostCallbacks {
@@ -76,15 +88,35 @@ pub struct HostCallbacks {
 
 use app_loop::AppLoopInit;
 use backend::*;
-use input::{GestureTracker, InputQueue, QueuedInput};
+use input::{GestureTracker, InputQueue, QueuedInput, held_by_space_change};
 use journal::JournalState;
 use memory::MemoryState;
+use parking::{ParkRecord, ParkTable};
 use runtime::*;
 use worker::spawn_worker;
 
 pub const TICK_INTERVAL: Duration = Duration::from_millis(25);
 /// Prefix on `UiAgentSnapshot::last_error` when installing a staged update fails.
 pub const UPDATE_FAILED_PREFIX: &str = "Update failed: ";
+
+/// The menu and `ctl status` text for a cycle that left `failed` window operations failed.
+pub fn window_operations_failed_status(failed: usize) -> String {
+    format!(
+        "{failed} window operation{} failed",
+        if failed == 1 { "" } else { "s" },
+    )
+}
+
+/// Whether a `UiAgentSnapshot::last_error` is a cycle's transient window-operation failure
+/// (see [`window_operations_failed_status`]) rather than a lasting agent error.
+pub fn is_window_operations_failed_error(error: &str) -> bool {
+    error.split_once(' ').is_some_and(|(count, rest)| {
+        !count.is_empty()
+            && count.bytes().all(|byte| byte.is_ascii_digit())
+            && matches!(rest, "window operation failed" | "window operations failed")
+    })
+}
+
 /// Retile without an event this often while the user is active...
 const FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// ...and this often once nothing has happened for `RECENT_ACTIVITY`. Each
@@ -98,6 +130,14 @@ const APPLICATION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const ACCESSIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const APPLICATION_ACTIVATION_SETTLE: Duration = Duration::from_millis(50);
+/// How long after macOS changes the active Space background cycles hold
+/// layout: the desktop and fullscreen slides finish well within it.
+const SPACE_TRANSITION_SETTLE: Duration = Duration::from_millis(700);
+/// How long after three or four fingers last touch the trackpad background
+/// cycles hold layout. macOS reports the Space change a swipe makes about a
+/// second after the fingers lift, and the arriving desktop's windows are on
+/// screen the whole time, so this outlasts that delay (#572).
+const SPACE_GESTURE_SETTLE: Duration = Duration::from_millis(1500);
 
 // AX creation and app activation can both precede the first on-screen frame.
 const WINDOW_OPENING_SETTLE: Duration = Duration::from_millis(500);
@@ -205,12 +245,21 @@ pub(crate) enum Action {
     ToggleAutomatic,
     /// The first-run setup tour finished, so its hold on tiling ends.
     FinishSetup,
+    /// The first-run setup tour ended without starting tiling: its hold ends, paused.
+    SkipSetup,
+    /// The setup tour wants the open windows, title-free, to suggest an arrangement.
+    PlanSetup,
+    /// Start tiling with the open windows arranged as the setup tour's plan says.
+    Arrange(crate::onboarding_plan::Arrangement),
+    /// Pause tiling and put every window back where it was before the arrangement.
+    UndoArrangement,
     OpenSettings,
     OpenTarget(OpenTarget),
     OpenSetup,
     OpenAccessibility,
     ToggleHud,
     SetHud(bool),
+    SetPauseOnBuiltinDisplay(bool),
     CheckForUpdates,
     InstallUpdate,
     ConfirmUpdateSwitch,
@@ -230,12 +279,26 @@ pub(crate) enum WorkerAction {
     SelectWorkspace(WorkspaceId),
     WorkspaceBackAndForth,
     MoveWorkspaceToDisplay(DisplayTarget),
-    /// A trackpad swipe, stepping through the occupied workspaces of the display
-    /// under the pointer.
-    Swipe(Swipe, (i32, i32)),
+    /// A trackpad swipe and its finger count, stepping through the occupied
+    /// workspaces of the display under the pointer.
+    Swipe(Swipe, Fingers, (i32, i32)),
+    /// The Workspace Steps Lab's `switch next|prev`: the swipe's step, on the focused display.
+    StepWorkspace(crate::WorkspaceStep),
     MoveFocused(WorkspaceId),
     MoveFocusedFollow(WorkspaceId),
+    /// The Workspace Steps Lab's `move next|prev [--follow]`: the focused window one step
+    /// along every enabled workspace of its display.
+    MoveFocusedStep {
+        step: crate::WorkspaceStep,
+        follow: bool,
+    },
     MoveApp(String, WorkspaceId),
+    /// Send the focused window's active tab to a workspace through the app's
+    /// own "Move Tab to New Window"; a single-tab window moves whole.
+    MoveTab {
+        target: WorkspaceId,
+        follow: bool,
+    },
     CycleFocus,
     /// Option-Shift-backtick: the same ring as `CycleFocus`, walked backward.
     CycleFocusPrevious,
@@ -250,10 +313,23 @@ pub(crate) enum WorkerAction {
     ToggleFullscreenLayout,
     /// Float the focused window above the workspace's tiles, or tile it again.
     ToggleFloat,
-    /// Kit noticed something wrong: mark the journal and snapshot it.
-    MarkWrong,
+    /// Pin the focused window (floating it first) on every workspace, or unpin it.
+    TogglePin,
+    /// Kit noticed something wrong: mark the journal and snapshot it. The
+    /// main thread fills in what the screen held as it accepts the mark.
+    MarkWrong(Option<Box<journal::WrongMoment>>),
+    /// Move the open windows onto the workspaces the setup tour's plan gives them.
+    Arrange(crate::onboarding_plan::Arrangement),
     /// The Scratchpad Lab: summon or hide, or send a window to or from it.
     Scratchpad(crate::scratchpad::ScratchpadCommand),
+    /// The Focus follows mouse Lab: the pointer rested at `point` on the window-server
+    /// window `window_id`; a visible tile there takes focus. Never moves the pointer.
+    FocusHovered {
+        window_id: u32,
+        point: (i32, i32),
+    },
+    /// The Window overlay Lab: read what it shows, or act on one of its windows.
+    WindowOverlay(WindowOverlayCommand),
 }
 
 impl WorkerAction {
@@ -266,11 +342,24 @@ impl WorkerAction {
             Self::WorkspaceBackAndForth => "workspace back-and-forth queued".into(),
             Self::MoveWorkspaceToDisplay(_) => "move workspace to display queued".into(),
             Self::Swipe(..) => "swipe queued".into(),
+            Self::StepWorkspace(step) => format!("switch {} queued", step.as_str()),
             Self::MoveFocused(workspace) => format!("move to workspace {workspace} queued"),
             Self::MoveFocusedFollow(workspace) => {
                 format!("move and switch to workspace {workspace} queued")
             }
+            Self::MoveFocusedStep { step, follow } => {
+                let follow = if *follow { " and follow" } else { "" };
+                format!("move {}{follow} queued", step.as_str())
+            }
             Self::MoveApp(_, workspace) => format!("move app to workspace {workspace} queued"),
+            Self::MoveTab {
+                target,
+                follow: false,
+            } => format!("move tab to workspace {target} queued"),
+            Self::MoveTab {
+                target,
+                follow: true,
+            } => format!("move tab and switch to workspace {target} queued"),
             Self::CycleFocus => "focus cycle queued".into(),
             Self::CycleFocusPrevious => "reverse focus cycle queued".into(),
             Self::Focus(_) => "focus queued".into(),
@@ -281,8 +370,12 @@ impl WorkerAction {
             Self::Balance => "balance queued".into(),
             Self::ToggleFullscreenLayout => "fullscreen layout toggle queued".into(),
             Self::ToggleFloat => "float toggle queued".into(),
-            Self::MarkWrong => "marking the journal".into(),
+            Self::TogglePin => "pin toggle queued".into(),
+            Self::MarkWrong(_) => "marking the journal".into(),
+            Self::Arrange(_) => "arrangement queued".into(),
             Self::Scratchpad(command) => format!("scratchpad {} queued", command.as_str()),
+            Self::FocusHovered { .. } => "hover focus queued".into(),
+            Self::WindowOverlay(_) => "window overlay queued".into(),
         }
     }
 }
@@ -292,6 +385,10 @@ enum WorkerCommand {
     Gesture(FinalGesture, bool, macos::DisplayOutputs),
     /// Restore every parked window, onto these displays when they are known.
     RestoreAll(Option<macos::DisplayOutputs>),
+    /// Restore every parked window, then put back the frames the last arrangement changed.
+    UndoArrangement(Option<macos::DisplayOutputs>),
+    /// Read the open windows, title-free, for the setup tour's plan.
+    Inventory(macos::DisplayOutputs),
     Stop,
 }
 
@@ -306,6 +403,8 @@ impl WorkerCommand {
             Self::Action(..) => "action",
             Self::Gesture(..) => "gesture",
             Self::RestoreAll(_) => "restore all",
+            Self::UndoArrangement(_) => "undo arrangement",
+            Self::Inventory(_) => "inventory",
             Self::Stop => "stop",
         }
     }
@@ -320,8 +419,27 @@ impl WorkerCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FinalGesture {
-    Drop(crate::PhysicalWindowId, (i32, i32)),
+    Drop {
+        window: crate::PhysicalWindowId,
+        point: (i32, i32),
+        bounds: Option<input::PointerBounds>,
+        /// When the main thread saw the button go down, so a Fullscreen
+        /// Layout exit the worker ran mid-press still owns the drag (#619).
+        pressed_at: Option<std::time::Instant>,
+    },
     Resize(crate::PhysicalWindowId, crate::Rect),
+}
+
+impl FinalGesture {
+    #[cfg(test)]
+    const fn drop(window: crate::PhysicalWindowId, point: (i32, i32)) -> Self {
+        Self::Drop {
+            window,
+            point,
+            bounds: None,
+            pressed_at: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,7 +468,12 @@ enum WorkerResult {
     },
     Restored {
         failed: usize,
+        /// The runtime after restoration, so paused `debug` never reports a
+        /// window as parked once its recovery record is gone (#548). `None`
+        /// only before any display has been seen.
+        debug: Option<Box<RuntimeDebug>>,
     },
+    Inventory(Box<crate::onboarding_plan::Inventory>),
 }
 
 /// Startup state initialized before the Rune event loop starts: single-agent
@@ -365,6 +488,11 @@ pub struct PreparedAgent {
     hotkey_workspaces: Vec<WorkspaceId>,
     shortcuts: crate::shortcuts::Shortcuts,
     hud: bool,
+    swipe_fingers: Fingers,
+    menu_bar_icon: crate::config::MenuBarIcon,
+    focus_follows_mouse: bool,
+    window_overlay: bool,
+    pause_on_builtin_display: bool,
     controls: Receiver<ControlRequest>,
     control_server: control::Server,
     bridge: UiBridge,
@@ -382,6 +510,11 @@ pub fn prepare() -> Result<(PreparedAgent, UiBridge), String> {
     let (config, workspace_state) =
         recover_startup_metadata(Config::load(), load_workspace_state());
     let hud = config.hud();
+    let swipe_fingers = config.swipe_fingers();
+    let menu_bar_icon = config.menu_bar_icon();
+    let focus_follows_mouse = config.labs().focus_follows_mouse;
+    let window_overlay = config.labs().window_overlay;
+    let pause_on_builtin_display = config.pause_on_builtin_display();
     let shortcuts = config.shortcuts().clone();
     let mut configured_workspaces = Workspaces::default();
     config.configure_workspaces(&mut configured_workspaces);
@@ -431,6 +564,11 @@ pub fn prepare() -> Result<(PreparedAgent, UiBridge), String> {
             hotkey_workspaces,
             shortcuts,
             hud,
+            swipe_fingers,
+            menu_bar_icon,
+            focus_follows_mouse,
+            window_overlay,
+            pause_on_builtin_display,
             controls,
             control_server,
             bridge: bridge.clone(),
@@ -464,6 +602,7 @@ impl PreparedAgent {
             return Err(format!("failed to install Spaceman status item: {error}"));
         }
         status_item::set_hud(self.hud);
+        status_item::set_visible(self.menu_bar_icon != crate::config::MenuBarIcon::Off);
         let launch_status = login_item::status();
         match &launch_status {
             Ok(status) => status_item::set_launch_at_login(*status),
@@ -493,6 +632,10 @@ impl PreparedAgent {
                 hotkey_workspaces: self.hotkey_workspaces,
                 shortcuts: self.shortcuts,
                 hud: self.hud,
+                swipe_fingers: self.swipe_fingers,
+                focus_follows_mouse: self.focus_follows_mouse,
+                window_overlay: self.window_overlay,
+                pause_on_builtin_display: self.pause_on_builtin_display,
                 trusted,
                 setup_tour_open,
                 controls: self.controls,

@@ -71,6 +71,48 @@ fn bundle_route_applies_to_initial_window_while_secondary_windows_stay_on_active
     assert!(runtime.backend.frames[&created].x < 1000);
 }
 
+/// Where a second window of `com.example.Test` lands, beside one already tiled on workspace 1,
+/// under `config`'s rules. Asserts the tiled window stays put.
+fn second_window_home(config: &str) -> Option<WorkspaceId> {
+    let tiled = window(20);
+    let opened = window(21);
+    let mut backend = FakeBackend {
+        observation: Some(observation_for_windows(
+            "com.example.Test",
+            &opened,
+            &[(tiled.clone(), frame(50)), (opened.clone(), frame(100))],
+        )),
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(tiled.clone(), frame(50));
+    backend.frames.insert(opened.clone(), frame(100));
+    let mut runtime = runtime_with_config(backend, Config::parse(config).unwrap());
+    bind(&mut runtime, WorkspaceId::ONE, &tiled);
+    runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        runtime.workspaces.workspace_of(&tiled),
+        Some(WorkspaceId::ONE)
+    );
+    runtime.workspaces.workspace_of(&opened)
+}
+
+#[test]
+fn windows_all_sends_a_later_window_to_the_route_once_its_lab_is_on() {
+    const RULE: &str =
+        "[[rules]]\nbundle_id = 'com.example.Test'\naction = 'route'\nworkspace = 6\n";
+    const LAB: &str = "[labs]\nroute_all_windows = true\n";
+    let cases = [
+        ("", "windows = 'all'", WorkspaceId::ONE),
+        (LAB, "windows = 'first'", WorkspaceId::ONE),
+        (LAB, "", WorkspaceId::ONE),
+        (LAB, "windows = 'all'", WorkspaceId::SIX),
+    ];
+    for (lab, windows, home) in cases {
+        let config = format!("version = 1\n{lab}{RULE}{windows}\n");
+        assert_eq!(second_window_home(&config), Some(home), "{config}");
+    }
+}
+
 #[test]
 fn title_route_rule_routes_matching_secondary_window() {
     let existing = window(10);
@@ -107,6 +149,123 @@ fn title_route_rule_routes_matching_secondary_window() {
         Some(WorkspaceId::SIX)
     );
     assert!(runtime.backend.frames[&created].x >= 1000);
+}
+
+/// Routes a new `Huddle` window from the main display into visible workspace 6 (Columns),
+/// which already tiles `tiled` and is first arranged by `arrange`. Returns the routed window.
+fn route_huddle_into_columns(
+    tiled: &[crate::PhysicalWindowId],
+    arrange: impl FnOnce(&mut WorkspaceRuntime<FakeBackend>),
+) -> (WorkspaceRuntime<FakeBackend>, crate::PhysicalWindowId) {
+    route_huddle_into("columns", tiled, arrange)
+}
+
+/// Routes a new `Huddle` window from the main display into visible workspace 6 in `layout`,
+/// which already tiles `tiled` and is first arranged by `arrange`. Returns the routed window.
+fn route_huddle_into(
+    layout: &str,
+    tiled: &[crate::PhysicalWindowId],
+    arrange: impl FnOnce(&mut WorkspaceRuntime<FakeBackend>),
+) -> (WorkspaceRuntime<FakeBackend>, crate::PhysicalWindowId) {
+    let created = window(40);
+    let mut windows: Vec<_> = tiled
+        .iter()
+        .zip((1050..).step_by(250))
+        .map(|(tiled, x)| (tiled.clone(), frame(x)))
+        .collect();
+    windows.push((created.clone(), frame(100)));
+    let mut observed = observation_for_windows("com.example.Test", &created, &windows);
+    if let crate::AppObservation::Complete {
+        windows: observed_windows,
+        ..
+    } = &mut observed.applications[0]
+    {
+        observed_windows.last_mut().unwrap().title = Some("Huddle".into());
+    }
+    let mut backend = FakeBackend {
+        observation: Some(observed),
+        ..FakeBackend::default()
+    };
+    backend.frames.extend(windows);
+    let config = Config::parse(&format!(
+        "version = 1\n[settings]\nlayout = '{layout}'\n[[rules]]\nbundle_id = 'com.example.Test'\ntitle = 'Huddle'\naction = 'route'\nworkspace = 6",
+    ))
+    .unwrap();
+    let mut runtime = runtime_with_config(backend, config);
+    for window in tiled {
+        bind(&mut runtime, WorkspaceId::SIX, window);
+    }
+    arrange(&mut runtime);
+
+    runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
+
+    assert_eq!(
+        runtime.workspaces.workspace_of(&created),
+        Some(WorkspaceId::SIX)
+    );
+    (runtime, created)
+}
+
+#[test]
+fn columns_route_into_a_visible_workspace_joins_its_focused_tile_split() {
+    let (left, right) = (window(30), window(31));
+    let (runtime, created) = route_huddle_into_columns(&[left.clone(), right.clone()], |rt| {
+        rt.workspaces
+            .engine_mut(WorkspaceId::SIX)
+            .remember_insertion_focus(&left);
+    });
+
+    // Beside the focused tile, as if it had opened there, not appended after `right` (#494).
+    let frames = &runtime.backend.frames;
+    assert!(frames[&left].x < frames[&created].x, "{frames:?}");
+    assert!(frames[&created].x < frames[&right].x, "{frames:?}");
+}
+
+#[test]
+fn columns_route_joins_a_nested_focused_split_and_keeps_the_other_column() {
+    let (top, right, below) = (window(30), window(31), window(32));
+    let tiled = [top.clone(), right.clone(), below.clone()];
+    let (runtime, created) = route_huddle_into_columns(&tiled, |rt| {
+        let engine = rt.workspaces.engine_mut(WorkspaceId::SIX);
+        // (top / below) | right, with `below` focused.
+        assert!(engine.move_window_relative(&below, &top, crate::Direction::Down));
+        engine.remember_insertion_focus(&below);
+    });
+
+    // A third row under `below`; `right` keeps half the display at full height (#494).
+    let frames = &runtime.backend.frames;
+    let column = [&top, &below, &created].map(|window| frames[window]);
+    assert!(
+        column.iter().all(|frame| frame.x == column[0].x),
+        "{frames:?}"
+    );
+    assert!(
+        column[0].y < column[1].y && column[1].y < column[2].y,
+        "{frames:?}"
+    );
+    assert_eq!(frames[&right].width, column[0].width, "{frames:?}");
+    assert!(frames[&right].x > column[0].x, "{frames:?}");
+    assert!(frames[&right].height > column[0].height * 2, "{frames:?}");
+}
+
+#[test]
+fn dwindle_route_splits_the_clicked_tile_not_the_one_remembered_from_the_last_visit() {
+    let (left, right) = (window(30), window(31));
+    let (runtime, created) = route_huddle_into("dwindle", &[left.clone(), right.clone()], |rt| {
+        // `left` had focus when workspace 6 was last switched to; a click then focused `right`.
+        rt.workspaces.remember_focus(WorkspaceId::SIX, &left);
+        rt.workspaces
+            .engine_mut(WorkspaceId::SIX)
+            .remember_insertion_focus(&right);
+    });
+
+    // `right` is split; `left` keeps its full-height column (#603).
+    let frames = &runtime.backend.frames;
+    assert!(frames[&left].x < frames[&right].x, "{frames:?}");
+    assert_eq!(frames[&created].x, frames[&right].x, "{frames:?}");
+    assert_eq!(frames[&created].width, frames[&right].width, "{frames:?}");
+    assert!(frames[&left].height > frames[&right].height, "{frames:?}");
+    assert!(frames[&left].height > frames[&created].height, "{frames:?}");
 }
 
 #[test]
@@ -345,14 +504,16 @@ fn tiled_window_keeps_its_tile_through_modal_sheet_non_resizable_state() {
         .unwrap();
 
     let snapshot_slots = |runtime: &WorkspaceRuntime<FakeBackend>| {
-        runtime
-            .workspaces
-            .engine(WorkspaceId::ONE)
+        let engine = runtime.workspaces.engine(WorkspaceId::ONE);
+        engine
             .model()
             .workspace
             .slots
             .iter()
-            .map(|slot| (slot.id, slot.bound_window().cloned(), slot.weight))
+            .map(|slot| {
+                let weight = engine.layout().weight(slot.id);
+                (slot.id, slot.bound_window().cloned(), weight)
+            })
             .collect::<Vec<_>>()
     };
     let slots_before = snapshot_slots(&runtime);
@@ -528,7 +689,7 @@ fn manual_float_and_float_rule_still_release_tiled_windows_immediately() {
         runtime.workspaces.floating_workspace_of(&first),
         Some(WorkspaceId::ONE)
     );
-    assert!(runtime.manual_floating.contains(&first));
+    assert!(runtime.workspaces.is_manual_float(&first));
     assert_eq!(runtime.backend.frames[&sibling], outputs().main().frame);
 
     // Subsequent cycles keep the manually floated window floating.

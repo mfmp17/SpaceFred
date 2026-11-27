@@ -35,6 +35,26 @@ impl Catalog {
         self.apps.get(bundle_id)
     }
 
+    /// Icons (for the apps installed here) and names for `bundle_ids`, each looked up once,
+    /// for an overlay's view, which can't look anything up.
+    pub fn icons_and_names<'a>(
+        &mut self,
+        bundle_ids: impl IntoIterator<Item = &'a String>,
+    ) -> (HashMap<String, Pixels>, HashMap<String, String>) {
+        let mut icons = HashMap::new();
+        let mut names = HashMap::new();
+        for bundle_id in bundle_ids {
+            if !names.contains_key(bundle_id) {
+                let app = self.get(bundle_id);
+                names.insert(bundle_id.clone(), app.name);
+                if let Some(pixels) = app.icon {
+                    icons.insert(bundle_id.clone(), pixels);
+                }
+            }
+        }
+        (icons, names)
+    }
+
     pub fn insert(&mut self, bundle_id: &str, app: App) {
         self.apps.insert(bundle_id.to_owned(), app);
     }
@@ -74,6 +94,22 @@ pub fn running() -> Vec<Running> {
 #[cfg(not(target_os = "macos"))]
 pub fn running() -> Vec<Running> {
     Vec::new()
+}
+
+/// The apps a fixture has running, so a still's Add menu doesn't list this Mac's.
+pub fn fixture_running() -> Vec<Running> {
+    [
+        ("com.anthropic.claudefordesktop", "Claude"),
+        ("com.apple.Notes", "Notes"),
+        ("com.apple.Safari", "Safari"),
+        ("com.tinyspeck.slackmacgap", "Slack"),
+        ("com.apple.Stickies", "Stickies"),
+    ]
+    .map(|(bundle_id, name)| Running {
+        bundle_id: bundle_id.to_owned(),
+        name: name.to_owned(),
+    })
+    .into()
 }
 
 const KNOWN_WINDOW_MANAGERS: &[(&str, &str)] = &[
@@ -131,6 +167,50 @@ pub fn conflicting_window_managers() -> Vec<String> {
 #[cfg(not(target_os = "macos"))]
 pub fn conflicting_window_managers() -> Vec<String> {
     Vec::new()
+}
+
+/// Asks the running window manager called `name` to quit. Returns whether one was asked.
+#[cfg(target_os = "macos")]
+pub fn quit_window_manager(name: &str) -> bool {
+    use objc2_app_kit::NSWorkspace;
+    objc2::rc::autoreleasepool(|_| {
+        NSWorkspace::sharedWorkspace()
+            .runningApplications()
+            .iter()
+            .filter(|app| {
+                let bundle_id = app.bundleIdentifier().map(|id| id.to_string());
+                let executable = app
+                    .executableURL()
+                    .and_then(|url| url.lastPathComponent())
+                    .map(|name| name.to_string());
+                window_manager_name(bundle_id.as_deref(), executable.as_deref()) == Some(name)
+            })
+            // Every match is asked, so no short-circuit.
+            .filter(|app| app.terminate())
+            .count()
+            > 0
+    })
+}
+
+/// The app's `LSApplicationCategoryType` from its `Info.plist`, such as
+/// `public.app-category.developer-tools`. `None` when it isn't installed or declares none.
+#[cfg(target_os = "macos")]
+pub fn category(bundle_id: &str) -> Option<String> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSBundle, NSString};
+    objc2::rc::autoreleasepool(|_| {
+        let url = NSWorkspace::sharedWorkspace()
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))?;
+        let value = NSBundle::bundleWithURL(&url)?
+            .objectForInfoDictionaryKey(&NSString::from_str("LSApplicationCategoryType"))?;
+        let category = value.downcast::<NSString>().ok()?.to_string();
+        (!category.is_empty()).then_some(category)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn category(_: &str) -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "macos")]

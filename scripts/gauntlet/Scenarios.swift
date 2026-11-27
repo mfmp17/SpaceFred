@@ -334,15 +334,8 @@ extension Gauntlet {
         scenario = "crash"
         var target: TestWindow!
         var original = display
-        try step("move a window to workspace \(otherWorkspace): it parks with its frame recorded") {
+        try step("move a window to workspace \(otherWorkspace): it parks with its frame recorded and hands focus to a remaining tile") {
             (target, original) = try parkOne()
-            // Evidence, not an assertion: which window keeps keyboard focus after the move.
-            let focus = "focus after move: \(label(agent.debug()?.focused)), frontmost app \(windows.first { $0.pid == Native.frontmostPid() }?.label ?? "other")"
-            return Outcome(expected: "\(target.label) parked, recorded at \(original)", measured: "\(frames(windows)); \(focus)")
-        }
-        try step("switch \(homeWorkspace) brings focus back to a visible tile") {
-            // Like a user who carries on working, so the relaunch below has no reason to follow focus.
-            try ctl("switch", homeWorkspace)
             var landed: TestWindow?
             let focused = wait {
                 guard let now = agent.debug()?.focused, now != target.id,
@@ -351,8 +344,10 @@ extension Gauntlet {
                 landed = window
                 return focusProblem(window)
             }
-            try require(focused.problem, expected: "a visible tile focused", measured: label(agent.debug()?.focused))
-            return Outcome(expected: "a visible tile focused", measured: "\(landed?.label ?? "?") in \(Int(focused.ms)) ms")
+            try require(focused.problem, expected: "a remaining visible tile focused", measured: label(agent.debug()?.focused))
+            return Outcome(
+                expected: "\(target.label) parked at \(original), focus handed to a remaining tile",
+                measured: "\(frames(windows)); focus -> \(landed?.label ?? "?") in \(Int(focused.ms)) ms")
         }
         try step("SIGKILL leaves \(target.label) parked and its record on disk") {
             agent.hardKill()

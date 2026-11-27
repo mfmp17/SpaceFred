@@ -13,6 +13,43 @@ const GHOSTTY_REPLACEMENT_SETTLE_CYCLES: u64 = 3;
 pub struct ReconciliationEvidence {
     #[serde(with = "crate::serde_map")]
     pub previous_placements: HashMap<SlotId, Rect>,
+    /// Each slot's window frame as last observed. An app that clamps its
+    /// window (a maximum size) never reaches the placement above, but its
+    /// incoming native tab takes the frame the outgoing one had.
+    #[serde(
+        default,
+        with = "crate::serde_map",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub previous_frames: HashMap<SlotId, Rect>,
+}
+
+impl ReconciliationEvidence {
+    /// Remember an accepted cycle's targets and the frames it observed for
+    /// the slots still bound afterwards.
+    pub fn record(&mut self, observation: &NativeObservation, result: &Reconciliation) {
+        self.previous_placements = result
+            .placements
+            .iter()
+            .map(|placement| (placement.slot, placement.frame))
+            .collect();
+        let slots = &result.model.workspace.slots;
+        self.previous_frames
+            .retain(|id, _| slots.iter().any(|slot| slot.id == *id));
+        for app in &observation.applications {
+            let AppObservation::Complete { windows, .. } = app else {
+                continue;
+            };
+            for window in windows {
+                if let Some(slot) = slots
+                    .iter()
+                    .find(|slot| slot.bound_window() == Some(&window.id))
+                {
+                    self.previous_frames.insert(slot.id, window.frame);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -23,9 +60,16 @@ pub struct Settings {
     /// Gaps, outer padding and the lone-window width cap applied to every tile.
     #[serde(default, skip_serializing_if = "crate::spacing::Spacing::is_none")]
     pub spacing: crate::spacing::Spacing,
+    /// How newly opened tiled windows split the workspace.
+    #[serde(default, skip_serializing_if = "is_default_layout")]
+    pub layout: crate::config::LayoutMode,
 }
 
 pub const DEFAULT_FRAME_TOLERANCE: i32 = 2;
+
+fn is_default_layout(layout: &crate::config::LayoutMode) -> bool {
+    *layout == crate::config::LayoutMode::default()
+}
 
 impl Settings {
     #[must_use]
@@ -34,12 +78,18 @@ impl Settings {
             output,
             frame_tolerance: DEFAULT_FRAME_TOLERANCE,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::Dwindle,
         }
     }
 
     #[must_use]
     pub const fn spaced(self, spacing: crate::spacing::Spacing) -> Self {
         Self { spacing, ..self }
+    }
+
+    #[must_use]
+    pub const fn with_layout(self, layout: crate::config::LayoutMode) -> Self {
+        Self { layout, ..self }
     }
 
     /// The rect the layout partitions: the output less its outer padding.
@@ -119,7 +169,7 @@ pub fn reconcile(
         let mut model = model.clone();
         reset_settling(&mut model, observation.cycle, None);
         return Reconciliation {
-            placements: flat_placements(settings, model.workspace.axis, &model.workspace.slots),
+            placements: flat_placements(settings, &model.workspace.slots),
             model,
             decisions: vec![Decision::MouseDownDeferred],
         };
@@ -167,8 +217,10 @@ pub fn reconcile(
                     let stale: Vec<_> = existing.difference(&current).cloned().collect();
                     let new: Vec<_> = current.difference(&existing).cloned().collect();
 
-                    let replacement = app.bundle_id == "com.mitchellh.ghostty"
-                        && replacement_candidate(&next, &stale, &new, &context);
+                    // Any app's native tab (Finder, Safari, Terminal...) can
+                    // replace its window this way; only Ghostty also settles
+                    // ambiguous evidence before retiring the slot.
+                    let replacement = replacement_candidate(&next, &stale, &new, &context);
 
                     if replacement {
                         let previous = &stale[0];
@@ -213,16 +265,20 @@ pub fn reconcile(
                     }
                 }
 
-                next.continuity
-                    .entry(app.id.clone())
-                    .or_default()
-                    .previous_focused
-                    .clone_from(focused);
+                // A snapshot with no focused window (focus mid native-tab switch, or on a
+                // tab not listed yet) proves nothing about focus; keep the last one known so
+                // the incoming tab still replaces the outgoing one (#718).
+                if let Some(focused) = focused {
+                    next.continuity
+                        .entry(app.id.clone())
+                        .or_default()
+                        .previous_focused = Some(focused.clone());
+                }
             }
         }
     }
 
-    let placements = flat_placements(settings, next.workspace.axis, &next.workspace.slots);
+    let placements = flat_placements(settings, &next.workspace.slots);
     Reconciliation {
         model: next,
         placements,
@@ -338,6 +394,98 @@ fn reset_settling(model: &mut Model, cycle: u64, app: Option<&AppInstanceId>) {
     }
 }
 
+/// Whether reconciling an app's `windows` against `model` would hand the app's one
+/// missing tile to its `focused` window as an unambiguous native-tab replacement.
+/// `unbound` is the app's windows no slot holds yet, as reconciliation would see them.
+/// Routing asks first, so a rule that routes every new window doesn't take the
+/// incoming tab away from its slot (#509).
+#[must_use]
+pub fn replaces_native_tab(
+    model: &Model,
+    evidence: &ReconciliationEvidence,
+    settings: &Settings,
+    windows: &[crate::ObservedWindow],
+    unbound: &[PhysicalWindowId],
+    focused: Option<&PhysicalWindowId>,
+) -> bool {
+    let Some(app) = focused.map(|window| &window.app) else {
+        return false;
+    };
+    let slots = move || {
+        model
+            .workspace
+            .slots
+            .iter()
+            .filter(move |slot| slot.belongs_to(app))
+    };
+    if slots().any(|slot| matches!(slot.binding, BindingState::Unresolved { .. })) {
+        return false;
+    }
+    let stale: Vec<_> = slots()
+        .filter_map(Slot::bound_window)
+        .filter(|bound| !windows.iter().any(|window| &window.id == *bound))
+        .cloned()
+        .collect();
+    let context = AppReconcileContext {
+        focused,
+        windows,
+        cycle: 0,
+        evidence,
+        settings,
+    };
+    replacement_candidate(model, &stale, unbound, &context)
+}
+
+/// Whether `candidate`, a window of its app that no slot holds yet, sits where one of the
+/// app's tiles is (that tile's target or last observed frame), while the tile's window is
+/// gone from `windows` or still listed at that same frame: a native-tab switch caught
+/// mid-handoff, before the outgoing tab leaves the list or focus reaches the incoming one,
+/// so [`replaces_native_tab`] can't tell yet. Routing holds it a moment instead of sending
+/// it to a rule's workspace (#706).
+#[must_use]
+pub fn native_tab_handoff_pending(
+    model: &Model,
+    evidence: &ReconciliationEvidence,
+    settings: &Settings,
+    candidate: &crate::ObservedWindow,
+    windows: &[crate::ObservedWindow],
+) -> bool {
+    let app = &candidate.id.app;
+    let tolerance = settings.frame_tolerance;
+    let mut slots = model
+        .workspace
+        .slots
+        .iter()
+        .filter(|slot| slot.belongs_to(app));
+    if slots
+        .clone()
+        .any(|slot| matches!(slot.binding, BindingState::Unresolved { .. }))
+    {
+        return false;
+    }
+    slots.any(|slot| {
+        let Some(bound) = slot.bound_window() else {
+            return false;
+        };
+        let at_tile = [
+            evidence.previous_placements.get(&slot.id),
+            evidence.previous_frames.get(&slot.id),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|known| candidate.frame.approximately_equals(*known, tolerance));
+        at_tile
+            && windows
+                .iter()
+                .find(|window| &window.id == bound)
+                .is_none_or(|window| {
+                    window
+                        .frame
+                        .approximately_equals(candidate.frame, tolerance)
+                })
+    })
+}
+
 fn replacement_candidate(
     model: &Model,
     stale: &[PhysicalWindowId],
@@ -366,26 +514,29 @@ fn replacement_candidate(
     candidate_matches_target(slot.id, &new[0], context)
 }
 
+/// The candidate sits where the slot's window was asked to go, or, when the
+/// app clamped that request, exactly where the outgoing window was last seen.
 fn candidate_matches_target(
     slot: SlotId,
     candidate: &PhysicalWindowId,
     context: &AppReconcileContext<'_>,
 ) -> bool {
-    context
-        .evidence
-        .previous_placements
-        .get(&slot)
-        .is_some_and(|target| {
-            context
-                .windows
-                .iter()
-                .find(|window| &window.id == candidate)
-                .is_some_and(|window| {
-                    window
-                        .frame
-                        .approximately_equals(*target, context.settings.frame_tolerance)
-                })
-        })
+    let Some(frame) = context
+        .windows
+        .iter()
+        .find(|window| &window.id == candidate)
+        .map(|window| window.frame)
+    else {
+        return false;
+    };
+    let evidence = context.evidence;
+    [
+        evidence.previous_placements.get(&slot),
+        evidence.previous_frames.get(&slot),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|known| frame.approximately_equals(*known, context.settings.frame_tolerance))
 }
 
 fn remove_app(model: &mut Model, app: &AppInstanceId, decisions: &mut Vec<Decision>) {
@@ -428,7 +579,6 @@ fn insert_windows(model: &mut Model, windows: &[PhysicalWindowId], decisions: &m
         model.next_slot_id += 1;
         model.workspace.slots.push(Slot {
             id: slot_id,
-            weight: 1,
             binding: BindingState::Bound(window.clone()),
         });
         decisions.push(Decision::WindowInserted {
@@ -438,8 +588,11 @@ fn insert_windows(model: &mut Model, windows: &[PhysicalWindowId], decisions: &m
     }
 }
 
-fn flat_placements(settings: &Settings, axis: crate::Axis, slots: &[Slot]) -> Vec<Placement> {
-    let cells = LayoutTree::weighted_flat(axis, slots.iter()).placements(settings.canvas());
+/// An even row of the slots: what a model alone, with no layout tree, places.
+/// The engine replaces these with its own layout's placements.
+fn flat_placements(settings: &Settings, slots: &[Slot]) -> Vec<Placement> {
+    let cells = LayoutTree::flat(crate::Axis::Horizontal, slots.iter().map(|slot| slot.id))
+        .placements(settings.canvas());
     slots
         .iter()
         .zip(settings.spacing.place(settings.usable(), cells))

@@ -28,10 +28,14 @@ pub(super) enum WindowAttribute {
     CloseButton,
     Modal,
     Title,
+    Document,
+    Identifier,
+    CancelButton,
+    DefaultButton,
 }
 
 /// Indexed by `WindowAttribute as usize`.
-const NAMES: [&str; 11] = [
+const NAMES: [&str; 15] = [
     "AXRole",
     "AXSubrole",
     "AXMinimized",
@@ -43,6 +47,10 @@ const NAMES: [&str; 11] = [
     "AXCloseButton",
     "AXModal",
     "AXTitle",
+    "AXDocument",
+    "AXIdentifier",
+    "AXCancelButton",
+    "AXDefaultButton",
 ];
 
 impl WindowAttribute {

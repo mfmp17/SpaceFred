@@ -28,6 +28,8 @@ fn memory(placements: &[(u8, crate::Rect)]) -> WindowMemory {
                 workspace: workspace(*value),
                 frame: *frame,
                 floating: false,
+                document: None,
+                title: None,
             })
             .collect(),
         1,
@@ -205,6 +207,40 @@ fn a_recall_closes_when_its_app_quits_and_recording_resumes() {
 }
 
 #[test]
+fn reordered_but_unchanged_placements_keep_settling() {
+    // A newer native tab taking an older window's slot moves that placement
+    // later in the creation-ordered list; nothing moved, so the arrangement
+    // must still settle on its original schedule (#630).
+    let first = window(10);
+    let second = window(11);
+    let mut runtime = runtime(backend_with(&[
+        (first.clone(), frame(50)),
+        (second.clone(), frame(500)),
+    ]));
+    let cancelled = AtomicBool::new(false);
+    runtime.cycle(outputs(), &cancelled).unwrap();
+    runtime.cycle(outputs(), &cancelled).unwrap();
+    assert!(runtime.memory.memory.is_empty());
+
+    let (pending, since) = runtime.memory.pending.get_mut(BUNDLE).unwrap();
+    let before = pending.clone();
+    pending.reverse();
+    assert!(
+        !crate::window_memory::same_placement_list(pending, &before),
+        "fixture needs distinct placements"
+    );
+    *since -= crate::app::memory::MEMORY_SETTLE;
+    runtime.cycle(outputs(), &cancelled).unwrap();
+
+    let remembered = runtime.memory.memory.get(BUNDLE).expect("settled");
+    assert!(crate::window_memory::same_placement_list(
+        &remembered.windows,
+        &before
+    ));
+    assert!(runtime.memory.pending.is_empty());
+}
+
+#[test]
 fn memory_records_only_arrangements_that_settle() {
     let first = window(10);
     let second = window(11);
@@ -258,7 +294,7 @@ fn apps_launched_after_the_startup_recall_window_open_on_the_active_workspace() 
     let window = relaunched(10);
     let mut runtime = runtime(backend_with(&[(window.clone(), frame(50))]));
     runtime.restore_window_memory(memory(&[(3, frame(50))]));
-    runtime.memory.started_at = Some(Instant::now() - crate::app::memory::RECALL_WINDOW);
+    runtime.memory.started_at = Some(runtime.backend.now() - crate::app::memory::RECALL_WINDOW);
 
     runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
 
@@ -285,7 +321,7 @@ fn second_instance(id: u32) -> crate::PhysicalWindowId {
 fn settled_on_three(first: &crate::PhysicalWindowId) -> WorkspaceRuntime<FakeBackend> {
     let mut runtime = runtime(backend_with(&[(first.clone(), frame(50))]));
     runtime.restore_window_memory(memory(&[(3, frame(50))]));
-    runtime.memory.started_at = Some(Instant::now() - crate::app::memory::RECALL_WINDOW);
+    runtime.memory.started_at = Some(runtime.backend.now() - crate::app::memory::RECALL_WINDOW);
     bind(&mut runtime, workspace(3), first);
     runtime.cycle(outputs(), &AtomicBool::new(false)).unwrap();
     assert_eq!(runtime.workspaces.workspace_of(first), Some(workspace(3)));
@@ -581,6 +617,8 @@ fn a_recalled_floating_placement_keeps_the_window_floating() {
             workspace: WorkspaceId::ONE,
             frame: original,
             floating: true,
+            document: None,
+            title: None,
         }],
         1,
     ));
@@ -625,7 +663,7 @@ fn bare_executables_without_bundle_ids_do_not_share_placement_memory() {
     };
     let mut rt = runtime(backend);
     rt.restore_window_memory(crate::window_memory::WindowMemory::default());
-    rt.memory.started_at = Some(Instant::now() - crate::app::memory::RECALL_WINDOW);
+    rt.memory.started_at = Some(rt.backend.now() - crate::app::memory::RECALL_WINDOW);
     let cancel = AtomicBool::new(false);
     let three = WorkspaceId::new(3).unwrap();
     rt.switch(three, outputs(), &cancel).unwrap();
@@ -659,4 +697,177 @@ fn bare_executables_without_bundle_ids_do_not_share_placement_memory() {
 
     assert_eq!(rt.workspaces.workspace_of(&b), Some(WorkspaceId::ONE));
     assert!(!rt.parked.contains_key(&b));
+}
+
+#[test]
+fn memory_records_document_and_title_across_parking_and_ignores_case_only_title_churn() {
+    let first = window(10);
+    let second = window(11);
+    let mut observed = observation_for_windows(
+        BUNDLE,
+        &first,
+        &[(first.clone(), frame(50)), (second.clone(), frame(500))],
+    );
+    if let crate::AppObservation::Complete { windows, .. } = &mut observed.applications[0] {
+        windows[0].document = Some("file:///Users/example/code/spaceman".into());
+        windows[0].title = Some("spaceman — Cargo.toml".into());
+        windows[1].title = Some("Inbox (3) - Gmail".into());
+    }
+    let mut runtime = runtime(FakeBackend {
+        frames: HashMap::from([(first.clone(), frame(50)), (second.clone(), frame(500))]),
+        observation: Some(observed),
+        ..FakeBackend::default()
+    });
+    let cancelled = AtomicBool::new(false);
+    runtime.cycle(outputs(), &cancelled).unwrap();
+    runtime.cycle(outputs(), &cancelled).unwrap();
+
+    // Move first to workspace 2 so it gets parked off-screen and omitted from observations.
+    runtime
+        .move_window(first.clone(), workspace(2), outputs(), &cancelled)
+        .unwrap();
+    let mut only_second = observation_for(BUNDLE, &second, frame(500));
+    if let crate::AppObservation::Complete { windows, .. } = &mut only_second.applications[0] {
+        windows[0].title = Some("Inbox (3) - Gmail".into());
+    }
+    runtime.backend.observation = Some(only_second);
+    runtime.cycle(outputs(), &cancelled).unwrap();
+    runtime.cycle(outputs(), &cancelled).unwrap();
+
+    // Case/whitespace-only title differences must not reset MEMORY_SETTLE.
+    for (_, since) in runtime.memory.pending.values_mut() {
+        *since -= crate::app::memory::MEMORY_SETTLE;
+    }
+    let mut same_normalized = observation_for(BUNDLE, &second, frame(500));
+    if let crate::AppObservation::Complete { windows, .. } = &mut same_normalized.applications[0] {
+        windows[0].title = Some("  inbox (3) - gmail  ".into());
+    }
+    runtime.backend.observation = Some(same_normalized);
+    runtime.cycle(outputs(), &cancelled).unwrap();
+
+    let remembered = runtime.memory.memory.get(BUNDLE).unwrap();
+    assert_eq!(remembered.windows.len(), 2);
+    // Parked window kept its observed document and title!
+    assert_eq!(remembered.windows[0].workspace, workspace(2));
+    assert_eq!(
+        remembered.windows[0].document.as_deref(),
+        Some("file:///Users/example/code/spaceman")
+    );
+    assert_eq!(
+        remembered.windows[0].title.as_deref(),
+        Some("spaceman — Cargo.toml")
+    );
+    assert_eq!(remembered.windows[1].workspace, WorkspaceId::ONE);
+    assert_eq!(remembered.windows[1].document, None);
+    assert_eq!(
+        remembered.windows[1].title.as_deref(),
+        Some("inbox (3) - gmail")
+    );
+
+    // A subsequent cycle with only a case difference must not mark memory dirty.
+    runtime.backend.window_memory = None;
+    let mut upper = observation_for(BUNDLE, &second, frame(500));
+    if let crate::AppObservation::Complete { windows, .. } = &mut upper.applications[0] {
+        windows[0].title = Some("INBOX (3) - GMAIL".into());
+    }
+    runtime.backend.observation = Some(upper);
+    runtime.cycle(outputs(), &cancelled).unwrap();
+    assert!(runtime.memory.pending.is_empty());
+    assert!(runtime.backend.window_memory.is_none());
+}
+
+#[test]
+fn continuous_title_churn_still_settles_and_unread_counter_ticks_do_not_rewrite_memory() {
+    let win = window(10);
+    let with_title = |title: &str| {
+        let mut obs = observation_for(BUNDLE, &win, frame(50));
+        if let crate::AppObservation::Complete { windows, .. } = &mut obs.applications[0] {
+            windows[0].title = Some(title.into());
+        }
+        obs
+    };
+    let mut rt = runtime(FakeBackend {
+        frames: HashMap::from([(win.clone(), frame(50))]),
+        observation: Some(with_title("Slack (1)")),
+        ..FakeBackend::default()
+    });
+    let cancelled = AtomicBool::new(false);
+    // First cycle tiles the window; second cycle seeds pending at the tiled frame.
+    rt.cycle(outputs(), &cancelled).unwrap();
+    rt.cycle(outputs(), &cancelled).unwrap();
+    assert!(rt.memory.memory.is_empty());
+    assert!(rt.memory.pending.contains_key(BUNDLE));
+
+    // Title churns on every single cycle (unread counter and arbitrary tab titles) across
+    // MEMORY_SETTLE: the original pending timestamp must survive and settle with the latest title.
+    let step = crate::app::memory::MEMORY_SETTLE / 5;
+    let titles = [
+        "Slack (2)",
+        "Slack — #general (3)",
+        "Slack — #dev (4)",
+        "Slack — #random (5)",
+        "Slack (6)",
+    ];
+    for title in titles {
+        rt.backend.advance(step);
+        rt.backend.observation = Some(with_title(title));
+        rt.cycle(outputs(), &cancelled).unwrap();
+    }
+
+    let remembered = rt.memory.memory.get(BUNDLE).expect("settled after churn");
+    assert_eq!(remembered.windows.len(), 1);
+    assert_eq!(remembered.windows[0].title.as_deref(), Some("Slack (6)"));
+    assert!(rt.backend.window_memory.is_some());
+    let remembered_events = |rt: &WorkspaceRuntime<FakeBackend>| {
+        rt.backend
+            .journal
+            .iter()
+            .filter(|event| matches!(event, crate::journal::JournalEvent::Remembered { .. }))
+            .count()
+    };
+    assert_eq!(remembered_events(&rt), 1);
+
+    // Subsequent unread-badge ticks must not re-dirty memory, queue pending, or rewrite disk.
+    rt.backend.window_memory = None;
+    for badge in ["Slack (7)", "Slack (8)", "Slack (99+)"] {
+        rt.backend.advance(crate::app::memory::MEMORY_SETTLE);
+        rt.backend.observation = Some(with_title(badge));
+        rt.cycle(outputs(), &cancelled).unwrap();
+        assert!(rt.memory.pending.is_empty(), "badge {badge} queued pending");
+        assert!(
+            rt.backend.window_memory.is_none(),
+            "badge {badge} rewrote window memory"
+        );
+    }
+    assert_eq!(remembered_events(&rt), 1);
+}
+
+#[test]
+fn missing_window_server_snapshot_does_not_overwrite_settled_memory() {
+    let first = window(10);
+    let second = window(11);
+    let mut rt = runtime(backend_with(&[
+        (first.clone(), frame(50)),
+        (second.clone(), frame(500)),
+    ]));
+    let cancelled = AtomicBool::new(false);
+    rt.cycle(outputs(), &cancelled).unwrap();
+    rt.move_window(first.clone(), workspace(2), outputs(), &cancelled)
+        .unwrap();
+    rt.backend.observation = Some(observation_for(BUNDLE, &second, frame(500)));
+    rt.cycle(outputs(), &cancelled).unwrap();
+    rt.cycle(outputs(), &cancelled).unwrap();
+    rt.backend.advance(crate::app::memory::MEMORY_SETTLE);
+    rt.cycle(outputs(), &cancelled).unwrap();
+    assert_eq!(rt.memory.memory.get(BUNDLE).unwrap().windows.len(), 2);
+
+    // If CGWindowList is temporarily unavailable (empty server_frames while apps were observed),
+    // record_window_memory must skip rather than persisting only the parked window.
+    rt.backend.window_memory = None;
+    rt.backend.server_snapshot_unavailable = true;
+    rt.cycle(outputs(), &cancelled).unwrap();
+    rt.backend.advance(crate::app::memory::MEMORY_SETTLE);
+    rt.cycle(outputs(), &cancelled).unwrap();
+    assert_eq!(rt.memory.memory.get(BUNDLE).unwrap().windows.len(), 2);
+    assert!(rt.backend.window_memory.is_none());
 }

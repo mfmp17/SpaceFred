@@ -1,4 +1,4 @@
-use super::super::commands::FOCUS_SETTLE;
+use super::super::focus::FOCUS_SETTLE;
 use super::*;
 
 /// Press a workspace shortcut or select a workspace from the menu bar / HUD,
@@ -56,7 +56,9 @@ fn pressing_the_active_workspace_shortcut_again_cycles_its_tiles() {
         for window in [&first, &second, &third] {
             bind(&mut runtime, two, window);
         }
-        runtime.workspaces.set_fullscreen_layout(two, fullscreen);
+        runtime
+            .workspaces
+            .set_deck(two, crate::workspace::DeckMode::from_fullscreen(fullscreen));
 
         // The first press switches to Space 2 and lands on its first tile.
         let status = press(&mut runtime, WorkerAction::SwitchWorkspace(two));
@@ -116,7 +118,7 @@ fn quick_repeat_presses_step_on_while_accessibility_still_reports_the_old_window
 
     // Once the settle window has passed, the reported focus wins again.
     runtime.backend.focused = Some(first);
-    runtime.pending_focus.as_mut().unwrap().at -= FOCUS_SETTLE;
+    runtime.focus.age_request(FOCUS_SETTLE);
     press(&mut runtime, WorkerAction::SwitchWorkspace(two));
     assert_eq!(
         focus_calls(&runtime),
@@ -288,7 +290,9 @@ fn quick_repeat_after_returning_from_another_display_advances_during_activation_
         bind(&mut runtime, two, &first);
         bind(&mut runtime, two, &second);
         bind(&mut runtime, WorkspaceId::SIX, &elsewhere);
-        runtime.workspaces.set_fullscreen_layout(two, fullscreen);
+        runtime
+            .workspaces
+            .set_deck(two, crate::workspace::DeckMode::from_fullscreen(fullscreen));
         press(&mut runtime, WorkerAction::SwitchWorkspace(two));
 
         runtime.backend.focused = Some(elsewhere.clone());
@@ -333,7 +337,7 @@ fn stale_focus_report_does_not_lose_selected_tile_on_switch_move_or_cycle() {
         }
         press(&mut rt, WorkerAction::Focus(Direction::Right));
         assert_eq!(rt.backend.focused, Some(second));
-        assert!(rt.pending_focus.is_some());
+        assert!(rt.focus.in_flight(rt.backend.now()).is_some());
         rt
     };
 
@@ -397,7 +401,7 @@ fn cross_display_focus_then_move_workspace_targets_pending_workspace_during_lag(
         bind(&mut rt, WorkspaceId::SIX, &second);
         press(&mut rt, WorkerAction::Focus(Direction::Right));
         assert_eq!(rt.backend.focused, Some(second.clone()));
-        assert_eq!(rt.pending_focus.as_ref().unwrap().target, second);
+        assert_eq!(rt.focus.in_flight(rt.backend.now()).unwrap().target, second);
 
         if stale {
             rt.backend.focused = Some(first.clone());
@@ -421,9 +425,11 @@ fn cross_display_focus_then_move_workspace_targets_pending_workspace_during_lag(
         );
         assert!(!rt.parked.contains_key(&second));
         if stale {
-            assert_eq!(rt.suppressed_focus, Some(first));
+            assert_eq!(rt.focus.guarded_window().cloned(), Some(first));
             assert_eq!(
-                rt.pending_focus.as_ref().map(|p| p.target.clone()),
+                rt.focus
+                    .in_flight(rt.backend.now())
+                    .map(|p| p.target.clone()),
                 Some(second)
             );
         }
@@ -463,18 +469,18 @@ fn cross_display_entry_fixture(park_secondary_on_seven: bool) -> WorkspaceRuntim
         let displays = outputs().frames().collect::<Vec<_>>();
         let parked = crate::geometry::parked_frame(displays[1], &displays, frame(1050));
         rt.backend.frames.insert(w30.clone(), parked);
-        rt.parked.insert(w30.clone(), frame(1050));
+        rt.parked.insert(w30.clone(), frame(1050), None);
         bind(&mut rt, WorkspaceId::new(7).unwrap(), &w30);
     } else {
         bind(&mut rt, WorkspaceId::SIX, &w30);
     }
     bind(&mut rt, WorkspaceId::TWO, &w40);
     rt.workspaces.switch(WorkspaceId::ONE);
-    rt.foreground_lanes
-        .insert("main-id".into(), DisplaySelector::Main);
+    rt.workspaces
+        .bring_forward("main-id", DisplaySelector::Main);
     rt.workspaces.switch(WorkspaceId::SIX);
-    rt.foreground_lanes
-        .insert("secondary-id".into(), DisplaySelector::Secondary);
+    rt.workspaces
+        .bring_forward("secondary-id", DisplaySelector::Secondary);
     rt
 }
 
@@ -488,7 +494,11 @@ fn workspace_switch_keeps_superseded_cross_display_focus_target_stale() {
     let entries = [
         WorkerAction::SwitchWorkspace(WorkspaceId::TWO),
         WorkerAction::SelectWorkspace(WorkspaceId::TWO),
-        WorkerAction::Swipe(crate::swipe::Swipe::Left, (500, 400)),
+        WorkerAction::Swipe(
+            crate::swipe::Swipe::Left,
+            crate::swipe::Fingers::Three,
+            (500, 400),
+        ),
     ];
     for entry in entries {
         for reported in [10, 30, 40] {
@@ -580,11 +590,11 @@ fn workspace_selection_keeps_raw_report_departure_policy_and_drops_expired_stale
         );
     }
 
-    // Expired prior pending_focus must not be carried into the new entry request.
+    // An expired prior focus request must not be carried into the new entry request.
     let mut rt = cross_display_entry_fixture(false);
     press(&mut rt, WorkerAction::Focus(Direction::Right));
     assert_eq!(rt.backend.focused, Some(w30.clone()));
-    rt.pending_focus.as_mut().unwrap().at -= FOCUS_SETTLE;
+    rt.focus.age_request(FOCUS_SETTLE);
     report_focus(&mut rt, &w10);
     press(&mut rt, WorkerAction::SelectWorkspace(WorkspaceId::TWO));
     assert_eq!(rt.backend.focused, Some(w40.clone()));

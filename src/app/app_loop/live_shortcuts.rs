@@ -161,6 +161,16 @@ impl MainThreadAgent {
         }
     }
 
+    /// Whether the previous table still runs after the saved one was rejected: tiling is on and
+    /// its shortcuts are registered, or only held off for a recording.
+    pub(super) fn previous_shortcuts_run(&self) -> bool {
+        rejected_table_keeps_previous(
+            self.automatic,
+            self.hotkeys.is_some() || self.hotkey_hold.is_held(),
+            self.is_shortcuts_not_applied_error(),
+        )
+    }
+
     pub(super) fn is_shortcuts_not_applied_error(&self) -> bool {
         self.last_error
             .as_deref()
@@ -218,7 +228,7 @@ impl MainThreadAgent {
                 log_event!("hotkeys: could not restore the previous shortcuts: {error}");
                 let message = not_applied.as_deref().unwrap_or(&error);
                 self.shortcuts_not_applied(message);
-                self.stop_automatic_and_restore();
+                self.stop_automatic_and_restore(RestoreKind::Restore);
                 status_item::set_status(&format!("Hotkeys unavailable: {error}"));
             }
         }
@@ -231,18 +241,24 @@ impl MainThreadAgent {
         self.ui_dirty = true;
     }
 
-    /// Settings › Shortcuts is recording a chord (`true`) or finished (`false`). While it records,
-    /// the hotkeys are unregistered so the chord reaches the recorder instead of firing; they
-    /// register again, with any table saved meanwhile, the moment it stops.
-    pub fn set_shortcut_recording(&mut self, recording: bool) {
-        let now = Instant::now();
-        let hold = recording && self.recording_since.get_or_insert(now).elapsed() < RECORDING_LIMIT;
+    /// Holds the hotkeys off for this tick, or lets them back. `recording`: Settings › Shortcuts
+    /// is recording a chord, so it must reach the recorder instead of firing. `practicing`: the
+    /// setup tour's Try it step has the keyboard, so its shortcuts drive the tour's miniature
+    /// desktop instead of the real windows; the host says so only while the setup window is the
+    /// key window, so that hold needs no time limit. The hotkeys register again, with any table
+    /// saved meanwhile, the moment neither holds.
+    pub fn hold_hotkeys(&mut self, recording: bool, practicing: bool) {
+        let recording_for = recording.then(|| {
+            self.recording_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+        });
         if !recording {
             self.recording_since = None;
         }
-        if hold {
+        if let Some(reason) = hold_reason(recording_for, practicing) {
             if self.hotkeys.take().is_some() {
-                log_event!("hotkeys: paused while Settings records a shortcut");
+                log_event!("hotkeys: paused while {reason}");
                 self.hotkey_delivery.clear();
                 self.hotkey_hold = HotkeyHold::Held { pending: None };
             }
@@ -254,7 +270,7 @@ impl MainThreadAgent {
         if self.hotkeys.is_some() {
             return;
         }
-        log_event!("hotkeys: resumed after recording");
+        log_event!("hotkeys: resumed");
         if let Some(next) = pending {
             self.reinstall_changed_shortcuts(next);
             return;
@@ -265,14 +281,32 @@ impl MainThreadAgent {
                 let error = format!("Hotkeys unavailable: {error}");
                 log_event!("{error}");
                 self.last_error = Some(error.clone());
-                self.stop_automatic_and_restore();
+                self.stop_automatic_and_restore(RestoreKind::Restore);
                 status_item::set_status(&error);
             }
         }
     }
 }
 
+/// Why the hotkeys are held off, if they are: a recording within its limit, or the setup tour's
+/// Try it step.
+fn hold_reason(recording_for: Option<Duration>, practicing: bool) -> Option<&'static str> {
+    if recording_for.is_some_and(|elapsed| elapsed < RECORDING_LIMIT) {
+        Some("Settings records a shortcut")
+    } else if practicing {
+        Some("the setup tour tries its shortcuts")
+    } else {
+        None
+    }
+}
+
 pub(super) const NOT_APPLIED: &str = "Shortcuts not applied";
+
+/// A rejected table leaves the previous one running only while tiling is on and the hotkeys are
+/// registered (or held for a recording). A failed rollback or a pause leaves none registered.
+fn rejected_table_keeps_previous(automatic: bool, registered: bool, rejected: bool) -> bool {
+    automatic && registered && rejected
+}
 
 #[cfg(test)]
 mod tests {
@@ -296,6 +330,32 @@ mod tests {
         .unwrap()
         .shortcuts()
         .clone()
+    }
+
+    #[test]
+    fn only_a_rollback_that_kept_its_shortcuts_says_they_still_run() {
+        // Reverted: tiling on, the previous table registered, the rejection reported.
+        assert!(rejected_table_keeps_previous(true, true, true));
+        // The rollback failed too, or tiling was paused after the rejection: the reason stays,
+        // but tiling is off and no shortcut is registered.
+        assert!(!rejected_table_keeps_previous(false, false, true));
+        // Never while tiling is off, whatever is left registered.
+        assert!(!rejected_table_keeps_previous(false, true, true));
+        // Tiling on but the shortcuts gone.
+        assert!(!rejected_table_keeps_previous(true, false, true));
+        // Applied: no rejection to report.
+        assert!(!rejected_table_keeps_previous(true, true, false));
+    }
+
+    #[test]
+    fn a_recording_holds_for_its_limit_and_the_tour_for_as_long_as_it_practices() {
+        assert_eq!(hold_reason(None, false), None);
+        assert!(hold_reason(Some(Duration::ZERO), false).is_some());
+        // A recorder left listening gives the shortcuts back.
+        assert_eq!(hold_reason(Some(RECORDING_LIMIT), false), None);
+        // The tour's hold has no limit of its own, with or without a recording beside it.
+        assert!(hold_reason(None, true).is_some());
+        assert!(hold_reason(Some(RECORDING_LIMIT), true).is_some());
     }
 
     #[test]

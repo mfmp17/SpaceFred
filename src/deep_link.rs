@@ -285,7 +285,7 @@ fn resolve_feature(slug: &str) -> OpenTarget {
             highlight_feature: (slug != "activity").then(|| slug.to_owned()),
             diagnostic: None,
         },
-        "gaps" | "max-width" | "layout" => OpenTarget {
+        "gaps" | "max-width" | "single-window-height" | "layout" => OpenTarget {
             pane: Some(DeepLinkPane::Layout),
             highlight_lab: None,
             highlight_feature: Some(slug.to_owned()),
@@ -297,10 +297,28 @@ fn resolve_feature(slug: &str) -> OpenTarget {
             highlight_feature: Some("hud".to_owned()),
             diagnostic: None,
         },
+        "menu-bar-icon" => OpenTarget {
+            pane: Some(DeepLinkPane::General),
+            highlight_lab: None,
+            highlight_feature: Some("menu-bar-icon".to_owned()),
+            diagnostic: None,
+        },
+        "mouse-follows-focus" => OpenTarget {
+            pane: Some(DeepLinkPane::General),
+            highlight_lab: None,
+            highlight_feature: Some("mouse-follows-focus".to_owned()),
+            diagnostic: None,
+        },
         "tiling" | "automatic-tiling" => OpenTarget {
             pane: Some(DeepLinkPane::General),
             highlight_lab: None,
             highlight_feature: Some("tiling".to_owned()),
+            diagnostic: None,
+        },
+        "pause-on-builtin-display" => OpenTarget {
+            pane: Some(DeepLinkPane::General),
+            highlight_lab: None,
+            highlight_feature: Some("pause-on-builtin-display".to_owned()),
             diagnostic: None,
         },
         "updates" | "update-channel" => OpenTarget {
@@ -620,6 +638,24 @@ mod tests {
                 Some(DeepLinkPane::General),
                 None,
                 Some("hud"),
+            ),
+            (
+                "spaceman://features/menu-bar-icon",
+                Some(DeepLinkPane::General),
+                None,
+                Some("menu-bar-icon"),
+            ),
+            (
+                "spaceman://features/mouse-follows-focus",
+                Some(DeepLinkPane::General),
+                None,
+                Some("mouse-follows-focus"),
+            ),
+            (
+                "spaceman://features/single-window-height",
+                Some(DeepLinkPane::Layout),
+                None,
+                Some("single-window-height"),
             ),
         ];
         for (url, pane, lab, feature) in cases {

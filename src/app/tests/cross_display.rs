@@ -34,8 +34,8 @@ fn moving_a_window_to_the_workspace_on_screen_on_another_display_tiles_it_there(
     assert!(!runtime.parked.contains_key(&window));
     assert_eq!(runtime.backend.focused, Some(window));
     // Focus followed the window to Main, so Option+Tab goes back to Secondary.
-    assert_eq!(runtime.last_focused_workspace, Some(WorkspaceId::ONE));
-    assert_eq!(runtime.previous_focused_workspace, Some(WorkspaceId::SIX));
+    assert_eq!(runtime.focus.history().current, Some(WorkspaceId::ONE));
+    assert_eq!(runtime.focus.history().previous, Some(WorkspaceId::SIX));
 }
 
 #[test]
@@ -288,6 +288,8 @@ workspace = 2",
                     workspace: target,
                     frame: frame(1050),
                     floating: false,
+                    document: None,
+                    title: None,
                 }],
                 1,
             );
@@ -314,6 +316,77 @@ workspace = 2",
                 &outputs().frames().collect::<Vec<_>>(),
             ),
             "recall={recall}: window should be parked off-screen"
+        );
+    }
+}
+
+/// #689: a recalled window whose first park to its hidden workspace is refused keeps the
+/// placement it claimed, tile or float, and joins it once the window accepts the move.
+#[test]
+fn a_recalled_window_keeps_its_placement_across_a_refused_first_park() {
+    use crate::window_memory::{RememberedWindow, WindowMemory};
+
+    let target = WorkspaceId::new(7).unwrap();
+    let remembered = crate::Rect {
+        x: 1300,
+        y: 40,
+        width: 400,
+        height: 300,
+    };
+    for floating in [false, true] {
+        let id = window(20);
+        let backend = FakeBackend {
+            frames: [(id.clone(), frame(100))].into_iter().collect(),
+            observation: Some(observation(&id, frame(100))),
+            focused: Some(id.clone()),
+            // Like the reported app: any write that changes its x is refused.
+            refuses_position: Some(|rect: crate::Rect| rect.x != 100),
+            ..FakeBackend::default()
+        };
+        let mut rt = runtime(backend);
+        let mut memory = WindowMemory::default();
+        memory.record(
+            "com.example.Test",
+            vec![RememberedWindow {
+                workspace: target,
+                frame: remembered,
+                floating,
+                document: None,
+                title: None,
+            }],
+            1,
+        );
+        rt.restore_window_memory(memory);
+
+        let status = rt.cycle(outputs(), &AtomicBool::new(false)).unwrap();
+        assert!(
+            status.failed > 0,
+            "floating={floating}: the park is refused"
+        );
+        assert_eq!(
+            rt.workspaces.workspace_of_any(&id),
+            None,
+            "floating={floating}"
+        );
+        assert!(!rt.parked.contains_key(&id), "floating={floating}");
+
+        rt.backend.refuses_position = None;
+        let status = rt.cycle(outputs(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(status.failed, 0, "floating={floating}");
+        if floating {
+            assert_eq!(rt.workspaces.floating_workspace_of(&id), Some(target));
+            let recovery = rt.parked.get(&id).copied().expect("parked");
+            assert_eq!((recovery.x, recovery.y), (remembered.x, remembered.y));
+        } else {
+            assert_eq!(rt.workspaces.workspace_of(&id), Some(target));
+            assert!(rt.parked.contains_key(&id));
+        }
+        assert!(
+            !crate::geometry::shows_on(
+                rt.backend.frames[&id],
+                &outputs().frames().collect::<Vec<_>>(),
+            ),
+            "floating={floating}: parked off-screen"
         );
     }
 }
@@ -555,8 +628,7 @@ fn moving_floating_window_back_before_cross_display_park_settles_restores_on_mai
     rt.backend.frozen_server_frames = false;
     rt.backend.server_frames.insert(w.clone(), park);
     rt.backend.server_frames.insert(w.clone(), newer);
-    rt.recently_parked
-        .insert(w.clone(), Instant::now() - Duration::from_secs(3));
+    rt.backend.advance(Duration::from_secs(3));
     rt.backend.observation = Some(observation(&w, newer));
     assert_eq!(
         rt.cycle(outputs(), &AtomicBool::new(false)).unwrap().failed,
@@ -629,8 +701,7 @@ fn moving_workspace_relocates_pending_parked_float_onto_target_display() {
             rt.workspaces.assignment(WorkspaceId::ONE),
             &DisplaySelector::Secondary
         );
-        rt.recently_parked
-            .insert(w.clone(), Instant::now() - Duration::from_secs(3));
+        rt.backend.advance(Duration::from_secs(3));
         for _ in 0..2 {
             rt.backend.observation = Some(observation(&w, rt.backend.frames[&w]));
             assert_eq!(act(&mut rt, WorkerAction::Retile).failed, 0);
@@ -693,7 +764,7 @@ fn display_pointer_follow_uses_dragged_floats_actual_display() {
         rt.backend.frames.insert(window(30), frame(1050));
         run(
             &mut rt,
-            WorkerCommand::Gesture(FinalGesture::Drop(window(30), (1250, 30)), false, outputs()),
+            WorkerCommand::Gesture(FinalGesture::drop(window(30), (1250, 30)), false, outputs()),
         );
         rt.backend.calls.clear();
         rt

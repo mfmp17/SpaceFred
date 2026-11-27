@@ -13,3 +13,4 @@ target/
 *.p12
 *.provisionprofile
 /scratchpad/
+/captures

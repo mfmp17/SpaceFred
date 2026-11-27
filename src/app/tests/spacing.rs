@@ -46,7 +46,7 @@ fn layout_applies_gaps_padding_and_the_single_window_width() {
 
     runtime
         .workspaces
-        .set_fullscreen_layout(WorkspaceId::ONE, true);
+        .set_deck(WorkspaceId::ONE, crate::workspace::DeckMode::Monocle);
     runtime.layout_workspace(WorkspaceId::ONE, output, &cancelled);
     assert_eq!(runtime.backend.frames[&left], lone);
     assert_eq!(runtime.backend.frames[&right], lone);
@@ -100,9 +100,15 @@ fn a_config_without_spacing_tiles_edge_to_edge() {
 /// Mirrors `macos::apply::apply_element`'s tolerance short-circuit so tests
 /// prove both `cycle`'s placement filter and the native writer apply small
 /// spacing changes (e.g. 0 -> 4 pt inner gap, a 2 pt delta per tile).
-struct ToleranceAwareBackend(FakeBackend);
+pub(super) struct ToleranceAwareBackend(pub(super) FakeBackend);
 
 impl WorkspaceBackend for ToleranceAwareBackend {
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+    fn pause(&mut self, duration: Duration) {
+        self.0.pause(duration);
+    }
     fn snapshot(
         &mut self,
         cycle: u64,
@@ -137,6 +143,9 @@ impl WorkspaceBackend for ToleranceAwareBackend {
     fn onscreen_window_order(&mut self) -> Option<Vec<u32>> {
         self.0.onscreen_window_order()
     }
+    fn window_owners(&mut self, window_ids: &HashSet<u32>) -> HashMap<u32, AppInstanceId> {
+        self.0.window_owners(window_ids)
+    }
     fn set_position(
         &mut self,
         window: &crate::PhysicalWindowId,
@@ -155,6 +164,9 @@ impl WorkspaceBackend for ToleranceAwareBackend {
     }
     fn focus_window(&mut self, window: &crate::PhysicalWindowId) -> bool {
         self.0.focus_window(window)
+    }
+    fn detach_tab(&mut self, window: &crate::PhysicalWindowId) -> macos::TabDetachResult {
+        self.0.detach_tab(window)
     }
     fn apply_managed(
         &mut self,
@@ -246,6 +258,7 @@ fn observe_windows(windows: &[&crate::PhysicalWindowId]) -> crate::NativeObserva
                     frame: frame(0),
                     resizable: true,
                     title: None,
+                    document: None,
                 })
                 .collect(),
         }],
@@ -372,7 +385,6 @@ fn startup_with_small_inner_gap_separates_already_touching_windows() {
             .engine_mut(WorkspaceId::ONE)
             .insert_slot(Slot {
                 id: SlotId((index + 1) as u64),
-                weight: 1,
                 binding: BindingState::Bound(win.clone()),
             });
     }
@@ -384,4 +396,62 @@ fn startup_with_small_inner_gap_separates_already_touching_windows() {
     );
     assert_eq!((a.x, a.width, b.x, b.width), (0, 498, 502, 498));
     assert_eq!(b.x - (a.x + a.width), 4);
+}
+
+/// #614: layout toggles while the button is held write nothing, so a small gap
+/// change made during the drag must still reach the seam after release.
+/// Reported by @coygeek.
+#[test]
+fn layout_toggles_during_a_held_drag_keep_a_small_gap_change_owed() {
+    for toggles in [0, 2] {
+        let (left, right) = (window(10), window(11));
+        let mut fake = FakeBackend {
+            observation: Some(observe_windows(&[&left, &right])),
+            focused: Some(left.clone()),
+            ..FakeBackend::default()
+        };
+        fake.frames.insert(left.clone(), frame(0));
+        fake.frames.insert(right.clone(), frame(100));
+        let mut runtime = WorkspaceRuntime::with_backend_and_config(
+            ManagementScope::Both,
+            ToleranceAwareBackend(fake),
+            HashMap::new(),
+            Config::default(),
+        );
+        retile(&mut runtime);
+        let (a, b) = (
+            runtime.backend.0.frames[&left],
+            runtime.backend.0.frames[&right],
+        );
+        assert_eq!((a.x, a.width, b.x, b.width), (0, 500, 500, 500));
+
+        // Held: the native writer defers every write.
+        runtime.backend.0.mouse_down = true;
+        runtime.backend.0.managed_outcome = Some(macos::ApplyOutcome::Deferred);
+        runtime.replace_config(config_with_inner_gap(2));
+        for _ in 0..toggles {
+            let result = runtime.execute(
+                WorkerCommand::Action(WorkerAction::ToggleLayout, outputs()),
+                &AtomicBool::new(false),
+            );
+            assert!(matches!(
+                result,
+                Some(WorkerResult::Status { result: Ok(_), .. })
+            ));
+        }
+        assert_eq!(runtime.backend.0.frames[&left], a);
+
+        runtime.backend.0.mouse_down = false;
+        runtime.backend.0.managed_outcome = None;
+        retile(&mut runtime);
+        let (a, b) = (
+            runtime.backend.0.frames[&left],
+            runtime.backend.0.frames[&right],
+        );
+        assert_eq!(
+            (a.x, a.width, b.x, b.width),
+            (0, 499, 501, 499),
+            "toggles={toggles}"
+        );
+    }
 }

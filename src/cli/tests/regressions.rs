@@ -401,3 +401,271 @@ fn config_commands_keep_and_show_the_workspace_order() {
         serde_json::json!([1, "Q", "W"])
     );
 }
+
+#[test]
+fn config_gets_sets_and_resets_layout() {
+    let temp = TempConfig::new("layout");
+    temp.write("# Mine.\nversion = 1\n[settings]\nhud_style = \"layouts\"\n");
+    assert_eq!(
+        temp.run(&["config", "get", "layout"]).stdout.as_deref(),
+        Some("dwindle")
+    );
+    assert_eq!(
+        temp.run(&["config", "get", "settings.layout"])
+            .stdout
+            .as_deref(),
+        Some("dwindle")
+    );
+
+    let set_columns = temp.run(&["config", "set", "settings.layout", "columns"]);
+    assert_eq!(set_columns.exit_code, 0, "{:?}", set_columns.stderr);
+    assert_eq!(set_columns.stdout.as_deref(), Some("set layout = columns"));
+    assert_eq!(
+        Config::parse(&temp.read()).unwrap().layout(),
+        spaceman::config::LayoutMode::Columns
+    );
+    assert!(temp.read().contains("hud_style = \"layouts\""));
+
+    assert_eq!(
+        temp.run(&["config", "get", "layout"]).stdout.as_deref(),
+        Some("columns")
+    );
+    let show: Value = serde_json::from_str(
+        temp.run(&["config", "show", "--json"])
+            .stdout
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(show["settings"]["layout"], "columns");
+    assert_eq!(show["settings"]["hud_style"], "layouts");
+
+    let reset = temp.run(&["config", "reset", "layout"]);
+    assert_eq!(reset.exit_code, 0, "{:?}", reset.stderr);
+    assert_eq!(reset.stdout.as_deref(), Some("reset layout = dwindle"));
+    let source = temp.read();
+    assert!(!source.contains("layout ="), "{source}");
+    assert!(source.contains("hud_style = \"layouts\""), "{source}");
+    assert_eq!(
+        Config::parse(&source).unwrap().layout(),
+        spaceman::config::LayoutMode::Dwindle
+    );
+
+    temp.write("version = 1\n[settings]\nlayout = \"columns\"\n");
+    let reset_json: Value = serde_json::from_str(
+        temp.run(&["config", "reset", "settings.layout", "--json"])
+            .stdout
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reset_json["key"], "layout");
+    assert_eq!(reset_json["value"], "dwindle");
+    assert!(!temp.read().contains("[settings]"));
+
+    let bad = temp.run(&["config", "set", "layout", "bsp"]);
+    assert_ne!(bad.exit_code, 0);
+    assert!(
+        bad.stderr
+            .unwrap()
+            .contains("expected 'dwindle' or 'columns'")
+    );
+}
+
+#[test]
+fn rules_add_writes_pin_and_title_contains_rules_and_lists_them_back() {
+    let temp = TempConfig::new("rules-pin-title-contains");
+
+    let pinned = temp.run(&["rules", "add", "--app", "com.apple.Stickies", "--pin"]);
+    assert_eq!(pinned.exit_code, 0);
+    assert_eq!(
+        pinned.stdout.as_deref(),
+        Some("added rule 1: bundle_id=com.apple.Stickies -> pin")
+    );
+    let routed = temp.run(&[
+        "rules",
+        "add",
+        "--app",
+        "com.apple.Safari",
+        "--title-contains",
+        "Work",
+        "--workspace",
+        "2",
+    ]);
+    assert_eq!(routed.exit_code, 0);
+    assert_eq!(
+        routed.stdout.as_deref(),
+        Some("added rule 2: bundle_id=com.apple.Safari title_contains=\"Work\" -> workspace 2")
+    );
+
+    let config = Config::parse(&temp.read()).unwrap();
+    assert_eq!(
+        config.disposition("com.apple.Stickies", &sample_window(None)),
+        WindowDisposition::Pinned
+    );
+    assert_eq!(
+        config.disposition("com.apple.Safari", &sample_window(Some("work — PR"))),
+        WindowDisposition::Route(WorkspaceId::TWO)
+    );
+    let listed = temp.run(&["rules", "list", "--json"]);
+    let json: Value = serde_json::from_str(listed.stdout.as_deref().unwrap()).unwrap();
+    assert_eq!(json["rules"][1]["title_contains"], "Work");
+
+    let both = temp.run(&["rules", "add", "--app", "x", "--pin", "--float"]);
+    assert_ne!(both.exit_code, 0);
+}
+
+#[test]
+fn config_gets_sets_shows_and_resets_trackpad_swipe() {
+    let temp = TempConfig::new("config-trackpad-swipe");
+    temp.write("version = 1\n");
+    assert_eq!(
+        temp.run(&["config", "get", "trackpad_swipe"])
+            .stdout
+            .as_deref(),
+        Some("true")
+    );
+
+    let bad = temp.run(&["config", "set", "trackpad_swipe", "off"]);
+    assert_eq!(bad.exit_code, 1);
+    assert!(bad.stderr.unwrap().contains("expected 'true' or 'false'"));
+
+    let set = temp.run(&["config", "set", "trackpad_swipe", "false"]);
+    assert_eq!(set.exit_code, 0, "{:?}", set.stderr);
+    // Read only with its Lab on.
+    assert!(Config::parse(&temp.read()).unwrap().trackpad_swipe());
+    let lab = temp.run(&["config", "set", "labs.swipe_switch", "true"]);
+    assert_eq!(lab.exit_code, 0, "{:?}", lab.stderr);
+    assert!(!Config::parse(&temp.read()).unwrap().trackpad_swipe());
+    let shown = temp.run(&["config", "show", "--json"]).stdout.unwrap();
+    let show: Value = serde_json::from_str(&shown).unwrap();
+    assert_eq!(show["settings"]["trackpad_swipe"], false);
+
+    let reset = temp.run(&["config", "reset", "trackpad_swipe"]);
+    assert_eq!(reset.exit_code, 0, "{:?}", reset.stderr);
+    assert!(!temp.read().contains("trackpad_swipe"));
+}
+
+#[test]
+fn config_edits_keep_every_comment_they_do_not_remove() {
+    const BEFORE: &str = r#"# My Spaceman config.
+version = 1
+
+[settings]
+# Columns on this Mac.
+layout = "columns"
+hud_position = "top"
+
+[settings.gaps]
+# Leave room at every edge.
+outer = 8
+
+# Terminals
+[[rules]]
+bundle_id = "com.apple.Terminal"
+action = "route"
+workspace = 2
+
+# Disabled for now:
+# [[rules]]
+# bundle_id = "com.apple.Safari"
+# action = "route"
+# workspace = 1
+"#;
+    let temp = TempConfig::new("keep-comments");
+    let comments = |source: &str| source.lines().filter(|line| line.starts_with('#')).count();
+
+    // Nothing to change leaves the file byte for byte.
+    for args in [
+        &["config", "reset", "hud_style"][..],
+        &["config", "set", "layout", "columns"][..],
+    ] {
+        temp.write(BEFORE);
+        let outcome = temp.run(args);
+        assert_eq!(outcome.exit_code, 0, "{args:?}: {:?}", outcome.stderr);
+        assert_eq!(temp.read(), BEFORE, "{args:?}");
+    }
+
+    temp.write(BEFORE);
+    let reset = temp.run(&["config", "reset", "hud_position"]);
+    assert_eq!(reset.exit_code, 0, "{:?}", reset.stderr);
+    assert_eq!(temp.read(), BEFORE.replace("hud_position = \"top\"\n", ""));
+
+    // The comment above `outer` goes with it and the table it empties; nothing else does.
+    temp.write(BEFORE);
+    let reset = temp.run(&["config", "reset", "gaps.outer"]);
+    assert_eq!(reset.exit_code, 0, "{:?}", reset.stderr);
+    assert_eq!(
+        temp.read(),
+        BEFORE.replace(
+            "[settings.gaps]\n# Leave room at every edge.\nouter = 8\n\n",
+            ""
+        )
+    );
+
+    temp.write(BEFORE);
+    let set = temp.run(&["config", "set", "layout", "dwindle"]);
+    assert_eq!(set.exit_code, 0, "{:?}", set.stderr);
+    assert_eq!(
+        temp.read(),
+        BEFORE.replace("layout = \"columns\"", "layout = \"dwindle\"")
+    );
+
+    for args in [
+        &["workspaces", "assign", "9", "main"][..],
+        &["rules", "add", "--app", "com.apple.Notes", "--float"][..],
+        &["rules", "remove", "1"][..],
+    ] {
+        temp.write(BEFORE);
+        let outcome = temp.run(args);
+        assert_eq!(outcome.exit_code, 0, "{args:?}: {:?}", outcome.stderr);
+        let source = temp.read();
+        assert!(Config::parse(&source).is_ok(), "{args:?}: {source}");
+        assert!(
+            source.contains("# Disabled for now:\n# [[rules]]\n# bundle_id = \"com.apple.Safari\""),
+            "{args:?}: {source}"
+        );
+        assert!(
+            comments(&source) >= comments(BEFORE) - 1,
+            "{args:?}: {source}"
+        );
+    }
+}
+
+#[test]
+fn removing_one_of_two_equal_rules_keeps_the_survivors_own_comments() {
+    const FIRST: &str = "# First copy\n[[rules]]\nbundle_id = \"test.example.documents\"\ntitle_contains = \"Planning\" # First inline\naction = \"route\"\nworkspace = 6\n\n";
+    const SECOND: &str = "# Second copy\n[[rules]]\nbundle_id = \"test.example.documents\"\ntitle_contains = \"Planning\" # Second inline\naction = \"route\"\nworkspace = 6\n\n";
+    const OTHER: &str = "# Notes\n[[rules]]\nbundle_id = \"com.apple.Notes\"\naction = \"float\"\n\n# End of file.\n";
+    let before = format!("version = 1\n\n{FIRST}{SECOND}{OTHER}");
+    let temp = TempConfig::new("equal-rules");
+
+    for (index, gone) in [("1", FIRST), ("2", SECOND)] {
+        temp.write(&before);
+        let outcome = temp.run(&["rules", "remove", index]);
+        assert_eq!(outcome.exit_code, 0, "{index}: {:?}", outcome.stderr);
+        assert_eq!(temp.read(), before.replace(gone, ""), "{index}");
+    }
+}
+
+#[test]
+fn removing_a_key_or_entry_keeps_the_comment_a_blank_line_sets_off_from_it() {
+    const GAPS: &str = "version = 1\n\n[settings.gaps]\nouter = 12 # Keep outer\n# Detached gap notes\n\n# Attached left-edge note\nleft = 20 # Left edge\n\n# EOF note\n";
+    const LEFT: &str = "\n# Attached left-edge note\nleft = 20 # Left edge\n";
+    const WORKSPACES: &str = "version = 1\n\n# Office notes\n[[workspaces]]\nworkspace = 2\nmonitor = \"secondary\"\n\n# Detached workspace notes\n\n# Attached workspace note\n[[workspaces]]\nworkspace = 6\nmonitor = \"secondary\" # Six\n\n# Seven\n[[workspaces]]\nworkspace = 7\nmonitor = \"main\"\n\n# EOF note\n";
+    const SIX: &str = "\n# Attached workspace note\n[[workspaces]]\nworkspace = 6\nmonitor = \"secondary\" # Six\n";
+    let temp = TempConfig::new("set-off-comments");
+
+    for (before, args, gone) in [
+        (GAPS, &["config", "reset", "gaps.left"][..], LEFT),
+        (WORKSPACES, &["workspaces", "clear", "6"][..], SIX),
+    ] {
+        temp.write(before);
+        let after = before.replace(gone, "");
+        for _ in 0..2 {
+            let outcome = temp.run(args);
+            assert_eq!(outcome.exit_code, 0, "{args:?}: {:?}", outcome.stderr);
+            assert_eq!(temp.read(), after, "{args:?}");
+        }
+    }
+}

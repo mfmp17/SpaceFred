@@ -153,7 +153,7 @@ impl Doc {
         }
         if modifier == Modifiers::OPTION {
             self.shortcuts_table_mut();
-            self.remove_key_in_table("shortcuts", "modifier");
+            self.remove_key_in_table(&["shortcuts"], "modifier");
         } else {
             let table = self.shortcuts_table_mut();
             super::set_table_item(table, "modifier", value(modifier.source()));

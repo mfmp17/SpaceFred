@@ -1,38 +1,60 @@
+mod arrange;
 mod benchmarks;
 mod cross_display;
 mod dispatch;
 mod display_disconnect;
+mod drag_path;
+mod drag_rows;
 mod dual_selector_move;
+mod dwindle;
+mod empty_workspace_choice;
 mod empty_workspace_move;
 mod float;
 mod float_regressions;
 mod focus;
+mod focus_follows_mouse;
 mod fullscreen;
 mod gestures;
 mod journal;
 mod layout;
 mod memory;
 mod minimums;
+mod move_handoff;
+mod move_tab;
 mod move_workspace;
 mod ordered_out;
 mod parking;
+mod physical_displays;
+mod recent_focus;
 mod reconciliation;
 mod reconnect_unsettled;
 mod reliability;
+mod reported;
+mod residency;
+mod restart_recall;
 mod rules;
 mod scratchpad;
+mod settle_grace;
+mod space_transitions;
 mod spacing;
 mod stacked_resize;
 mod startup;
+mod state_machine;
 mod switch_repeat;
 mod switching;
 mod tear_regressions;
+mod three_display;
+mod utility_floats;
+mod window_overlay;
 mod workspace_order;
+mod workspace_steps;
 use crate::{BindingState, Slot, SlotId};
 
 use super::*;
 use super::{
-    app_loop::{TilingStart, TilingStartup, WorkerDispatch},
+    app_loop::{
+        AfterCommand, RestoreKind, TilingStart, TilingStartup, WorkerDispatch, WorkerLifecycle,
+    },
     cycle::OMISSION_SETTLE,
     input::{is_window_drag, is_window_resize},
     parking::REPARK_ATTEMPT_LIMIT,
@@ -46,6 +68,23 @@ enum BackendCall {
     Raise(crate::PhysicalWindowId),
     Focus(crate::PhysicalWindowId),
     WarpPointer((i32, i32)),
+    DetachTab(crate::PhysicalWindowId),
+}
+
+/// What pressing "Move Tab to New Window" does in the fake app.
+#[derive(Clone, Debug)]
+enum FakeTabDetach {
+    /// Chromium: the tab opens in a new window at this frame, which takes focus.
+    NewWindow(crate::PhysicalWindowId, crate::Rect),
+    /// AppKit tab group: the tab's own window moves to `moved_to` and keeps
+    /// focus; the group's next tab, `next`, shows in its old place.
+    TabGroup {
+        next: crate::PhysicalWindowId,
+        moved_to: crate::Rect,
+    },
+    /// Pressed, but no window has appeared yet.
+    Silent,
+    Failed,
 }
 
 #[derive(Default)]
@@ -54,6 +93,8 @@ struct FakeBackend {
     close_probes: Vec<AppInstanceId>,
     /// Windows whose app is hidden or which are minimized.
     set_aside: HashSet<crate::PhysicalWindowId>,
+    /// Windows in macOS native fullscreen, on their own Space.
+    native_fullscreen: HashSet<crate::PhysicalWindowId>,
     frames: HashMap<crate::PhysicalWindowId, crate::Rect>,
     server_frames: HashMap<crate::PhysicalWindowId, crate::Rect>,
     /// Windows the window server still lists but has ordered out (closed
@@ -73,10 +114,28 @@ struct FakeBackend {
     managed_outcome: Option<macos::ApplyOutcome>,
     /// Fails position writes with this outcome (an app briefly inaccessible).
     position_outcome: Option<macos::ApplyOutcome>,
+    /// Apps not answering Accessibility (a hung main thread). Like the real adapter, their
+    /// windows' reads time out, and a write is sent only on a cached handle: it reports
+    /// unavailable but lands, in order, once the app answers (`answer_again`).
+    unanswering: HashSet<AppInstanceId>,
+    /// Cached Accessibility handles, consulted only for unanswering apps.
+    handles: HashSet<crate::PhysicalWindowId>,
+    /// Writes sent to unanswering apps that have not landed yet, oldest first.
+    queued_writes: Vec<(crate::PhysicalWindowId, crate::Rect)>,
     /// Position writes macOS clamps back, leaving the window where it was.
     refuses_position: Option<fn(crate::Rect) -> bool>,
+    /// Windows that refuse every parking write (an app rejecting off-screen
+    /// coordinates).
+    refuses_parking: HashSet<crate::PhysicalWindowId>,
     /// Widths windows refuse to shrink below, clamped synchronously like AppKit.
     minimum_widths: HashMap<crate::PhysicalWindowId, i32>,
+    /// Skips managed writes to windows already within the write tolerance of
+    /// their target, as the Accessibility adapter does.
+    honors_tolerance: bool,
+    /// Display frames. A write that moves a window from one of them to
+    /// another has its height fit to the bottom of the display it left, as
+    /// macOS does before the app sees its new screen (#428).
+    departed_display_clamp: Vec<crate::Rect>,
     focus_outcome: Option<bool>,
     /// Raised by the next position write: an activation cancelling the worker
     /// in the middle of a switch.
@@ -94,10 +153,121 @@ struct FakeBackend {
     fail_persist_config: bool,
     persisted_monitors: Vec<(WorkspaceId, DisplaySelector)>,
     pointer: Option<(i32, i32)>,
+    /// The window in front at the pointer when a test sets one (a float over
+    /// a tile); otherwise the lowest-numbered window whose frame holds the point.
+    window_in_front: Option<Option<u32>>,
     mouse_down: bool,
+    /// The right or middle mouse button is held.
+    other_button_down: bool,
+    /// When macOS last changed the active Space.
+    space_changed_at: Option<Instant>,
+    /// Every display is asleep (closed lid, background wake).
+    displays_asleep: bool,
+    /// When three or four fingers last touched the trackpad.
+    space_gesture_at: Option<Instant>,
+    /// How long ago the user last typed or clicked; `None` (unknown) reads as
+    /// possible input, so a late sibling handoff is followed.
+    recent_input: Option<macos::RecentInput>,
+    /// The next position write starts a Space slide (Cmd+Tab out of a
+    /// native fullscreen app while a focus follow runs).
+    space_change_on_position: bool,
+    /// "Move Tab to New Window"; `None` when the window has one tab.
+    tab_detach: Option<FakeTabDetach>,
+    /// Virtual time: it moves only when a test advances it.
+    clock: FakeClock,
+    /// Bundle ID, title and whether Accessibility resolved it, by window ID, for windows
+    /// no observation lists.
+    rule_probes: HashMap<u32, (&'static str, Option<&'static str>, bool)>,
+    /// Window IDs whose bundle and title were read, in order.
+    rule_probe_calls: Vec<u32>,
+}
+
+struct FakeClock(Instant);
+
+impl Default for FakeClock {
+    fn default() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl FakeBackend {
+    /// Let `by` pass on the worker's clock.
+    fn advance(&mut self, by: Duration) {
+        self.clock.0 += by;
+    }
+
+    /// The frame macOS leaves a window written to `target` on another display:
+    /// its height stops at the bottom of the display it left (#428).
+    fn fit_to_departed_display(
+        &self,
+        window: &crate::PhysicalWindowId,
+        target: crate::Rect,
+    ) -> Option<crate::Rect> {
+        let before = *self.frames.get(window)?;
+        let from = self
+            .departed_display_clamp
+            .iter()
+            .find(|display| display.contains_center(before))?;
+        let height = from.y + from.height - target.y;
+        (!from.contains_center(target) && height > 0 && height < target.height)
+            .then_some(crate::Rect { height, ..target })
+    }
+
+    /// An operation on `window` of an unanswering app failed: like the real adapter, its
+    /// app cannot list its windows either, and the cached handle survives that only as
+    /// `macos::keeps_failed_handle` says.
+    fn unanswered(&mut self, window: &crate::PhysicalWindowId) {
+        if !macos::keeps_failed_handle(macos::WindowLookup::Unanswered) {
+            self.handles.remove(window);
+        }
+    }
+
+    /// `app` answers again: the writes it was sent land in order.
+    fn answer_again(&mut self, app: &AppInstanceId) {
+        self.unanswering.remove(app);
+        let (landing, waiting) = std::mem::take(&mut self.queued_writes)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(window, _)| &window.app == app);
+        self.queued_writes = waiting;
+        for (window, target) in landing {
+            if let Some(frame) = self.frames.get_mut(&window) {
+                frame.x = target.x;
+                frame.y = target.y;
+            }
+        }
+    }
+
+    /// A window the app opens: on screen at `frame` and in its next snapshot.
+    fn open_window(&mut self, window: &crate::PhysicalWindowId, frame: crate::Rect) {
+        self.frames.insert(window.clone(), frame);
+        let Some(observation) = self.observation.as_mut() else {
+            return;
+        };
+        for app in &mut observation.applications {
+            if let crate::AppObservation::Complete { app, windows, .. } = app
+                && app.id == window.app
+            {
+                windows.push(crate::ObservedWindow {
+                    id: window.clone(),
+                    frame,
+                    resizable: true,
+                    title: None,
+                    document: None,
+                });
+            }
+        }
+    }
 }
 
 impl WorkspaceBackend for FakeBackend {
+    fn now(&self) -> Instant {
+        self.clock.0
+    }
+
+    fn pause(&mut self, duration: Duration) {
+        self.advance(duration);
+    }
+
     fn confirms_no_windows(&mut self, app: &AppInstanceId) -> bool {
         self.close_probes.push(app.clone());
         self.apps_confirming_no_windows.contains(app)
@@ -105,6 +275,10 @@ impl WorkspaceBackend for FakeBackend {
 
     fn confirms_set_aside(&mut self, window: &crate::PhysicalWindowId) -> bool {
         self.set_aside.contains(window)
+    }
+
+    fn confirms_native_fullscreen(&mut self, window: &crate::PhysicalWindowId) -> bool {
+        self.native_fullscreen.contains(window)
     }
 
     fn snapshot(
@@ -125,7 +299,7 @@ impl WorkspaceBackend for FakeBackend {
                         return false;
                     };
                     window.frame = frame;
-                    outputs.union().contains_center(frame)
+                    outputs.screen_union().contains_center(frame)
                 });
                 if focused
                     .as_ref()
@@ -160,6 +334,10 @@ impl WorkspaceBackend for FakeBackend {
     ) -> Result<crate::Rect, macos::WindowAccessError> {
         if let Some(outcome) = self.frame_outcome {
             return Err(outcome);
+        }
+        if self.unanswering.contains(&window.app) {
+            self.unanswered(window);
+            return Err(macos::WindowAccessError::Unavailable);
         }
         self.frames
             .get(window)
@@ -199,12 +377,56 @@ impl WorkspaceBackend for FakeBackend {
         self.stacking.clone()
     }
 
+    fn window_owners(&mut self, window_ids: &HashSet<u32>) -> HashMap<u32, AppInstanceId> {
+        self.frames
+            .keys()
+            .filter(|window| window_ids.contains(&window.window_id))
+            .map(|window| (window.window_id, window.app.clone()))
+            .collect()
+    }
+
+    fn set_restore_frame(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        target: crate::Rect,
+    ) -> macos::ApplyOutcome {
+        let outcome = self.set_position(window, target);
+        if outcome == macos::ApplyOutcome::Applied {
+            let server = if self.frozen_server_frames {
+                None
+            } else {
+                self.server_frames.get_mut(window)
+            };
+            for frame in [self.frames.get_mut(window), server].into_iter().flatten() {
+                frame.width = target.width;
+                frame.height = target.height;
+            }
+        }
+        outcome
+    }
+
+    fn window_rule_probe(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+    ) -> Option<macos::WindowRuleProbe> {
+        self.rule_probe_calls.push(window.window_id);
+        let (bundle_id, title, resolved) = *self.rule_probes.get(&window.window_id)?;
+        Some(macos::WindowRuleProbe {
+            bundle_id: bundle_id.into(),
+            title: title.map(Arc::from),
+            resolved,
+        })
+    }
+
     fn set_parked_position(
         &mut self,
         window: &crate::PhysicalWindowId,
         target: crate::Rect,
     ) -> macos::ApplyOutcome {
         self.parked_writes.push(window.clone());
+        if self.refuses_parking.contains(window) {
+            return macos::ApplyOutcome::Unavailable;
+        }
         self.set_position(window, target)
     }
 
@@ -215,6 +437,16 @@ impl WorkspaceBackend for FakeBackend {
     ) -> macos::ApplyOutcome {
         self.calls
             .push(BackendCall::SetPosition(window.clone(), target));
+        if self.unanswering.contains(&window.app) {
+            if self.handles.contains(window) {
+                self.queued_writes.push((window.clone(), target));
+            }
+            self.unanswered(window);
+            return macos::ApplyOutcome::Unavailable;
+        }
+        if std::mem::take(&mut self.space_change_on_position) {
+            self.space_changed_at = Some(self.clock.0);
+        }
         if let Some(cancelled) = self.cancel_on_position.take() {
             cancelled.store(true, Ordering::Release);
         }
@@ -246,6 +478,22 @@ impl WorkspaceBackend for FakeBackend {
         self.frontmost.clone()
     }
 
+    fn recent_input(&mut self) -> Option<macos::RecentInput> {
+        self.recent_input
+    }
+
+    fn active_space_changed_at(&mut self) -> Option<Instant> {
+        self.space_changed_at
+    }
+
+    fn displays_asleep(&mut self) -> bool {
+        self.displays_asleep
+    }
+
+    fn space_gesture_at(&mut self) -> Option<Instant> {
+        self.space_gesture_at
+    }
+
     fn raise_window(&mut self, window: &crate::PhysicalWindowId) -> bool {
         self.calls.push(BackendCall::Raise(window.clone()));
         true
@@ -261,12 +509,53 @@ impl WorkspaceBackend for FakeBackend {
         true
     }
 
+    fn detach_tab(&mut self, window: &crate::PhysicalWindowId) -> macos::TabDetachResult {
+        self.calls.push(BackendCall::DetachTab(window.clone()));
+        // Like the app's own menu command, the press acts on the key window:
+        // pressed from any other window, it detaches nothing (#597).
+        let pressed_on_key = self.focused.as_ref() == Some(window);
+        match self.tab_detach.take() {
+            None => return macos::TabDetachResult::SingleTabOrUnsupported,
+            Some(_) if !pressed_on_key => {}
+            Some(FakeTabDetach::NewWindow(new, frame)) => {
+                self.open_window(&new, frame);
+                self.focused = Some(new);
+            }
+            Some(FakeTabDetach::TabGroup { next, moved_to }) => {
+                let Some(old) = self.frames.insert(window.clone(), moved_to) else {
+                    return macos::TabDetachResult::Error("window is gone".into());
+                };
+                self.open_window(&next, old);
+            }
+            Some(FakeTabDetach::Silent) => {}
+            Some(FakeTabDetach::Failed) => {
+                return macos::TabDetachResult::Error("AXPress: Failure".into());
+            }
+        }
+        macos::TabDetachResult::Detached
+    }
+
     fn pointer_location(&mut self) -> Option<(i32, i32)> {
         self.pointer
     }
 
+    fn hover_window_at(&mut self, point: (i32, i32)) -> Option<u32> {
+        if let Some(front) = self.window_in_front {
+            return front;
+        }
+        self.frames
+            .iter()
+            .filter(|(_, frame)| frame.contains(point.0, point.1))
+            .map(|(window, _)| window.window_id)
+            .min()
+    }
+
     fn mouse_down(&mut self) -> bool {
         self.mouse_down
+    }
+
+    fn any_mouse_button_down(&mut self) -> bool {
+        self.mouse_down || self.other_button_down
     }
 
     fn warp_pointer(&mut self, point: (i32, i32)) -> bool {
@@ -281,7 +570,7 @@ impl WorkspaceBackend for FakeBackend {
     fn apply_managed(
         &mut self,
         placements: &[crate::Placement],
-        _: &Settings,
+        settings: &Settings,
         cancelled: &AtomicBool,
     ) -> Vec<macos::ApplyResult> {
         placements
@@ -289,6 +578,17 @@ impl WorkspaceBackend for FakeBackend {
             .take_while(|_| !cancelled.load(Ordering::Acquire))
             .filter_map(|placement| {
                 let window = placement.window.clone()?;
+                if self.honors_tolerance
+                    && let Some(&current) = self.frames.get(&window)
+                    && current.approximately_equals(placement.frame, settings.frame_tolerance)
+                {
+                    return Some(macos::ApplyResult {
+                        actual: Some(current),
+                        window,
+                        target: placement.frame,
+                        outcome: macos::ApplyOutcome::Applied,
+                    });
+                }
                 self.calls
                     .push(BackendCall::Apply(window.clone(), placement.frame));
                 let mut outcome = self.managed_outcome.unwrap_or(macos::ApplyOutcome::Applied);
@@ -304,6 +604,12 @@ impl WorkspaceBackend for FakeBackend {
                             ..placement.frame
                         },
                     );
+                }
+                if matches!(outcome, macos::ApplyOutcome::Applied)
+                    && let Some(clamped) = self.fit_to_departed_display(&window, placement.frame)
+                {
+                    outcome = macos::ApplyOutcome::Constrained;
+                    self.frames.insert(window.clone(), clamped);
                 }
                 if matches!(outcome, macos::ApplyOutcome::Applied) {
                     self.frames.insert(window.clone(), placement.frame);
@@ -453,7 +759,6 @@ fn bind(
 ) {
     runtime.workspaces.engine_mut(workspace).insert_slot(Slot {
         id: SlotId(u64::from(window.window_id)),
-        weight: 1,
         binding: BindingState::Bound(window.clone()),
     });
 }
@@ -517,6 +822,7 @@ fn observation_for_windows(
                     frame: *frame,
                     resizable: true,
                     title: None,
+                    document: None,
                 })
                 .collect(),
         }],
@@ -547,6 +853,7 @@ fn benchmark_backend(window_count: u32) -> FakeBackend {
             frame,
             resizable: true,
             title: None,
+            document: None,
         });
     }
     FakeBackend {

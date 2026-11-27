@@ -1,4 +1,5 @@
-//! Space around and between tiles: `[settings.gaps]` and `settings.single_window_max_width`.
+//! Space around and between tiles: `[settings.gaps]`, `settings.single_window_max_width` and
+//! `settings.single_window_max_height`.
 //!
 //! The *usable* rect is the output less its outer padding. The layout tree partitions the
 //! *canvas*, the usable rect grown by half the inner gap on every side, and its weights, resize
@@ -19,8 +20,10 @@ pub const EDGE_MAX: i32 = 128;
 pub const OUTER: &str = "gaps.outer";
 /// Outer padding gives way before the usable rect gets narrower or shorter than this.
 pub const MIN_USABLE: (i32, i32) = (320, 240);
-/// Largest `single_window_max_width`, in points.
+/// Largest `single_window_max_width` and `single_window_max_height`, in points.
 pub const MAX_WIDTH_LIMIT: i32 = 16_384;
+/// Smallest `single_window_max_width` and `single_window_max_height` other than `0` (off).
+pub const MIN_SINGLE: i32 = 320;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,6 +38,9 @@ pub struct Spacing {
     /// A lone tile (one tiled window, or Fullscreen Layout) is centered at this width when the
     /// usable rect is wider; `0` is off.
     pub single_window_max_width: i32,
+    /// A lone tile is centered at this height when the usable rect is taller; `0` is off. It
+    /// is read only with `[labs] single_window_height` on (`Config::spacing` clears it).
+    pub single_window_max_height: i32,
 }
 
 /// One spacing setting, as `config.toml`, `spaceman config` and Settings name it.
@@ -46,20 +52,23 @@ pub enum SpacingKey {
     Left,
     Right,
     SingleWindowMaxWidth,
+    SingleWindowMaxHeight,
 }
 
 impl SpacingKey {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Inner,
         Self::Top,
         Self::Bottom,
         Self::Left,
         Self::Right,
         Self::SingleWindowMaxWidth,
+        Self::SingleWindowMaxHeight,
     ];
     pub const EDGES: [Self; 4] = [Self::Top, Self::Bottom, Self::Left, Self::Right];
 
-    /// The key under `[settings]`: `gaps.inner`, `gaps.top`, ... or `single_window_max_width`.
+    /// The key under `[settings]`: `gaps.inner`, `gaps.top`, ... or `single_window_max_width` /
+    /// `single_window_max_height`.
     #[must_use]
     pub const fn path(self) -> &'static str {
         match self {
@@ -69,10 +78,11 @@ impl SpacingKey {
             Self::Left => "gaps.left",
             Self::Right => "gaps.right",
             Self::SingleWindowMaxWidth => "single_window_max_width",
+            Self::SingleWindowMaxHeight => "single_window_max_height",
         }
     }
 
-    /// The key inside `[settings.gaps]`, or `None` for `single_window_max_width`.
+    /// The key inside `[settings.gaps]`, or `None` for the lone-window caps.
     #[must_use]
     pub const fn gap_name(self) -> Option<&'static str> {
         match self {
@@ -81,7 +91,7 @@ impl SpacingKey {
             Self::Bottom => Some("bottom"),
             Self::Left => Some("left"),
             Self::Right => Some("right"),
-            Self::SingleWindowMaxWidth => None,
+            Self::SingleWindowMaxWidth | Self::SingleWindowMaxHeight => None,
         }
     }
 
@@ -120,6 +130,7 @@ impl SpacingKey {
             Self::Left => spacing.left,
             Self::Right => spacing.right,
             Self::SingleWindowMaxWidth => spacing.single_window_max_width,
+            Self::SingleWindowMaxHeight => spacing.single_window_max_height,
         }
     }
 
@@ -131,6 +142,7 @@ impl SpacingKey {
             Self::Left => spacing.left = value,
             Self::Right => spacing.right = value,
             Self::SingleWindowMaxWidth => spacing.single_window_max_width = value,
+            Self::SingleWindowMaxHeight => spacing.single_window_max_height = value,
         }
     }
 
@@ -140,15 +152,14 @@ impl SpacingKey {
         let max = match self {
             Self::Inner => INNER_MAX,
             Self::Top | Self::Bottom | Self::Left | Self::Right => EDGE_MAX,
-            Self::SingleWindowMaxWidth => {
+            Self::SingleWindowMaxWidth | Self::SingleWindowMaxHeight => {
                 if value == 0
-                    || (i64::from(MIN_USABLE.0)..=i64::from(MAX_WIDTH_LIMIT)).contains(&value)
+                    || (i64::from(MIN_SINGLE)..=i64::from(MAX_WIDTH_LIMIT)).contains(&value)
                 {
                     return Ok(value as i32);
                 }
                 return Err(format!(
-                    "settings.{key} must be 0 (off) or between {} and {MAX_WIDTH_LIMIT} px, got {value}",
-                    MIN_USABLE.0
+                    "settings.{key} must be 0 (off) or between {MIN_SINGLE} and {MAX_WIDTH_LIMIT} px, got {value}"
                 ));
             }
         };
@@ -159,6 +170,16 @@ impl SpacingKey {
 /// `value` as [`OUTER`] accepts it, or why it doesn't.
 pub fn check_outer(value: i64) -> Result<i32, String> {
     check_points(OUTER, value, EDGE_MAX)
+}
+
+/// The span `start..start + length` narrowed to `max` and centered in it; `max <= 0` (off) or
+/// `max >= length` keeps it whole.
+const fn cap_span(start: i32, length: i32, max: i32) -> (i32, i32) {
+    if max <= 0 || max >= length {
+        (start, length)
+    } else {
+        (start + (length - max) / 2, max)
+    }
 }
 
 fn check_points(key: &str, value: i64, max: i32) -> Result<i32, String> {
@@ -179,6 +200,7 @@ impl Spacing {
         left: 0,
         right: 0,
         single_window_max_width: 0,
+        single_window_max_height: 0,
     };
 
     #[must_use]
@@ -189,6 +211,7 @@ impl Spacing {
             && self.left == 0
             && self.right == 0
             && self.single_window_max_width == 0
+            && self.single_window_max_height == 0
     }
 
     /// Every screen edge at `padding`.
@@ -239,17 +262,17 @@ impl Spacing {
         }
     }
 
-    /// A lone tile's frame in `usable`: centered at `single_window_max_width` when narrower.
+    /// A lone tile's frame in `usable`: centered at `single_window_max_width` when narrower, and
+    /// at `single_window_max_height` when shorter, each axis on its own.
     #[must_use]
     pub fn single(self, usable: Rect) -> Rect {
-        let max = self.single_window_max_width;
-        if max <= 0 || max >= usable.width {
-            return usable;
-        }
+        let (x, width) = cap_span(usable.x, usable.width, self.single_window_max_width);
+        let (y, height) = cap_span(usable.y, usable.height, self.single_window_max_height);
         Rect {
-            x: usable.x + (usable.width - max) / 2,
-            width: max,
-            ..usable
+            x,
+            y,
+            width,
+            height,
         }
     }
 

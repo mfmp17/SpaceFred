@@ -1,8 +1,11 @@
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
-use crate::{Axis, Rect, WorkspaceId, login_item};
+use crate::{
+    Axis, Rect, WorkspaceId, login_item,
+    onboarding_plan::{Arrangement, Inventory},
+};
 
-use super::{Action, WorkerAction};
+use super::{Action, UiWindowOverlay, WindowOverlayCommand, WorkerAction};
 
 /// Normalized preview coordinate space for HUD split rectangles.
 pub const HUD_PREVIEW_RECT: Rect = Rect {
@@ -12,12 +15,40 @@ pub const HUD_PREVIEW_RECT: Rect = Rect {
     height: 1100,
 };
 
+/// [`HUD_PREVIEW_RECT`] turned on its side, for a portrait display's previews.
+pub const HUD_PORTRAIT_PREVIEW_RECT: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: HUD_PREVIEW_RECT.height,
+    height: HUD_PREVIEW_RECT.width,
+};
+
+/// The preview space for a display: [`HUD_PORTRAIT_PREVIEW_RECT`] when `portrait`.
+#[must_use]
+pub const fn hud_preview_rect(portrait: bool) -> Rect {
+    if portrait {
+        HUD_PORTRAIT_PREVIEW_RECT
+    } else {
+        HUD_PREVIEW_RECT
+    }
+}
+
 /// Actions the in-process Rune window or HUD overlay can send to the agent loop.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiAction {
     ToggleAutomatic,
     /// The first-run setup tour finished: automatic tiling may start.
     FinishSetup,
+    /// The first-run setup tour ended without starting: windows stay where they are, paused.
+    SkipSetup,
+    /// The setup tour asks which windows are open, to suggest an arrangement.
+    PlanSetup,
+    /// Start tiling with the open windows arranged as the setup tour's plan says.
+    Arrange(Arrangement),
+    /// Pause tiling and put every window back where it was before the arrangement.
+    UndoArrangement,
+    /// Restore every window, then quit.
+    Quit,
     OpenSettings,
     OpenAccessibility,
     CheckForUpdates,
@@ -29,9 +60,12 @@ pub enum UiAction {
     DownloadUpdate,
     ToggleLaunchAtLogin,
     SetHud(bool),
+    SetPauseOnBuiltinDisplay(bool),
     SwitchWorkspace(WorkspaceId),
     Retile,
     MarkWrong,
+    /// A Window overlay card's button.
+    WindowOverlay(WindowOverlayCommand),
 }
 
 impl From<UiAction> for Action {
@@ -39,6 +73,11 @@ impl From<UiAction> for Action {
         match action {
             UiAction::ToggleAutomatic => Self::ToggleAutomatic,
             UiAction::FinishSetup => Self::FinishSetup,
+            UiAction::SkipSetup => Self::SkipSetup,
+            UiAction::PlanSetup => Self::PlanSetup,
+            UiAction::Arrange(arrangement) => Self::Arrange(arrangement),
+            UiAction::UndoArrangement => Self::UndoArrangement,
+            UiAction::Quit => Self::Quit,
             UiAction::OpenSettings => Self::OpenSettings,
             UiAction::OpenAccessibility => Self::OpenAccessibility,
             UiAction::CheckForUpdates => Self::CheckForUpdates,
@@ -47,11 +86,13 @@ impl From<UiAction> for Action {
             UiAction::DownloadUpdate => Self::DownloadUpdate,
             UiAction::ToggleLaunchAtLogin => Self::ToggleLaunchAtLogin,
             UiAction::SetHud(enabled) => Self::SetHud(enabled),
+            UiAction::SetPauseOnBuiltinDisplay(enabled) => Self::SetPauseOnBuiltinDisplay(enabled),
             UiAction::SwitchWorkspace(workspace) => {
                 Self::Worker(WorkerAction::SelectWorkspace(workspace))
             }
             UiAction::Retile => Self::Worker(WorkerAction::Retile),
-            UiAction::MarkWrong => Self::Worker(WorkerAction::MarkWrong),
+            UiAction::MarkWrong => Self::Worker(WorkerAction::MarkWrong(None)),
+            UiAction::WindowOverlay(command) => Self::Worker(WorkerAction::WindowOverlay(command)),
         }
     }
 }
@@ -77,8 +118,35 @@ pub const HUD_MAX_TILES: usize = 16;
 /// The most floating apps one HUD workspace carries.
 pub const HUD_MAX_FLOATING: usize = 8;
 
-/// Title-free Workspace HUD event emitted on explicit user actions: every display's row of
-/// workspaces, with their layouts and the bundle IDs of the apps in them.
+/// Transient, title-free status toast shown in the non-activating HUD overlay, even when
+/// the Workspace HUD is turned off.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiHudToast {
+    pub message: String,
+    pub paused: bool,
+}
+
+impl UiHudToast {
+    #[must_use]
+    pub fn paused(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            paused: true,
+        }
+    }
+
+    #[must_use]
+    pub fn resumed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            paused: false,
+        }
+    }
+}
+
+/// Title-free Workspace HUD event emitted on explicit user actions and when a
+/// tiled window joins a visible Fullscreen Layout workspace: every display's
+/// row of workspaces, with their layouts and the bundle IDs of the apps in them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiHudEvent {
     /// The workspace the action was on: switched to, moved to, or relaid.
@@ -99,6 +167,9 @@ pub struct UiHudDisplay {
     /// Every workspace in listing order (`settings.workspace_order`, then 1-10 and A-Z), so the
     /// HUD can place a workspace this row leaves out; empty means that default order.
     pub order: Vec<WorkspaceId>,
+    /// A portrait display, with `[labs] physical_displays` on: its previews are in
+    /// [`HUD_PORTRAIT_PREVIEW_RECT`] space and the Layouts style draws them tall.
+    pub portrait: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,7 +187,7 @@ pub struct UiHudWorkspace {
 pub struct UiHudTile {
     /// The tile's slot, stable while the window keeps its place.
     pub key: u64,
-    /// In [`HUD_PREVIEW_RECT`] space.
+    /// In [`HUD_PREVIEW_RECT`] space, or [`HUD_PORTRAIT_PREVIEW_RECT`] on a portrait row.
     pub rect: Rect,
     pub bundle: Option<String>,
 }
@@ -175,7 +246,7 @@ pub enum UiUpdateStatus {
     Checking,
     UpToDate,
     Downloading,
-    /// A verified update waits for Install & Restart.
+    /// A verified update waits for Install & restart.
     Ready {
         version: String,
     },
@@ -245,6 +316,12 @@ pub struct UiAgentSnapshot {
     pub update: UiUpdateStatus,
     pub active_workspaces: Vec<WorkspaceId>,
     pub last_error: Option<String>,
+    /// The previous `[shortcuts]` table while it is still registered because the saved one was
+    /// rejected; `None` otherwise, including once tiling stops and no shortcut is registered.
+    pub running_shortcuts: Option<crate::shortcuts::Shortcuts>,
+    /// The named workspaces this session registers shortcuts for, fixed when it started; `None`
+    /// when unknown. A workspace enabled by a later config edit gets its shortcuts on next start.
+    pub shortcut_workspaces: Option<Vec<WorkspaceId>>,
 }
 
 impl UiAgentSnapshot {
@@ -263,10 +340,21 @@ impl UiAgentSnapshot {
     }
 }
 
+/// The Window overlay Lab's chord was held long enough (with what it shows), or let go.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiWindowOverlayNews {
+    Show(UiWindowOverlay),
+    Hide,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UiNews {
     pub snapshot: Option<UiAgentSnapshot>,
     pub hud: Option<UiHudEvent>,
+    pub toast: Option<UiHudToast>,
+    pub window_overlay: Option<UiWindowOverlayNews>,
+    /// The open windows the setup tour asked for, title-free.
+    pub inventory: Option<Inventory>,
     pub config_changed: bool,
 }
 
@@ -275,6 +363,9 @@ struct SharedState {
     last: Option<UiAgentSnapshot>,
     pending_snapshot: Option<UiAgentSnapshot>,
     pending_hud: Option<UiHudEvent>,
+    pending_toast: Option<UiHudToast>,
+    pending_window_overlay: Option<UiWindowOverlayNews>,
+    pending_inventory: Option<Inventory>,
     config_changed: bool,
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -304,6 +395,9 @@ impl UiBridge {
         }
         let has_news = shared.pending_snapshot.is_some()
             || shared.pending_hud.is_some()
+            || shared.pending_toast.is_some()
+            || shared.pending_window_overlay.is_some()
+            || shared.pending_inventory.is_some()
             || shared.config_changed;
         shared.waker = Some(Arc::clone(&waker));
         drop(shared);
@@ -321,6 +415,9 @@ impl UiBridge {
         UiNews {
             snapshot: shared.pending_snapshot.take(),
             hud: shared.pending_hud.take(),
+            toast: shared.pending_toast.take(),
+            window_overlay: shared.pending_window_overlay.take(),
+            inventory: shared.pending_inventory.take(),
             config_changed: std::mem::take(&mut shared.config_changed),
         }
     }
@@ -336,6 +433,48 @@ impl UiBridge {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             shared.pending_hud = Some(event);
+            shared.waker.clone()
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub(super) fn publish_toast(&self, toast: UiHudToast) {
+        let waker = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shared.pending_toast = Some(toast);
+            shared.waker.clone()
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub(super) fn publish_window_overlay(&self, news: UiWindowOverlayNews) {
+        let waker = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shared.pending_window_overlay = Some(news);
+            shared.waker.clone()
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub(super) fn publish_inventory(&self, inventory: Inventory) {
+        let waker = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shared.pending_inventory = Some(inventory);
             shared.waker.clone()
         };
         if let Some(waker) = waker {
@@ -389,6 +528,8 @@ mod tests {
             update: UiUpdateStatus::Idle,
             active_workspaces: vec![WorkspaceId::ONE],
             last_error: None,
+            running_shortcuts: None,
+            shortcut_workspaces: None,
         };
         bridge.publish(initial.clone(), false);
 
@@ -402,6 +543,9 @@ mod tests {
             UiNews {
                 snapshot: Some(initial.clone()),
                 hud: None,
+                toast: None,
+                window_overlay: None,
+                inventory: None,
                 config_changed: false,
             }
         );
@@ -418,6 +562,9 @@ mod tests {
             UiNews {
                 snapshot: None,
                 hud: None,
+                toast: None,
+                window_overlay: None,
+                inventory: None,
                 config_changed: true,
             }
         );
@@ -434,6 +581,23 @@ mod tests {
             UiNews {
                 snapshot: None,
                 hud: Some(hud_event),
+                toast: None,
+                window_overlay: None,
+                inventory: None,
+                config_changed: false,
+            }
+        );
+        let toast = UiHudToast::paused("Tiling paused — built-in display");
+        bridge.publish_toast(toast.clone());
+        assert_eq!(wakes.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            bridge.take_news(),
+            UiNews {
+                snapshot: None,
+                hud: None,
+                toast: Some(toast),
+                window_overlay: None,
+                inventory: None,
                 config_changed: false,
             }
         );
@@ -454,6 +618,40 @@ mod tests {
             receiver.try_recv().ok(),
             Some(Action::Worker(WorkerAction::Retile))
         );
+
+        // The setup tour's plan crosses as its own actions, and its inventory comes back.
+        bridge.send(UiAction::PlanSetup);
+        assert_eq!(receiver.try_recv().ok(), Some(Action::PlanSetup));
+        bridge.send(UiAction::SkipSetup);
+        assert_eq!(receiver.try_recv().ok(), Some(Action::SkipSetup));
+        bridge.send(UiAction::Arrange(Arrangement::default()));
+        assert_eq!(
+            receiver.try_recv().ok(),
+            Some(Action::Arrange(Arrangement::default()))
+        );
+        bridge.send(UiAction::UndoArrangement);
+        assert_eq!(receiver.try_recv().ok(), Some(Action::UndoArrangement));
+        bridge.send(UiAction::Quit);
+        assert_eq!(receiver.try_recv().ok(), Some(Action::Quit));
+        bridge.publish_inventory(Inventory::default());
+        assert_eq!(wakes.load(Ordering::SeqCst), 5);
+        assert_eq!(bridge.take_news().inventory, Some(Inventory::default()));
+        assert_eq!(bridge.take_news().inventory, None);
+
+        // The window overlay's buttons reach the worker, and its news comes back once.
+        let command = WindowOverlayCommand::Snapshot;
+        bridge.send(UiAction::WindowOverlay(command.clone()));
+        assert_eq!(
+            receiver.try_recv().ok(),
+            Some(Action::Worker(WorkerAction::WindowOverlay(command)))
+        );
+        bridge.publish_window_overlay(UiWindowOverlayNews::Hide);
+        assert_eq!(wakes.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            bridge.take_news().window_overlay,
+            Some(UiWindowOverlayNews::Hide)
+        );
+        assert_eq!(bridge.take_news().window_overlay, None);
     }
 
     #[test]
@@ -466,6 +664,8 @@ mod tests {
             update: UiUpdateStatus::Checking,
             active_workspaces: vec![WorkspaceId::THREE, WorkspaceId::named('M').unwrap()],
             last_error: Some("Hotkeys unavailable".into()),
+            running_shortcuts: None,
+            shortcut_workspaces: None,
         };
         let value = snapshot.to_settings_json();
         assert_eq!(value["accessibility"], true);

@@ -23,6 +23,8 @@ const AX_MESSAGING_TIMEOUT: f32 = 0.5;
 pub(super) struct WindowServerWindow {
     pub(super) pid: i32,
     pub(super) id: u32,
+    /// `kCGWindowLayer`: 0 (normal) or 3 (floating).
+    pub(super) layer: i64,
     pub(super) frame: Rect,
 }
 
@@ -88,6 +90,59 @@ pub fn window_server_frame(id: &PhysicalWindowId) -> Option<Rect> {
         .into_iter()
         .find(|window| window.id == id.window_id && window.pid == id.app.pid)
         .map(|window| window.frame)
+}
+
+/// `kCGPopUpMenuWindowLevel`: open menus, from the menu bar or a context menu.
+const POP_UP_MENU_LAYER: i64 = 101;
+
+/// One on-screen window for [`hover_target`]: owner, ID, layer and frame.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StackedWindow {
+    pub(super) pid: i32,
+    pub(super) id: CGWindowID,
+    pub(super) layer: i64,
+    pub(super) frame: Rect,
+}
+
+/// The window focus follows mouse may focus at `point`: the front-most window
+/// there, when it is an ordinary (layer 0) window of another process and no
+/// menu is open. The menu bar, the Dock, a menu, a popover or Spaceman's own
+/// HUD and Settings in front of the point give nothing. `stack` is front to back.
+pub(super) fn hover_target(
+    stack: &[StackedWindow],
+    point: (i32, i32),
+    own_pid: i32,
+) -> Option<CGWindowID> {
+    if stack.iter().any(|window| window.layer == POP_UP_MENU_LAYER) {
+        return None;
+    }
+    let front = stack
+        .iter()
+        .find(|window| window.frame.contains(point.0, point.1))?;
+    (front.layer == 0 && front.pid != own_pid).then_some(front.id)
+}
+
+/// [`hover_target`] over the windows on screen now. Core Graphics only: no
+/// Accessibility calls, so the main thread may ask on every pointer rest.
+pub fn hover_window_at(point: (i32, i32)) -> Option<CGWindowID> {
+    let list = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    )?;
+    let stack = cf_array_items::<CFDictionary>(&list)
+        .filter_map(|entry| {
+            let (pid, id, layer) = window_server_entry(entry)?;
+            let frame = window_server_bounds(entry)?;
+            Some(StackedWindow {
+                pid,
+                id,
+                layer,
+                frame,
+            })
+        })
+        .collect::<Vec<_>>();
+    let own_pid = i32::try_from(std::process::id()).ok()?;
+    hover_target(&stack, point, own_pid)
 }
 
 /// How far outside its frame the pointer can still grab a window's edge to
@@ -168,13 +223,18 @@ pub(super) fn window_server_windows(
     let mut windows = Vec::new();
     let list = CGWindowListCopyWindowInfo(options | CGWindowListOption::ExcludeDesktopElements, 0)?;
     for entry in cf_array_items::<CFDictionary>(&list) {
-        let Some((pid, id, _)) = window_server_identity(entry) else {
+        let Some((pid, id, layer)) = window_server_identity(entry) else {
             continue;
         };
         let Some(frame) = window_server_bounds(entry) else {
             continue;
         };
-        windows.push(WindowServerWindow { pid, id, frame });
+        windows.push(WindowServerWindow {
+            pid,
+            id,
+            layer,
+            frame,
+        });
     }
     Some(windows)
 }
@@ -188,12 +248,15 @@ fn window_server_frame_map(options: CGWindowListOption) -> Option<HashMap<CGWind
     )
 }
 
+/// An ordinary window's owner, ID and layer: layers 0 (normal) and 3 (floating) only.
 fn window_server_identity(entry: &CFDictionary) -> Option<(i32, u32, i64)> {
+    window_server_entry(entry).filter(|(_, _, layer)| matches!(layer, 0 | 3))
+}
+
+/// Any on-screen window's owner, ID and layer, menus and the menu bar included.
+fn window_server_entry(entry: &CFDictionary) -> Option<(i32, u32, i64)> {
     // SAFETY: CoreGraphics window-info keys are process-lifetime static `CFString`s.
     let layer = dictionary_number(entry, unsafe { kCGWindowLayer })?;
-    if !matches!(layer, 0 | 3) {
-        return None;
-    }
     // SAFETY: CoreGraphics window-info keys are process-lifetime static `CFString`s.
     let id = dictionary_number(entry, unsafe { kCGWindowNumber })
         .and_then(|id| u32::try_from(id).ok())?;

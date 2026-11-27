@@ -2,15 +2,21 @@
 
 use std::{cell::Cell, collections::BTreeSet};
 
-use spaceman::{WorkspaceId, app::UiHudDisplay};
+use spaceman::{
+    WorkspaceId,
+    app::{UiHudDisplay, UiHudToast},
+};
 
-use super::pill::HudView;
+use super::pill::{HudView, ToastView};
 
 pub const HOLD_MS: u64 = 1_150;
+/// How long a transient status toast stays on screen before fading out.
+pub const TOAST_HOLD_MS: u64 = 2_500;
 /// Grace period before auto-dismissing once the pointer leaves the pill or a context menu closes.
 pub const RESUME_HOLD_MS: u64 = 600;
-/// How long the capsule's exit gets before the panel is ordered out. The exit spring is under
-/// 1/255 of the way from rest by then, so the cut removes nothing that shows.
+/// How long the capsule's exit gets before the panel is ordered out, so the cut removes nothing
+/// that shows. Reduce Motion sets it: Rune swaps the exit spring (under 1/255 by ~140 ms) for its
+/// fixed 0.18 s ease-in-out fade, which still shows at about 0.14 at 125 ms.
 pub const LEAVE_MS: u64 = 170;
 /// A freshly shown HUD draws its marker where the switch started for one frame, then sends it
 /// on without a hitch.
@@ -46,12 +52,18 @@ enum Stage {
     Leaving { gone_at_ms: u64 },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HudContent {
+    Workspaces(UiHudDisplay),
+    Toast(UiHudToast),
+}
+
 /// Pure HUD visibility and deadline state machine for one display's capsule.
 #[derive(Clone, Debug)]
 pub struct HudFlow {
     enabled: bool,
     stage: Stage,
-    current: Option<UiHudDisplay>,
+    content: Option<HudContent>,
     /// Where a fresh show's marker starts: the workspace the switch left on this display.
     from: Option<WorkspaceId>,
     fresh: bool,
@@ -79,7 +91,7 @@ impl HudFlow {
         Self {
             enabled,
             stage: Stage::Hidden,
-            current: None,
+            content: None,
             from: None,
             fresh: true,
             fresh_until_ms: 0,
@@ -90,10 +102,13 @@ impl HudFlow {
         }
     }
 
-    /// What the capsule draws now; the last row stays through the exit so it never blanks.
+    /// What the workspace capsule draws now; the last row stays through the exit so it never blanks.
     #[must_use]
     pub fn view(&self, still: bool) -> Option<HudView<'_>> {
-        self.current.as_ref().map(|row| HudView {
+        let Some(HudContent::Workspaces(row)) = self.content.as_ref() else {
+            return None;
+        };
+        Some(HudView {
             row,
             shown: matches!(self.stage, Stage::Shown { .. }),
             fresh: self.fresh,
@@ -107,9 +122,25 @@ impl HudFlow {
         })
     }
 
+    /// What a transient status toast draws now; stays through its exit so it never blanks.
+    #[must_use]
+    pub fn toast_view(&self, still: bool) -> Option<ToastView<'_>> {
+        let Some(HudContent::Toast(toast)) = self.content.as_ref() else {
+            return None;
+        };
+        Some(ToastView {
+            toast,
+            shown: matches!(self.stage, Stage::Shown { .. }),
+            still,
+        })
+    }
+
     #[must_use]
     pub(super) fn current(&self) -> Option<&UiHudDisplay> {
-        self.current.as_ref()
+        match self.content.as_ref() {
+            Some(HudContent::Workspaces(row)) => Some(row),
+            _ => None,
+        }
     }
 
     /// The view was built: a fresh marker has been drawn where it starts.
@@ -157,7 +188,7 @@ impl HudFlow {
     /// Tracks an open per-app context menu so the capsule stays visible while the menu tracks
     /// (even when the pointer moves onto the menu) and resumes auto-dismiss once it closes.
     pub fn set_menu_open(&mut self, open: bool, now_ms: u64) -> bool {
-        if self.stage == Stage::Hidden {
+        if self.stage == Stage::Hidden || (open && self.current().is_none()) {
             self.menu_open = false;
             return false;
         }
@@ -203,6 +234,14 @@ impl HudFlow {
                 self.from = self.from.or(row.from);
             }
         }
+        // The workspace this display showed left it without a switch here (it
+        // moved to another display), so it keeps no slot in this row (#419).
+        if let Some(left) = self.current().and_then(|current| current.visible)
+            && row.visible != Some(left)
+            && row.from != Some(left)
+        {
+            self.visited_empty.remove(&left);
+        }
         if let Some(visible) = row.visible {
             let is_empty = row
                 .workspaces
@@ -216,7 +255,27 @@ impl HudFlow {
         self.stage = Stage::Shown {
             hide_at_ms: now_ms.saturating_add(HOLD_MS),
         };
-        self.current = Some(row);
+        self.content = Some(HudContent::Workspaces(row));
+        if hidden {
+            HudTransition::Show
+        } else {
+            HudTransition::Update
+        }
+    }
+
+    /// Triggers a transient status toast (~2.5 s) regardless of whether the Workspace HUD is
+    /// enabled.
+    pub fn trigger_toast(&mut self, toast: UiHudToast, now_ms: u64) -> HudTransition {
+        let hidden = self.stage == Stage::Hidden;
+        self.fresh = false;
+        self.from = None;
+        self.hovered = false;
+        self.menu_open = false;
+        self.visited_empty.clear();
+        self.stage = Stage::Shown {
+            hide_at_ms: now_ms.saturating_add(TOAST_HOLD_MS),
+        };
+        self.content = Some(HudContent::Toast(toast));
         if hidden {
             HudTransition::Show
         } else {
@@ -269,10 +328,14 @@ impl HudFlow {
         }
     }
 
-    /// Updates `enabled`; returns `true` if a shown HUD starts to leave now.
+    /// Updates `enabled`; returns `true` if a shown workspace HUD starts to leave now.
+    /// An active status toast keeps showing until its hold expires.
     pub fn set_enabled(&mut self, enabled: bool, now_ms: u64) -> bool {
         self.enabled = enabled;
-        if !enabled && matches!(self.stage, Stage::Shown { .. }) {
+        if !enabled
+            && matches!(self.stage, Stage::Shown { .. })
+            && matches!(self.content, Some(HudContent::Workspaces(_)))
+        {
             self.hovered = false;
             self.menu_open = false;
             self.leave(now_ms);

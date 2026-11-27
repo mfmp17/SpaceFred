@@ -1,11 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Engine, PhysicalWindowId};
 
+mod deck;
+mod display_map;
 mod id;
+mod lanes;
+mod residency;
+mod state;
+pub(crate) use deck::DeckMode;
+pub(crate) use display_map::DisplayMap;
 pub use id::WorkspaceId;
+pub(crate) use residency::{FloatCause, Residency};
+pub(crate) use state::{SavedSlot, WorkspaceState};
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum DisplaySelector {
@@ -21,124 +30,44 @@ pub enum DisplayTarget {
     Selector(DisplaySelector),
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct WorkspaceState {
-    active: Vec<(DisplaySelector, WorkspaceId)>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    previous: Vec<(DisplaySelector, WorkspaceId)>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    axes: Vec<crate::Axis>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    layouts: Vec<crate::layout_tree::LayoutTree>,
-    slots: Vec<Vec<crate::Slot>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    floating: Vec<(crate::PhysicalWindowId, WorkspaceId)>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    last_focused: Vec<Option<crate::SlotId>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fullscreen_layout: Vec<bool>,
-    /// Legacy per-window maximize intent. A populated entry migrates the
-    /// workspace into fullscreen layout mode.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    maximized: Vec<Option<crate::SlotId>>,
+/// One step along a display's workspaces, in `settings.workspace_order`: `switch next|prev`
+/// and `move next|prev` (the Workspace Steps Lab). Steps stop at either end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceStep {
+    Next,
+    Prev,
 }
 
-impl WorkspaceState {
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.slots.len() > WorkspaceId::COUNT
-            || self.layouts.len() > WorkspaceId::COUNT
-            || self.axes.len() > WorkspaceId::COUNT
-            || self.last_focused.len() > WorkspaceId::COUNT
-            || self.fullscreen_layout.len() > WorkspaceId::COUNT
-            || self.maximized.len() > WorkspaceId::COUNT
-        {
-            return Err("workspace state contains more than 36 workspaces".into());
+impl WorkspaceStep {
+    /// Parses `next` or `prev`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "next" => Some(Self::Next),
+            "prev" => Some(Self::Prev),
+            _ => None,
         }
-        for (index, slots) in self.slots.iter().enumerate() {
-            let next_slot_id = slots
-                .iter()
-                .map(|slot| slot.id.0)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or("workspace slot ID cannot be incremented")?;
-            crate::Model {
-                workspace: crate::model::Workspace {
-                    axis: self.axes.get(index).copied().unwrap_or_default(),
-                    slots: slots.clone(),
-                },
-                continuity: HashMap::new(),
-                next_slot_id,
-            }
-            .validate()
-            .map_err(|error| format!("workspace {}: {error}", index + 1))?;
-            if let Some(layout) = self.layouts.get(index) {
-                layout
-                    .validate(slots)
-                    .map_err(|error| format!("workspace {}: {error}", index + 1))?;
-            }
-        }
-        if self.layouts.len() > self.slots.len() {
-            return Err("workspace layouts have no matching slot state".into());
-        }
-        for (name, intents) in [
-            ("last-focused", &self.last_focused),
-            ("maximized", &self.maximized),
-        ] {
-            for (index, slot) in intents.iter().enumerate() {
-                if let Some(slot) = slot
-                    && !self
-                        .slots
-                        .get(index)
-                        .is_some_and(|slots| slots.iter().any(|candidate| candidate.id == *slot))
-                {
-                    return Err(format!(
-                        "workspace {} {name} slot {} does not exist",
-                        index + 1,
-                        slot.0
-                    ));
-                }
-            }
-        }
-        let mut tiled = HashSet::new();
-        for window in self
-            .slots
-            .iter()
-            .flatten()
-            .map(crate::Slot::identity_window)
-        {
-            if !tiled.insert(window) {
-                return Err("tiled window is owned by multiple workspaces".into());
-            }
-        }
-        let mut floating = HashSet::new();
-        for (window, _) in &self.floating {
-            if tiled.contains(window) {
-                return Err("window is both tiled and floating".into());
-            }
-            if !floating.insert(window) {
-                return Err("floating window is owned by multiple workspaces".into());
-            }
-        }
-        Ok(())
     }
 
-    pub(crate) fn named_workspaces_in_use(&self) -> HashSet<WorkspaceId> {
-        let mut used = self
-            .active
-            .iter()
-            .chain(&self.previous)
-            .map(|(_, workspace)| *workspace)
-            .chain(self.floating.iter().map(|(_, workspace)| *workspace))
-            .filter(|workspace| workspace.letter().is_some())
-            .collect::<HashSet<_>>();
-        for (index, slots) in self.slots.iter().enumerate() {
-            let workspace = WorkspaceId::from_index(index);
-            if workspace.letter().is_some() && !slots.is_empty() {
-                used.insert(workspace);
-            }
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Prev => "prev",
         }
-        used
+    }
+
+    /// The workspace one step from `current` in `ordered`, or `None` past either end or when
+    /// `current` is not listed.
+    #[must_use]
+    pub fn target(self, ordered: &[WorkspaceId], current: WorkspaceId) -> Option<WorkspaceId> {
+        let index = ordered.iter().position(|workspace| *workspace == current)?;
+        match self {
+            Self::Next => ordered.get(index + 1).copied(),
+            Self::Prev => index
+                .checked_sub(1)
+                .and_then(|index| ordered.get(index).copied()),
+        }
     }
 }
 
@@ -166,13 +95,14 @@ impl DisplaySelector {
 pub struct Workspaces {
     engines: [Engine; WorkspaceId::COUNT],
     assignments: [DisplaySelector; WorkspaceId::COUNT],
-    active: HashMap<DisplaySelector, WorkspaceId>,
-    previous: HashMap<DisplaySelector, WorkspaceId>,
-    floating_owners: HashMap<PhysicalWindowId, WorkspaceId>,
+    /// What each display lane and each physical display shows.
+    displays: DisplayMap,
+    /// Every managed window that holds no tile: floats (pinned or not) and the Scratchpad.
+    residency: residency::WindowTable,
     enabled: HashSet<WorkspaceId>,
     last_focused: [Option<crate::SlotId>; WorkspaceId::COUNT],
     last_focused_float: [Option<PhysicalWindowId>; WorkspaceId::COUNT],
-    fullscreen_layout: [bool; WorkspaceId::COUNT],
+    decks: [DeckMode; WorkspaceId::COUNT],
 }
 
 impl Default for Workspaces {
@@ -182,16 +112,15 @@ impl Default for Workspaces {
             assignments: std::array::from_fn(|index| {
                 Self::default_assignment(WorkspaceId::from_index(index))
             }),
-            active: HashMap::from([
+            displays: DisplayMap::new([
                 (DisplaySelector::Main, WorkspaceId::ONE),
                 (DisplaySelector::Secondary, WorkspaceId::SIX),
             ]),
-            previous: HashMap::new(),
-            floating_owners: HashMap::new(),
+            residency: residency::WindowTable::default(),
             enabled: WorkspaceId::numbered().collect(),
             last_focused: std::array::from_fn(|_| None),
             last_focused_float: std::array::from_fn(|_| None),
-            fullscreen_layout: [false; WorkspaceId::COUNT],
+            decks: [DeckMode::Split; WorkspaceId::COUNT],
         }
     }
 }
@@ -199,15 +128,24 @@ impl Default for Workspaces {
 impl Workspaces {
     #[must_use]
     pub(crate) fn state(&self) -> WorkspaceState {
+        // An emptied workspace still keeps a split direction chosen for it (#402).
+        let default_layout = crate::layout_tree::LayoutTree::default();
         let workspace_count = self
             .engines
             .iter()
-            .rposition(|engine| !engine.model().workspace.slots.is_empty())
+            .rposition(|engine| {
+                !engine.model().workspace.slots.is_empty() || *engine.layout() != default_layout
+            })
             .map_or(WorkspaceId::NUMBERED_COUNT, |index| index + 1)
             .max(WorkspaceId::NUMBERED_COUNT);
         WorkspaceState {
-            active: sorted(self.active.clone()),
-            previous: sorted(self.previous.clone()),
+            active: sorted(self.displays.lanes().map(|(lane, ws)| (lane.clone(), ws))),
+            previous: sorted(
+                self.displays
+                    .previous_lanes()
+                    .map(|(lane, ws)| (lane.clone(), ws)),
+            ),
+            fronts: self.displays.fronts_in_order(),
             axes: Vec::new(),
             layouts: self
                 .engines
@@ -219,11 +157,20 @@ impl Workspaces {
                 .engines
                 .iter()
                 .take(workspace_count)
-                .map(|engine| engine.model().workspace.slots.clone())
+                .map(|engine| {
+                    let slots = engine.model().workspace.slots.iter();
+                    slots
+                        .map(|slot| SavedSlot::new(slot, engine.layout()))
+                        .collect()
+                })
                 .collect(),
-            floating: sorted(self.floating_owners.clone()),
+            floating: sorted(
+                self.floating_entries()
+                    .map(|(window, workspace)| (window.clone(), workspace)),
+            ),
+            pinned: sorted(self.residency.hand_pinned().cloned()),
             last_focused: trimmed(&self.last_focused, Option::is_some),
-            fullscreen_layout: trimmed(&self.fullscreen_layout, |enabled| *enabled),
+            fullscreen_layout: trimmed(&self.decks.map(DeckMode::is_monocle), |enabled| *enabled),
             maximized: Vec::new(),
         }
     }
@@ -233,17 +180,20 @@ impl Workspaces {
         let WorkspaceState {
             active,
             previous,
+            fronts,
             axes,
             layouts,
             slots,
             floating,
+            pinned,
             last_focused,
             fullscreen_layout,
             maximized,
         } = state;
-        for (index, slots) in slots.into_iter().take(WorkspaceId::COUNT).enumerate() {
+        for (index, saved) in slots.into_iter().take(WorkspaceId::COUNT).enumerate() {
             let workspace = WorkspaceId::from_index(index);
-            for mut slot in slots {
+            for saved in &saved {
+                let mut slot = saved.slot();
                 if let crate::BindingState::Unresolved { since, .. } = &mut slot.binding {
                     // Reconciliation cycles are process-local, so restart the
                     // bounded settling window when restoring persisted state.
@@ -254,27 +204,33 @@ impl Workspaces {
             let layout = layouts.get(index).cloned().unwrap_or_else(|| {
                 crate::layout_tree::LayoutTree::weighted_flat(
                     axes.get(index).copied().unwrap_or_default(),
-                    self.engine(workspace).model().workspace.slots.iter(),
+                    saved.iter().map(|slot| (slot.id, slot.weight)),
                 )
             });
             self.engine_mut(workspace).restore_layout(layout);
         }
         for (selector, workspace) in active {
             if self.assignment(workspace) == &selector {
-                self.active.insert(selector, workspace);
+                self.displays.set_lane(selector, workspace);
             }
         }
+        // A lane's previous workspace is what its display showed before, which
+        // another selector naming the same display may assign (#401).
         for (selector, workspace) in previous {
-            if self.assignment(workspace) == &selector
-                && self.active_for(&selector) != Some(workspace)
-            {
-                self.previous.insert(selector, workspace);
+            if self.is_enabled(workspace) && self.active_for(&selector) != Some(workspace) {
+                self.displays.set_previous(selector, workspace);
             }
         }
+        self.displays.restore_fronts(fronts);
+        // The saved state does not say why a window floated, so every restored float floats
+        // by hand until its first observation settles whether a float rule holds it.
         for (window, workspace) in floating {
             if self.workspace_of(&window).is_none() {
-                self.floating_owners.insert(window, workspace);
+                self.float(window, workspace, FloatCause::Restored);
             }
+        }
+        for window in pinned {
+            let _: bool = self.pin(window);
         }
         for index in 0..WorkspaceId::COUNT {
             let workspace = WorkspaceId::from_index(index);
@@ -287,11 +243,9 @@ impl Workspaces {
             };
             let legacy_maximized = valid_slot(&maximized);
             self.last_focused[index] = legacy_maximized.or_else(|| valid_slot(&last_focused));
-            self.set_fullscreen_layout(
-                workspace,
-                fullscreen_layout.get(index).copied().unwrap_or(false)
-                    || legacy_maximized.is_some(),
-            );
+            let monocle = fullscreen_layout.get(index).copied().unwrap_or(false)
+                || legacy_maximized.is_some();
+            self.set_deck(workspace, DeckMode::from_fullscreen(monocle));
         }
     }
 
@@ -308,135 +262,22 @@ impl Workspaces {
         &self.assignments[workspace.index()]
     }
 
-    #[must_use]
-    pub fn active_for(&self, display: &DisplaySelector) -> Option<WorkspaceId> {
-        self.active.get(display).copied()
-    }
-
-    pub fn active_lanes(&self) -> impl Iterator<Item = (&DisplaySelector, WorkspaceId)> {
-        self.active
-            .iter()
-            .map(|(display, workspace)| (display, *workspace))
-    }
-
-    pub fn set_assignment(&mut self, workspace: WorkspaceId, display: DisplaySelector) {
-        self.enable(workspace);
-        let previous = self.assignments[workspace.index()].clone();
-        if previous == display {
-            return;
-        }
-        self.assignments[workspace.index()] = display.clone();
-        self.active.entry(display).or_insert(workspace);
-        if self.active.get(&previous) == Some(&workspace) {
-            if let Some(replacement) = WorkspaceId::all().find(|candidate| {
-                self.is_enabled(*candidate) && self.assignment(*candidate) == &previous
-            }) {
-                self.active.insert(previous.clone(), replacement);
-            } else {
-                self.active.remove(&previous);
-            }
-        }
-        if self.previous.get(&previous).is_some_and(|candidate| {
-            *candidate == workspace || self.active.get(&previous) == Some(candidate)
-        }) {
-            self.previous.remove(&previous);
-        }
-    }
-
-    /// Moves `workspace` to `target`, making it active there (recording any
-    /// displaced active workspace on `target` as that display's previous
-    /// workspace) and promoting `source_replacement` on the lane `workspace`
-    /// left.
-    pub fn move_to_display(
-        &mut self,
-        workspace: WorkspaceId,
-        target: DisplaySelector,
-        source_replacement: Option<WorkspaceId>,
-    ) {
-        self.enable(workspace);
-        let source = self.assignments[workspace.index()].clone();
-        if source == target {
-            return;
-        }
-        self.assignments[workspace.index()] = target.clone();
-
-        let displaced = self.active.insert(target.clone(), workspace);
-        match displaced {
-            Some(previous) if previous != workspace => {
-                self.previous.insert(target, previous);
-            }
-            _ => {
-                if self.previous.get(&target) == Some(&workspace) {
-                    self.previous.remove(&target);
-                }
-            }
-        }
-
-        if self.active.get(&source) == Some(&workspace) {
-            let replacement = source_replacement
-                .filter(|candidate| {
-                    *candidate != workspace
-                        && self.is_enabled(*candidate)
-                        && self.assignment(*candidate) == &source
-                })
-                .or_else(|| {
-                    self.previous.get(&source).copied().filter(|candidate| {
-                        *candidate != workspace
-                            && self.is_enabled(*candidate)
-                            && self.assignment(*candidate) == &source
-                    })
-                })
-                .or_else(|| {
-                    WorkspaceId::all().find(|candidate| {
-                        self.is_enabled(*candidate) && self.assignment(*candidate) == &source
-                    })
-                });
-            match replacement {
-                Some(replacement) => {
-                    self.active.insert(source.clone(), replacement);
-                }
-                None => {
-                    self.active.remove(&source);
-                }
-            }
-        }
-        if self.previous.get(&source).is_some_and(|candidate| {
-            *candidate == workspace
-                || Some(*candidate) == source_replacement
-                || self.active.get(&source) == Some(candidate)
-        }) {
-            self.previous.remove(&source);
-        }
-    }
-
     pub fn enable(&mut self, workspace: WorkspaceId) {
         self.enabled.insert(workspace);
+    }
+
+    /// Disables every named workspace keep rejects that nothing refers to any
+    /// more: no window, no display history, no Fullscreen Layout (#424).
+    pub(crate) fn retain_named(&mut self, keep: impl Fn(WorkspaceId) -> bool) {
+        let in_use = self.state().named_workspaces_in_use();
+        self.enabled.retain(|workspace| {
+            workspace.letter().is_none() || keep(*workspace) || in_use.contains(workspace)
+        });
     }
 
     #[must_use]
     pub fn is_enabled(&self, workspace: WorkspaceId) -> bool {
         self.enabled.contains(&workspace)
-    }
-
-    pub fn switch(&mut self, workspace: WorkspaceId) -> WorkspaceId {
-        let display = self.assignment(workspace).clone();
-        let active = self.active_for(&display).unwrap_or(workspace);
-        if active != workspace {
-            self.previous.insert(display.clone(), active);
-            self.active.insert(display, workspace);
-        }
-        active
-    }
-
-    /// Records `shown` as `display`'s previous workspace: a move covered it
-    /// there though another selector naming the same display assigns it.
-    pub fn set_previous(&mut self, display: DisplaySelector, shown: WorkspaceId) {
-        self.previous.insert(display, shown);
-    }
-
-    #[must_use]
-    pub fn previous_for(&self, display: &DisplaySelector) -> Option<WorkspaceId> {
-        self.previous.get(display).copied()
     }
 
     #[must_use]
@@ -453,12 +294,33 @@ impl Workspaces {
         window: &PhysicalWindowId,
         target: WorkspaceId,
     ) -> Option<WorkspaceId> {
+        self.move_window_with(
+            window,
+            target,
+            crate::config::LayoutMode::Columns,
+            crate::Rect::default(),
+            crate::Rect::default(),
+        )
+    }
+
+    pub(crate) fn move_window_with(
+        &mut self,
+        window: &PhysicalWindowId,
+        target: WorkspaceId,
+        mode: crate::config::LayoutMode,
+        source_output: crate::Rect,
+        target_output: crate::Rect,
+    ) -> Option<WorkspaceId> {
         let source = self.workspace_of(window)?;
         let source_index = source.index();
         let target_index = target.index();
         if source_index == target_index {
             return None;
         }
+        let anchor = match mode {
+            crate::config::LayoutMode::Dwindle => self.last_focused[target_index],
+            crate::config::LayoutMode::Columns => None,
+        };
         let (source_engine, target_engine) = if source_index < target_index {
             let (before, after) = self.engines.split_at_mut(target_index);
             (&mut before[source_index], &mut after[0])
@@ -466,8 +328,8 @@ impl Workspaces {
             let (before, after) = self.engines.split_at_mut(source_index);
             (&mut after[0], &mut before[target_index])
         };
-        let slot = source_engine.take_slot(window)?;
-        target_engine.insert_slot(slot);
+        let slot = source_engine.take_slot_with(window, mode, source_output)?;
+        target_engine.insert_slot_with(slot, mode, target_output, anchor);
         self.prune_intents(source);
         Some(source)
     }
@@ -488,23 +350,9 @@ impl Workspaces {
     }
 
     #[must_use]
-    pub(crate) fn floating_workspace_of(&self, window: &PhysicalWindowId) -> Option<WorkspaceId> {
-        self.floating_owners.get(window).copied()
-    }
-
-    #[must_use]
     pub(crate) fn workspace_of_any(&self, window: &PhysicalWindowId) -> Option<WorkspaceId> {
         self.workspace_of(window)
             .or_else(|| self.floating_workspace_of(window))
-    }
-
-    pub(crate) fn own_floating(&mut self, window: PhysicalWindowId, workspace: WorkspaceId) {
-        if let Some(previous) = self.floating_owners.insert(window.clone(), workspace)
-            && previous != workspace
-            && self.last_focused_float[previous.index()].as_ref() == Some(&window)
-        {
-            self.last_focused_float[previous.index()] = None;
-        }
     }
 
     /// The workspace's tiles in stable tile order, then its floats in a stable
@@ -539,51 +387,45 @@ impl Workspaces {
 
     pub(crate) fn app_owns_windows(&self, app: &crate::AppInstanceId) -> bool {
         self.app_owns_tiled_windows(app)
-            || self.floating_owners.keys().any(|window| &window.app == app)
+            || self
+                .floating_entries()
+                .any(|(window, _)| &window.app == app)
     }
 
-    pub(crate) fn forget_app(
+    pub(crate) fn forget_app_with(
         &mut self,
         workspace: WorkspaceId,
         app: &crate::AppInstanceId,
+        mode: crate::config::LayoutMode,
+        output: crate::Rect,
     ) -> bool {
-        let removed = self.engine_mut(workspace).forget_app(app);
+        let removed = self
+            .engine_mut(workspace)
+            .forget_app_with(app, mode, output);
         if removed {
             self.prune_intents(workspace);
         }
         removed
     }
 
-    pub(crate) fn floating_windows_for_app(
-        &self,
-        app: &crate::AppInstanceId,
-    ) -> Vec<PhysicalWindowId> {
-        self.floating_entries()
-            .filter(|(window, _)| &window.app == app)
-            .map(|(window, _)| window.clone())
-            .collect()
-    }
-
-    pub(crate) fn floating_entries(
-        &self,
-    ) -> impl Iterator<Item = (&PhysicalWindowId, WorkspaceId)> {
-        self.floating_owners
-            .iter()
-            .map(|(window, workspace)| (window, *workspace))
-    }
-
-    pub(crate) fn forget_floating(&mut self, window: &PhysicalWindowId) {
-        if let Some(workspace) = self.floating_owners.remove(window)
-            && self.last_focused_float[workspace.index()].as_ref() == Some(window)
-        {
-            self.last_focused_float[workspace.index()] = None;
-        }
-    }
-
     /// The one enabled workspace holding the app's windows, tiled or floating;
-    /// none when they are spread over several.
+    /// none when they are spread over several. A pinned window shows on every
+    /// workspace, so its home workspace does not count (#465).
     #[must_use]
     pub fn workspace_for_app(&self, app: &crate::AppInstanceId) -> Option<WorkspaceId> {
+        self.workspace_for_live_app(app, |_| true)
+    }
+
+    /// [`Self::workspace_for_app`] counting only windows `alive` keeps. A bound
+    /// window the window server no longer lists is closed and must not pull a
+    /// switch to its workspace (#516); an unresolved slot counts only while at
+    /// least one of its candidates is still alive (or it has none to check).
+    #[must_use]
+    pub fn workspace_for_live_app(
+        &self,
+        app: &crate::AppInstanceId,
+        alive: impl Fn(&PhysicalWindowId) -> bool,
+    ) -> Option<WorkspaceId> {
         let mut matches = WorkspaceId::all().filter(|workspace| {
             self.is_enabled(*workspace)
                 && (self
@@ -592,10 +434,21 @@ impl Workspaces {
                     .workspace
                     .slots
                     .iter()
-                    .any(|slot| slot.belongs_to(app))
-                    || self
-                        .floating_entries()
-                        .any(|(window, owner)| owner == *workspace && &window.app == app))
+                    .any(|slot| {
+                        slot.belongs_to(app)
+                            && match &slot.binding {
+                                crate::BindingState::Bound(window) => alive(window),
+                                crate::BindingState::Unresolved { candidates, .. } => {
+                                    candidates.is_empty() || candidates.iter().any(&alive)
+                                }
+                            }
+                    })
+                    || self.floating_entries().any(|(window, owner)| {
+                        owner == *workspace
+                            && &window.app == app
+                            && !self.is_pinned(window)
+                            && alive(window)
+                    }))
         });
         let workspace = matches.next()?;
         matches.next().is_none().then_some(workspace)
@@ -621,7 +474,23 @@ impl Workspaces {
     }
 
     pub fn forget_window(&mut self, workspace: WorkspaceId, window: &PhysicalWindowId) {
-        self.engine_mut(workspace).take_slot(window);
+        self.forget_window_with(
+            workspace,
+            window,
+            crate::config::LayoutMode::Columns,
+            crate::Rect::default(),
+        );
+    }
+
+    pub(crate) fn forget_window_with(
+        &mut self,
+        workspace: WorkspaceId,
+        window: &PhysicalWindowId,
+        mode: crate::config::LayoutMode,
+        output: crate::Rect,
+    ) {
+        self.engine_mut(workspace)
+            .take_slot_with(window, mode, output);
         self.prune_intents(workspace);
     }
 
@@ -636,12 +505,31 @@ impl Workspaces {
         }
     }
 
+    /// Remember `window`, focused while `workspace` shows where it sits. A pin
+    /// from another workspace (its home hidden or elsewhere) counts as that
+    /// workspace's focused float, so coming back refocuses it (#676). The
+    /// caller has resolved the workspace the window shows on.
+    pub(crate) fn remember_shown_focus(
+        &mut self,
+        workspace: WorkspaceId,
+        window: &PhysicalWindowId,
+    ) {
+        if self.is_pinned(window) && self.floating_workspace_of(window) != Some(workspace) {
+            self.last_focused_float[workspace.index()] = Some(window.clone());
+        } else {
+            self.remember_focus(workspace, window);
+        }
+    }
+
     /// The workspace's most recently focused floating window, if it still
-    /// belongs to `workspace`.
+    /// belongs to `workspace` or is a pin (which may show on any workspace of
+    /// its display; callers check where it is).
     pub(crate) fn preferred_float_focus(&self, workspace: WorkspaceId) -> Option<PhysicalWindowId> {
         self.last_focused_float[workspace.index()]
             .as_ref()
-            .filter(|window| self.floating_workspace_of(window) == Some(workspace))
+            .filter(|window| {
+                self.floating_workspace_of(window) == Some(workspace) || self.is_pinned(window)
+            })
             .cloned()
     }
 
@@ -654,20 +542,23 @@ impl Workspaces {
             .cloned()
     }
 
-    pub(crate) fn uses_fullscreen_layout(&self, workspace: WorkspaceId) -> bool {
-        self.fullscreen_layout[workspace.index()]
+    /// How the workspace shows its tiles.
+    pub(crate) fn deck(&self, workspace: WorkspaceId) -> DeckMode {
+        self.decks[workspace.index()]
     }
 
-    pub(crate) fn set_fullscreen_layout(&mut self, workspace: WorkspaceId, enabled: bool) {
-        self.fullscreen_layout[workspace.index()] =
-            enabled && !self.engine(workspace).model().workspace.slots.is_empty();
+    /// An empty workspace always shows its (nonexistent) tiles split, so the
+    /// next window to arrive starts in the ordinary layout.
+    pub(crate) fn set_deck(&mut self, workspace: WorkspaceId, deck: DeckMode) {
+        let empty = self.engine(workspace).model().workspace.slots.is_empty();
+        self.decks[workspace.index()] = if empty { DeckMode::Split } else { deck };
     }
 
     pub(crate) fn prune_intents(&mut self, workspace: WorkspaceId) {
         let index = workspace.index();
         self.last_focused[index] =
             self.last_focused[index].filter(|slot| self.has_slot(workspace, *slot));
-        self.set_fullscreen_layout(workspace, self.fullscreen_layout[index]);
+        self.set_deck(workspace, self.decks[index]);
     }
 
     fn has_slot(&self, workspace: WorkspaceId, slot: crate::SlotId) -> bool {

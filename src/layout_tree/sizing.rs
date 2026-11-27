@@ -6,8 +6,74 @@ use super::{
     Child, LayoutTree, MIN_TILE_EXTENT, Node, extent, leading, partition_children, trailing,
 };
 
+/// The smallest cell each tile may be given by a size edit: a known minimum
+/// window size (its cell, gap included) or else the floor every tile keeps.
+#[derive(Clone, Copy)]
+pub(crate) struct Minimums<'a> {
+    pub(crate) known: Option<&'a HashMap<SlotId, (i32, i32)>>,
+    pub(crate) floor: i32,
+}
+
+impl Minimums<'_> {
+    #[cfg(test)]
+    pub(crate) const FLOOR: Minimums<'static> = Minimums {
+        known: None,
+        floor: MIN_TILE_EXTENT,
+    };
+
+    fn leaf(self, slot: SlotId, axis: Axis) -> i32 {
+        let known = self
+            .known
+            .and_then(|known| known.get(&slot))
+            .map_or(0, |&(width, height)| match axis {
+                Axis::Horizontal => width,
+                Axis::Vertical => height,
+            });
+        known.max(self.floor)
+    }
+}
+
 impl LayoutTree {
+    #[cfg(test)]
     pub(crate) fn resize(&mut self, slot: SlotId, current: Rect, output: Rect) -> bool {
+        self.resize_within(slot, current, output, Minimums::FLOOR)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resize_by(
+        &mut self,
+        slot: SlotId,
+        direction: ResizeDirection,
+        amount: i32,
+        output: Rect,
+    ) -> bool {
+        self.resize_by_within(slot, direction, amount, output, Minimums::FLOOR)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resize_to(
+        &mut self,
+        slot: SlotId,
+        axis: Axis,
+        target: i32,
+        output: Rect,
+    ) -> bool {
+        self.resize_to_within(slot, axis, target, output, Minimums::FLOOR)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn balance(&mut self, slot: SlotId, output: Rect) -> bool {
+        self.balance_within(slot, output, Minimums::FLOOR)
+    }
+
+    /// Reads a tile the user resized to `current` as the split boundaries it moved.
+    pub(crate) fn resize_within(
+        &mut self,
+        slot: SlotId,
+        current: Rect,
+        output: Rect,
+        minimums: Minimums<'_>,
+    ) -> bool {
         let Some(expected) = self
             .placements(output)
             .into_iter()
@@ -28,13 +94,18 @@ impl LayoutTree {
                 Vec::new(),
                 axis,
             ) {
-                changed |= self.apply_resize(candidate, output);
+                changed |= self.apply_resize(candidate, output, minimums);
             }
         }
         changed
     }
 
-    fn apply_resize(&mut self, candidate: ResizeCandidate, output: Rect) -> bool {
+    fn apply_resize(
+        &mut self,
+        candidate: ResizeCandidate,
+        output: Rect,
+        minimums: Minimums<'_>,
+    ) -> bool {
         if candidate.delta.abs() <= 2 {
             return false;
         }
@@ -46,8 +117,8 @@ impl LayoutTree {
         let after = before + 1;
         let pair_start = leading(frames[before], *axis);
         let pair_end = trailing(frames[after], *axis);
-        let before_minimum = minimum_extent(&children[before].node, *axis);
-        let after_minimum = minimum_extent(&children[after].node, *axis);
+        let before_minimum = minimum_extent(&children[before].node, *axis, minimums);
+        let after_minimum = minimum_extent(&children[after].node, *axis, minimums);
         if pair_end - pair_start < before_minimum + after_minimum {
             return false;
         }
@@ -64,12 +135,13 @@ impl LayoutTree {
         true
     }
 
-    pub(crate) fn resize_by(
+    pub(crate) fn resize_by_within(
         &mut self,
         slot: SlotId,
         direction: ResizeDirection,
         amount: i32,
         output: Rect,
+        minimums: Minimums<'_>,
     ) -> bool {
         let Some((path, index)) = immediate_parent(&self.root, slot, Vec::new()) else {
             return false;
@@ -86,8 +158,8 @@ impl LayoutTree {
         };
         let frames = partition_children(split_frame, *axis, children);
         let pair_extent = extent(frames[index], *axis) + extent(frames[neighbor], *axis);
-        let focused_minimum = minimum_extent(&children[index].node, *axis);
-        let neighbor_minimum = minimum_extent(&children[neighbor].node, *axis);
+        let focused_minimum = minimum_extent(&children[index].node, *axis, minimums);
+        let neighbor_minimum = minimum_extent(&children[neighbor].node, *axis, minimums);
         if pair_extent < focused_minimum + neighbor_minimum {
             return false;
         }
@@ -113,12 +185,13 @@ impl LayoutTree {
     /// Set the focused tile's extent along `axis` at the nearest split on that axis. The
     /// split's other children give or take the difference in proportion to their size (or to
     /// what each can spare above its nested minimum), so their relative sizes hold.
-    pub(crate) fn resize_to(
+    pub(crate) fn resize_to_within(
         &mut self,
         slot: SlotId,
         axis: Axis,
         target: i32,
         output: Rect,
+        minimums: Minimums<'_>,
     ) -> bool {
         let Some((path, index)) = nearest_split_on(&self.root, slot, axis, Vec::new()) else {
             return false;
@@ -132,7 +205,7 @@ impl LayoutTree {
             .collect::<Vec<_>>();
         let minimums = children
             .iter()
-            .map(|child| minimum_extent(&child.node, axis))
+            .map(|child| minimum_extent(&child.node, axis, minimums))
             .collect::<Vec<_>>();
         let Some(sized) = extents_with(&extents, &minimums, index, target) else {
             return false;
@@ -146,7 +219,12 @@ impl LayoutTree {
         true
     }
 
-    pub(crate) fn balance(&mut self, slot: SlotId, output: Rect) -> bool {
+    pub(crate) fn balance_within(
+        &mut self,
+        slot: SlotId,
+        output: Rect,
+        minimums: Minimums<'_>,
+    ) -> bool {
         let Some((path, _)) = immediate_parent(&self.root, slot, Vec::new()) else {
             return false;
         };
@@ -156,7 +234,7 @@ impl LayoutTree {
         let total = extent(split_frame, *axis);
         let minimums = children
             .iter()
-            .map(|child| minimum_extent(&child.node, *axis))
+            .map(|child| minimum_extent(&child.node, *axis, minimums))
             .collect::<Vec<_>>();
         if minimums.iter().sum::<i32>() > total {
             return false;
@@ -218,7 +296,7 @@ impl LayoutTree {
         path: &[usize],
     ) -> Option<(Rect, &mut Axis, &mut Vec<Child>)> {
         let frame = output_at(&self.root, output, path);
-        let Node::Split { axis, children } = node_at_mut(&mut self.root, path)? else {
+        let Node::Split { axis, children, .. } = node_at_mut(&mut self.root, path)? else {
             return None;
         };
         Some((frame, axis, children))
@@ -242,7 +320,7 @@ fn resize_candidate(
     path: Vec<usize>,
     drag_axis: Axis,
 ) -> Option<ResizeCandidate> {
-    let Node::Split { axis, children } = node else {
+    let Node::Split { axis, children, .. } = node else {
         return None;
     };
     let frames = partition_children(frame, *axis, children);
@@ -365,6 +443,7 @@ fn nearest_split_on(
     let Node::Split {
         axis: split_axis,
         children,
+        ..
     } = node
     else {
         return None;
@@ -400,7 +479,7 @@ fn output_at(root: &Node, output: Rect, path: &[usize]) -> Rect {
     let mut node = root;
     let mut frame = output;
     for &index in path {
-        let Node::Split { axis, children } = node else {
+        let Node::Split { axis, children, .. } = node else {
             break;
         };
         frame = partition_children(frame, *axis, children)[index];
@@ -420,7 +499,18 @@ fn node_at_mut<'a>(node: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
     Some(node)
 }
 
+/// The split a keyboard resize or balance of `slot` acts on, and the index of the child that
+/// holds it: the split directly holding the tile, or, when that is a one-child split kept for
+/// its direction (#611), the nearest ancestor where the tile has a sibling.
 fn immediate_parent(node: &Node, slot: SlotId, path: Vec<usize>) -> Option<(Vec<usize>, usize)> {
+    sizing_parent(node, slot, path).map(|(path, index, _)| (path, index))
+}
+
+fn sizing_parent(
+    node: &Node,
+    slot: SlotId,
+    path: Vec<usize>,
+) -> Option<(Vec<usize>, usize, usize)> {
     let Node::Split { children, .. } = node else {
         return None;
     };
@@ -428,26 +518,32 @@ fn immediate_parent(node: &Node, slot: SlotId, path: Vec<usize>) -> Option<(Vec<
         .iter()
         .position(|child| child.node.contains(slot))?;
     if matches!(children[index].node, Node::Leaf(existing) if existing == slot) {
-        return Some((path, index));
+        return Some((path, index, children.len()));
     }
-    let mut child_path = path;
+    let mut child_path = path.clone();
     child_path.push(index);
-    immediate_parent(&children[index].node, slot, child_path)
+    let nested = sizing_parent(&children[index].node, slot, child_path)?;
+    if nested.2 == 1 && children.len() > 1 {
+        Some((path, index, children.len()))
+    } else {
+        Some(nested)
+    }
 }
 
-fn minimum_extent(node: &Node, axis: Axis) -> i32 {
+fn minimum_extent(node: &Node, axis: Axis, minimums: Minimums<'_>) -> i32 {
     match node {
-        Node::Leaf(_) => MIN_TILE_EXTENT,
+        Node::Leaf(slot) => minimums.leaf(*slot, axis),
         Node::Split {
             axis: split_axis,
             children,
+            ..
         } if *split_axis == axis => children
             .iter()
-            .map(|child| minimum_extent(&child.node, axis))
+            .map(|child| minimum_extent(&child.node, axis, minimums))
             .sum(),
         Node::Split { children, .. } => children
             .iter()
-            .map(|child| minimum_extent(&child.node, axis))
+            .map(|child| minimum_extent(&child.node, axis, minimums))
             .max()
             .unwrap_or(0),
     }
@@ -457,7 +553,7 @@ fn minimum_extent(node: &Node, axis: Axis) -> i32 {
 const MINIMUM_TOLERANCE: i32 = 2;
 
 fn fit_node(node: &mut Node, frame: Rect, minimums: &HashMap<SlotId, (i32, i32)>) -> bool {
-    let Node::Split { axis, children } = node else {
+    let Node::Split { axis, children, .. } = node else {
         return false;
     };
     let extents = partition_children(frame, *axis, children)
@@ -498,6 +594,7 @@ pub(super) fn required_extent(
         Node::Split {
             axis: split_axis,
             children,
+            ..
         } if *split_axis == axis => children
             .iter()
             .map(|child| required_extent(&child.node, axis, minimums))

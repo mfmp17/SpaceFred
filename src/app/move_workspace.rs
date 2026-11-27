@@ -18,15 +18,21 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outputs: macos::DisplayOutputs,
         cancelled: &AtomicBool,
     ) -> Result<CycleStatus, String> {
-        self.synchronize_foreground(&outputs);
         if outputs.displays().len() <= 1 {
             return Err("Only one display is connected".into());
         }
         let visible = self.visible_workspaces(&outputs);
         let reported_focused = self.backend.focused_window();
-        let (source_resolved, focused_window) =
+        let (mut source_resolved, focused_window) =
             self.focused_visible_workspace(&visible, &outputs)?;
-        let prior_stale = self.take_pending_focus_stale();
+        // `move-workspace` still moves a float's own workspace when it is shown, even
+        // after the float was dragged to another display without joining it (#561, #652).
+        if let Some(window) = focused_window.as_ref()
+            && let Some(home) = self.workspaces.floating_workspace_of(window)
+            && let Some(home_resolved) = visible.iter().find(|entry| entry.workspace == home)
+        {
+            source_resolved = home_resolved.clone();
+        }
         let moved_ws = source_resolved.workspace;
         let source_display_id = source_resolved.display_id;
         let source_output = source_resolved.output;
@@ -80,8 +86,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             self.workspaces.remember_focus(moved_ws, focused);
         }
 
-        let move_started = Instant::now();
-        let source_incoming = source_replacement
+        let move_started = self.backend.now();
+        let mut source_incoming = source_replacement
             .map(|workspace| self.workspaces.windows(workspace))
             .unwrap_or_default();
         let source_incoming_originals: HashMap<_, _> = source_incoming
@@ -181,6 +187,12 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             ));
         }
 
+        // A window minimized or hidden while the replacement was away stays
+        // set aside, as on an explicit switch (#496, #682).
+        if let Some(replacement) = source_replacement {
+            self.release_set_aside(replacement, &mut source_incoming);
+        }
+
         let mut failed = 0;
         if let Some(replacement) = source_replacement {
             let source_layout = self.layout_workspace(replacement, source_output, cancelled);
@@ -228,6 +240,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
         failed += moved_layout.failed;
 
+        let display_frames: Vec<_> = outputs.frames().collect();
         let mut moved_floating_originals = Vec::new();
         for window in &moved_floating {
             if self.parked.contains_key(window) {
@@ -268,7 +281,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     ));
                 }
             };
-            if !source_output.contains_center(frame) {
+            // A float taller than a display it was carried to has its center
+            // off every display; it is on the display it covers most (#403).
+            if Self::display_for_frame(frame, &display_frames) != Some(source_output) {
                 continue;
             }
             let target_frame = translate_frame_to_output(frame, source_output, target_output);
@@ -380,20 +395,17 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         {
             self.workspaces.set_previous(target_selector.clone(), shown);
         }
-        self.foreground_lanes
-            .insert(target_display_id, target_selector);
+        self.workspaces
+            .bring_forward(&target_display_id, target_selector);
         if let Some(replacement) = source_replacement {
-            self.foreground_lanes.insert(
-                source_display_id,
-                self.workspaces.assignment(replacement).clone(),
-            );
-            if self.workspaces.uses_fullscreen_layout(replacement)
+            self.workspaces.show_on(&source_display_id, replacement);
+            if self.workspaces.deck(replacement).is_monocle()
                 && let Some(front) = self.workspaces.preferred_focus(replacement)
             {
                 self.backend.raise_window(&front);
             }
         } else {
-            self.foreground_lanes.remove(&source_display_id);
+            self.workspaces.forget_display_front(&source_display_id);
         }
 
         // Translate any floating window still waiting on a pending recovery frame
@@ -403,25 +415,20 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 continue;
             };
             let current = self
-                .scratchpad
-                .pending_summon(window)
+                .parked
+                .summon_destination(window)
                 .map(|summon| self.restore_target(summon))
                 .unwrap_or(recovery);
-            if source_output.contains_center(current) {
+            if Self::display_for_frame(current, &display_frames) == Some(source_output) {
                 let relocated = translate_frame_to_output(current, source_output, target_output);
                 let _: bool = self.record_recovery(window, relocated);
-                if self.scratchpad.pending_summon(window).is_some() {
-                    self.scratchpad.set_pending_summon(window, Some(relocated));
-                }
+                self.parked.move_summon(window, relocated);
             }
             if !matches!(
                 self.restore_window(window),
                 macos::ApplyOutcome::Applied | macos::ApplyOutcome::Gone
             ) {
                 failed += 1;
-            }
-            if !self.parked.contains_key(window) {
-                self.scratchpad.set_pending_summon(window, None);
             }
         }
 
@@ -432,47 +439,57 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             reported_focused,
             frontmost_before,
             false,
-            prior_stale,
         );
-        self.follow_pointer_for_workspace(moved_ws, target_output, outcome, &outputs);
+        self.follow_pointer_for_workspace(
+            super::commands::CommandOrigin::Explicit,
+            moved_ws,
+            target_output,
+            outcome,
+            &outputs,
+        );
         self.persist_workspace_state_if_changed()?;
         log_event!(
             "move-workspace complete: workspace {} -> {} in {}ms",
             moved_ws,
             target_display_name,
-            move_started.elapsed().as_millis()
+            self.backend
+                .now()
+                .saturating_duration_since(move_started)
+                .as_millis()
         );
         let mut status = self.status(failed, &outputs);
         status.hud = Some(self.hud_for(moved_ws, UiHudKind::Workspace, displaced, &outputs));
         Ok(status)
     }
 
-    fn focused_visible_workspace(
+    pub(super) fn focused_visible_workspace(
         &mut self,
         visible: &[ResolvedWorkspace],
         outputs: &macos::DisplayOutputs,
     ) -> Result<(ResolvedWorkspace, Option<crate::PhysicalWindowId>), String> {
         let focused = self.current_focus();
-        if let Some(window) = focused.as_ref() {
-            if let Some(workspace) = self.workspaces.workspace_of_any(window)
-                && let Some(resolved) = visible.iter().find(|entry| entry.workspace == workspace)
-            {
-                return Ok((resolved.clone(), Some(window.clone())));
-            }
-            if let Some(frame) = self
-                .backend
-                .window_server_frame(window)
-                .or_else(|| self.backend.frame(window).ok())
-                && let Some(resolved) = visible
-                    .iter()
-                    .find(|entry| entry.output.contains_center(frame))
-            {
-                return Ok((resolved.clone(), Some(window.clone())));
-            }
+        // A float keeps its workspace when dragged to another display (always for a pin,
+        // and for any float while Dragged Floats Follow Their Display is off), so the focused
+        // display is the one it is on (#652). A shown Scratchpad window is not a float here:
+        // it stays with the workspace it was summoned onto, so a toggle still hides it.
+        if let Some(window) = focused.as_ref()
+            && !self.parked.contains_key(window)
+            && matches!(
+                self.workspaces.residency(window),
+                Some(crate::workspace::Residency::Floating { .. })
+            )
+            && let Some(resolved) = self.visible_workspace_under(window, visible)
+        {
+            return Ok((resolved, Some(window.clone())));
+        }
+        if let Some(window) = focused.as_ref()
+            && let Some(resolved) = self.shown_workspace_for(window, visible, outputs)
+        {
+            return Ok((resolved, Some(window.clone())));
         }
         // No visible window has focus, as on an empty workspace: the one
         // switched to last is the focused one, wherever it shows.
-        let last_focused = self.last_focused_workspace;
+        let last_focused = self.focus.history().current;
         visible
             .iter()
             .find(|entry| Some(entry.workspace) == last_focused)
@@ -485,6 +502,28 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .cloned()
             .map(|resolved| (resolved, focused))
             .ok_or_else(|| "No active workspace is available".into())
+    }
+
+    /// The visible workspace whose display holds `window`'s live frame center, counting a
+    /// center in that display's menu bar or Dock strip as on it (#606).
+    pub(super) fn visible_workspace_under(
+        &mut self,
+        window: &crate::PhysicalWindowId,
+        visible: &[ResolvedWorkspace],
+    ) -> Option<ResolvedWorkspace> {
+        let frame = self
+            .backend
+            .window_server_frame(window)
+            .or_else(|| self.backend.frame(window).ok())?;
+        visible
+            .iter()
+            .find(|resolved| resolved.output.contains_center(frame))
+            .or_else(|| {
+                visible
+                    .iter()
+                    .find(|resolved| resolved.screen.contains_center(frame))
+            })
+            .cloned()
     }
 
     fn pick_source_replacement(
@@ -528,8 +567,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     }
 
     fn rollback_move_workspace(&mut self, state: MoveRollback<'_>) {
-        self.suppressed_focus = self.backend.focused_window();
-        self.suppressed_app = self.backend.frontmost_application();
+        self.guard_reported_focus();
         for window in state.parked_displaced {
             self.restore_window(&window);
         }

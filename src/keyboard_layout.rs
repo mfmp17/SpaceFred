@@ -147,6 +147,23 @@ impl LayoutSnapshot {
         }
     }
 
+    /// What the key serving `key` types with Shift held, on the primary layout: `+` for `=`
+    /// on a US layout. A shifted binding written with that character (`alt++`) lands on the
+    /// same physical chord as `alt+shift+=`, so Settings must treat the two as one.
+    pub(crate) fn shifted(&self, key: LogicalKey) -> Option<char> {
+        let key_code = self
+            .candidates(key)
+            .ok()?
+            .into_iter()
+            .find(|candidate| !candidate.shift)?
+            .key_code;
+        let key_code = u16::try_from(key_code).ok()?;
+        self.primary
+            .iter()
+            .find(|output| output.key_code == key_code && output.shift && !output.dead)
+            .map(|output| output.character)
+    }
+
     /// A character's keys in preference order: a live key on the primary layout, a live key
     /// on the ASCII-capable fallback, a dead key, then the physical ANSI punctuation key.
     ///
@@ -654,6 +671,32 @@ mod tests {
             shift: false,
             dead: false,
         }
+    }
+
+    #[test]
+    fn shifted_names_what_the_same_key_types_with_shift() {
+        // US: `=` and `+` share 0x18; `1` and `!` share the number row's 0x12.
+        let snapshot = LayoutSnapshot::for_test(
+            vec![
+                (0x18, '=', false, false),
+                (0x18, '+', true, false),
+                (0x45, '+', false, false),
+                (0x12, '1', false, false),
+                (0x12, '!', true, false),
+                (0x04, 'h', false, false),
+                (0x04, 'H', true, false),
+            ],
+            vec![],
+        );
+        assert_eq!(snapshot.shifted(LogicalKey::Character('=')), Some('+'));
+        assert_eq!(
+            snapshot.shifted(LogicalKey::Semantic(SemanticKey::Workspace(1))),
+            Some('!')
+        );
+        assert_eq!(snapshot.shifted(LogicalKey::Character('h')), Some('H'));
+        // `+` resolves to Shift+`=` itself, so it has no shifted twin.
+        assert_eq!(snapshot.shifted(LogicalKey::Character('+')), None);
+        assert_eq!(snapshot.shifted(LogicalKey::Character('x')), None);
     }
 
     #[test]

@@ -123,7 +123,7 @@ fn gesture_dispatch_preserves_preview_and_final_semantics() {
     for preview in [true, false] {
         compare_dispatch(
             WorkerCommand::Gesture(
-                FinalGesture::Drop(window(10), (1500, 100)),
+                FinalGesture::drop(window(10), (1500, 100)),
                 preview,
                 outputs(),
             ),
@@ -173,7 +173,7 @@ fn dispatch_classifies_cancellation_before_worker_receipt() {
         .collect::<Vec<_>>();
     for preview in [true, false] {
         commands.push((
-            WorkerCommand::Gesture(FinalGesture::Drop(window(10), (50, 50)), preview, outputs()),
+            WorkerCommand::Gesture(FinalGesture::drop(window(10), (50, 50)), preview, outputs()),
             preview,
         ));
         commands.push((
@@ -239,7 +239,7 @@ fn restoration_request_sends_now_or_waits_for_the_current_worker() {
             assert!(dispatch.send(WorkerCommand::Action(WorkerAction::Retile, outputs())));
             assert!(receiver.try_recv().is_ok());
         }
-        dispatch.request_restore();
+        dispatch.request_restore(RestoreKind::Restore);
         assert!(dispatch.is_busy());
         assert_eq!(dispatch.is_restoring(), !was_busy);
         assert!(dispatch.is_restoring_or_pending());
@@ -262,7 +262,7 @@ fn disconnected_worker_does_not_claim_restoration_is_running() {
     let (sender, receiver) = channel();
     drop(receiver);
     let mut dispatch = WorkerDispatch::new(sender);
-    dispatch.request_restore();
+    dispatch.request_restore(RestoreKind::Restore);
     assert!(!dispatch.is_busy() && !dispatch.is_restoring_or_pending());
 }
 
@@ -271,7 +271,7 @@ fn restoration_and_stop_do_not_require_display_outputs() {
     let mut runtime = fixture();
     assert!(matches!(
         runtime.execute(WorkerCommand::RestoreAll(None), &AtomicBool::new(false)),
-        Some(WorkerResult::Restored { failed: 0 })
+        Some(WorkerResult::Restored { failed: 0, .. })
     ));
     assert!(
         runtime
@@ -368,4 +368,311 @@ fn hud_emits_only_for_workspace_move_and_layout_actions() {
             .collect::<Vec<_>>(),
         vec![WorkspaceId::ONE, WorkspaceId::TWO]
     );
+}
+
+fn lifecycle_rig() -> (WorkerDispatch, std::sync::mpsc::Receiver<WorkerCommand>) {
+    let (sender, receiver) = channel();
+    (WorkerDispatch::new(sender), receiver)
+}
+
+fn retile() -> WorkerCommand {
+    WorkerCommand::Action(WorkerAction::Retile, outputs())
+}
+
+fn switch_two() -> WorkerCommand {
+    WorkerCommand::Action(WorkerAction::SwitchWorkspace(WorkspaceId::TWO), outputs())
+}
+
+/// Every transition of the worker lifecycle, from every state it can leave.
+#[test]
+fn worker_lifecycle_transitions_cover_every_legal_state() {
+    use AfterCommand::*;
+    use RestoreKind::*;
+    use WorkerLifecycle::*;
+
+    let (mut dispatch, receiver) = lifecycle_rig();
+    assert_eq!(dispatch.lifecycle(), Idle);
+
+    // Idle -> Running (interruptible follows the command) -> Idle.
+    assert!(dispatch.send(retile()));
+    assert_eq!(
+        dispatch.lifecycle(),
+        Running {
+            interruptible: true,
+            then: Nothing
+        }
+    );
+    dispatch.finish_command();
+    assert_eq!(dispatch.lifecycle(), Idle);
+    assert!(dispatch.send(switch_two()));
+    assert_eq!(
+        dispatch.lifecycle(),
+        Running {
+            interruptible: false,
+            then: Nothing
+        }
+    );
+
+    // A restoration requested mid-command waits for it; an undo merges in.
+    dispatch.request_restore(Restore);
+    assert_eq!(
+        dispatch.lifecycle(),
+        Running {
+            interruptible: false,
+            then: AfterCommand::StartRestore(Restore)
+        }
+    );
+    dispatch.request_restore(Undo);
+    assert_eq!(
+        dispatch.lifecycle(),
+        Running {
+            interruptible: false,
+            then: AfterCommand::StartRestore(Undo)
+        }
+    );
+    dispatch.finish_command();
+    assert_eq!(dispatch.lifecycle(), RestorePending(Undo));
+    assert!(dispatch.is_restoring_or_pending() && !dispatch.is_busy());
+    while receiver.try_recv().is_ok() {}
+
+    // RestorePending -> Restoring, and the worker receives the undo.
+    assert_eq!(dispatch.start_pending_restore(), Some(true));
+    assert_eq!(
+        dispatch.lifecycle(),
+        Restoring {
+            kind: Undo,
+            again: None
+        }
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(WorkerCommand::UndoArrangement(_))
+    ));
+    assert_eq!(dispatch.start_pending_restore(), None);
+
+    // Restoring -> RestoreRetryDue keeps the undo for the retry.
+    dispatch.defer_restore_retry();
+    assert_eq!(dispatch.lifecycle(), RestoreRetryDue(Undo));
+    assert!(dispatch.is_restoring() && !dispatch.is_busy());
+
+    // A command sent while the retry waits returns to it.
+    assert!(dispatch.send(retile()));
+    assert_eq!(
+        dispatch.lifecycle(),
+        Running {
+            interruptible: true,
+            then: RetryRestore(Undo)
+        }
+    );
+    assert!(dispatch.is_restoring());
+    dispatch.finish_command();
+    assert_eq!(dispatch.lifecycle(), RestoreRetryDue(Undo));
+    while receiver.try_recv().is_ok() {}
+
+    // The retry timer sends it again.
+    assert!(dispatch.send_restore());
+    assert_eq!(
+        dispatch.lifecycle(),
+        Restoring {
+            kind: Undo,
+            again: None
+        }
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(WorkerCommand::UndoArrangement(_))
+    ));
+
+    // A request during a restoration runs after it, then -> Idle.
+    dispatch.request_restore(Restore);
+    assert_eq!(
+        dispatch.lifecycle(),
+        Restoring {
+            kind: Undo,
+            again: Some(Restore)
+        }
+    );
+    dispatch.finish_restore();
+    assert_eq!(dispatch.lifecycle(), RestorePending(Restore));
+    assert_eq!(dispatch.start_pending_restore(), Some(true));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(WorkerCommand::RestoreAll(_))
+    ));
+    dispatch.finish_restore();
+    assert_eq!(dispatch.lifecycle(), Idle);
+
+    // A failed restoration with another owed goes straight back to pending.
+    dispatch.request_restore(Restore);
+    dispatch.request_restore(Undo);
+    assert_eq!(
+        dispatch.lifecycle(),
+        Restoring {
+            kind: Restore,
+            again: Some(Undo)
+        }
+    );
+    dispatch.defer_restore_retry();
+    assert_eq!(dispatch.lifecycle(), RestorePending(Undo));
+
+    // A request while one waits for its retry sends now, merged.
+    dispatch.start_pending_restore();
+    dispatch.defer_restore_retry();
+    assert_eq!(dispatch.lifecycle(), RestoreRetryDue(Undo));
+    dispatch.request_restore(Restore);
+    assert_eq!(
+        dispatch.lifecycle(),
+        Restoring {
+            kind: Undo,
+            again: None
+        }
+    );
+
+    // A status result does not finish a restoration.
+    dispatch.finish_command();
+    assert_eq!(
+        dispatch.lifecycle(),
+        Restoring {
+            kind: Undo,
+            again: None
+        }
+    );
+
+    dispatch.reset_disconnected();
+    assert_eq!(dispatch.lifecycle(), Idle);
+
+    // A worker that is gone takes nothing and owes nothing.
+    drop(receiver);
+    dispatch.request_restore(Undo);
+    assert_eq!(dispatch.lifecycle(), Idle);
+    assert!(!dispatch.send(retile()));
+    assert_eq!(dispatch.lifecycle(), Idle);
+}
+
+/// The queries the app loop gates on, for every legal state.
+#[test]
+fn worker_lifecycle_queries_match_each_state() {
+    use AfterCommand::*;
+    use RestoreKind::*;
+    use WorkerLifecycle::*;
+    let cases = [
+        // state, busy, interruptible, restoring, restoring or pending
+        (Idle, false, false, false, false),
+        (
+            Running {
+                interruptible: true,
+                then: Nothing,
+            },
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            Running {
+                interruptible: false,
+                then: Nothing,
+            },
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            Running {
+                interruptible: true,
+                then: AfterCommand::StartRestore(Undo),
+            },
+            true,
+            true,
+            false,
+            true,
+        ),
+        (
+            Running {
+                interruptible: false,
+                then: RetryRestore(Restore),
+            },
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            Restoring {
+                kind: Restore,
+                again: None,
+            },
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            Restoring {
+                kind: Undo,
+                again: Some(Restore),
+            },
+            true,
+            false,
+            true,
+            true,
+        ),
+        (RestoreRetryDue(Restore), false, false, true, true),
+        (RestorePending(Undo), false, false, false, true),
+    ];
+    for (state, busy, interruptible, restoring, owed) in cases {
+        let (mut dispatch, _receiver) = lifecycle_rig();
+        drive_to(&mut dispatch, state);
+        assert_eq!(dispatch.lifecycle(), state);
+        assert_eq!(dispatch.is_busy(), busy, "{state:?}");
+        assert_eq!(dispatch.is_interruptible_busy(), interruptible, "{state:?}");
+        assert_eq!(dispatch.is_restoring(), restoring, "{state:?}");
+        assert_eq!(dispatch.is_restoring_or_pending(), owed, "{state:?}");
+    }
+}
+
+/// Reaches `state` through the public transitions only.
+fn drive_to(dispatch: &mut WorkerDispatch, state: WorkerLifecycle) {
+    use WorkerLifecycle::*;
+    let command = |interruptible: bool| {
+        if interruptible {
+            retile()
+        } else {
+            switch_two()
+        }
+    };
+    match state {
+        Idle => {}
+        Running {
+            interruptible,
+            then,
+        } => {
+            match then {
+                AfterCommand::Nothing => {}
+                AfterCommand::StartRestore(kind) => {
+                    drive_to(dispatch, RestorePending(kind));
+                }
+                AfterCommand::RetryRestore(kind) => {
+                    drive_to(dispatch, RestoreRetryDue(kind));
+                }
+            }
+            assert!(dispatch.send(command(interruptible)));
+        }
+        Restoring { kind, again } => {
+            dispatch.request_restore(kind);
+            if let Some(again) = again {
+                dispatch.request_restore(again);
+            }
+        }
+        RestoreRetryDue(kind) => {
+            dispatch.request_restore(kind);
+            dispatch.defer_restore_retry();
+        }
+        RestorePending(kind) => {
+            assert!(dispatch.send(retile()));
+            dispatch.request_restore(kind);
+            dispatch.finish_command();
+        }
+    }
 }

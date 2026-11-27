@@ -23,6 +23,10 @@ use super::{
     mouse_down, observe_window, process_incarnation_matches, running_application,
 };
 
+mod frame;
+
+use frame::apply_element;
+
 #[derive(Debug, serde::Serialize)]
 pub struct ApplyResult {
     pub window: PhysicalWindowId,
@@ -117,6 +121,7 @@ pub fn apply_managed(
                 break;
             }
             if !process_incarnation_matches(&app_id) {
+                evict_placed_windows(&placements, &indices);
                 fill_missing_results(&placements, &indices, &mut results, ApplyOutcome::Gone);
                 continue;
             }
@@ -124,6 +129,7 @@ pub fn apply_managed(
             let windows = match attribute::<CFArray>(&app, "AXWindows") {
                 Ok(windows) => windows,
                 Err(AXError::InvalidUIElement) => {
+                    evict_placed_windows(&placements, &indices);
                     fill_missing_results(&placements, &indices, &mut results, ApplyOutcome::Gone);
                     continue;
                 }
@@ -178,6 +184,11 @@ pub fn apply_managed(
                     break;
                 }
             }
+            // `AXWindows` lists only the showing desktop's windows, so a window
+            // missing from it may live on another macOS desktop. Its cached
+            // handle still reaches it: a rolled-back switch parks it again
+            // through that handle (#775). A truly closed window's handle is
+            // dropped the next time an operation on it fails.
             fill_missing_results(
                 &placements,
                 &pending.into_values().flatten().collect::<Vec<_>>(),
@@ -208,6 +219,13 @@ pub(super) fn group_placements_by_app(
     groups
 }
 
+/// Drop the cached handles of windows whose app is gone or relaunched.
+fn evict_placed_windows(placements: &[(&PhysicalWindowId, Rect)], indices: &[usize]) {
+    for index in indices {
+        evict_managed_window(placements[*index].0);
+    }
+}
+
 fn fill_missing_results(
     placements: &[(&PhysicalWindowId, Rect)],
     indices: &[usize],
@@ -216,9 +234,6 @@ fn fill_missing_results(
 ) {
     for index in indices {
         let (window, target) = placements[*index];
-        if matches!(outcome, ApplyOutcome::Gone) {
-            evict_managed_window(window);
-        }
         results[*index] = Some(ApplyResult {
             window: window.clone(),
             target,
@@ -234,8 +249,66 @@ pub fn frame(id: &PhysicalWindowId) -> Result<Rect, WindowAccessError> {
     })
 }
 
+/// What window rules match on, for a window no observation lists (one an app reopened at a
+/// parking spot). Its title stays in memory only; never log it.
+pub struct WindowRuleProbe {
+    pub bundle_id: String,
+    /// The window's title, `None` when it has none or Accessibility could not read it.
+    pub title: Option<std::sync::Arc<str>>,
+    /// Whether Accessibility resolved the window, so a missing title is an answer.
+    pub resolved: bool,
+}
+
+/// Reads `id`'s app bundle ID and window title for rule matching.
+#[must_use]
+pub fn window_rule_probe(id: &PhysicalWindowId) -> Option<WindowRuleProbe> {
+    let bundle_id = autoreleasepool(|_| {
+        running_application(&id.app)?
+            .bundleIdentifier()
+            .map(|value| value.to_string())
+    })?;
+    let read = with_managed_window_result(id, |window| {
+        interpret_ax_title(attribute::<CFString>(window, "AXTitle"))
+    });
+    Some(WindowRuleProbe {
+        bundle_id,
+        resolved: read.is_ok(),
+        title: read.ok().flatten(),
+    })
+}
+
+fn interpret_ax_title(
+    result: Result<CFRetained<CFString>, AXError>,
+) -> Result<Option<std::sync::Arc<str>>, WindowAccessError> {
+    match result {
+        Ok(title) => Ok(Some(std::sync::Arc::from(title.to_string()))),
+        Err(AXError::NoValue | AXError::AttributeUnsupported) => Ok(None),
+        Err(_) => Err(WindowAccessError::Unavailable),
+    }
+}
+
 pub fn set_position_only(id: &PhysicalWindowId, target: Rect) -> ApplyOutcome {
     write_position(id, target, position_matches)
+}
+
+/// Move a parked window back to its recovery frame `target`: position first,
+/// then the recorded size if an app changed it while parked. The size write is
+/// best effort (apps may clamp it); arrival is confirmed by position alone.
+pub fn set_restore_frame(id: &PhysicalWindowId, target: Rect) -> ApplyOutcome {
+    write_window(
+        id,
+        target,
+        |window| {
+            let result = set_position(window, target);
+            if window_frame(window).is_some_and(|actual| {
+                actual.width != target.width || actual.height != target.height
+            }) {
+                let _: AXError = set_size(window, target);
+            }
+            result
+        },
+        position_matches,
+    )
 }
 
 /// Park a window at `target`, a [`crate::geometry::parked_frame`] position.
@@ -252,8 +325,17 @@ fn write_position(
     target: Rect,
     confirmed: impl Fn(Rect, Rect) -> bool,
 ) -> ApplyOutcome {
+    write_window(id, target, |window| set_position(window, target), confirmed)
+}
+
+fn write_window(
+    id: &PhysicalWindowId,
+    target: Rect,
+    write: impl Fn(&AXUIElement) -> AXError,
+    confirmed: impl Fn(Rect, Rect) -> bool,
+) -> ApplyOutcome {
     match with_managed_window_result(id, |window| {
-        let result = without_window_animations(&id.app, || set_position(window, target));
+        let result = without_window_animations(&id.app, || write(window));
         if window_frame(window).is_some_and(|actual| confirmed(actual, target)) {
             Ok(())
         } else if matches!(result, AXError::InvalidUIElement) {
@@ -287,7 +369,7 @@ unsafe extern "C" {
 pub fn warp_pointer(point: (i32, i32)) -> bool {
     let target = CGPoint::new(f64::from(point.0), f64::from(point.1));
     warp_sequence(
-        mouse_down,
+        super::any_mouse_button_down,
         || {
             // SAFETY: `CGWarpMouseCursorPosition` takes a plain `CGPoint` by
             // value and does not retain pointers or require AppKit main-thread state.
@@ -491,53 +573,6 @@ fn apply_window(
     None
 }
 
-fn apply_element(
-    id: &PhysicalWindowId,
-    window: &AXUIElement,
-    target: Rect,
-    settings: &Settings,
-) -> ApplyResult {
-    let before = window_frame(window);
-    if before.is_some_and(|frame| frame.approximately_equals(target, settings.frame_tolerance)) {
-        return ApplyResult {
-            window: id.clone(),
-            target,
-            actual: before,
-            outcome: ApplyOutcome::Applied,
-        };
-    }
-    let wrote = write_frame(|| set_size(window, target), || set_position(window, target));
-    let actual = window_frame(window);
-    let outcome = match (wrote, actual) {
-        (_, Some(actual)) if actual.approximately_equals(target, settings.frame_tolerance) => {
-            ApplyOutcome::Applied
-        }
-        (true, Some(_)) => ApplyOutcome::Constrained,
-        _ => ApplyOutcome::Unavailable,
-    };
-    ApplyResult {
-        window: id.clone(),
-        target,
-        actual,
-        outcome,
-    }
-}
-
-/// Size, move, then size again. The first size write only helps a window
-/// that is leaving a smaller display fit where it lands, so it is best effort:
-/// a window that refuses it on its old display (a clamped or slow app) must
-/// still move. Whether the frame was written rests on the move and the final
-/// size alone.
-fn write_frame(
-    mut set_size: impl FnMut() -> AXError,
-    set_position: impl FnOnce() -> AXError,
-) -> bool {
-    let _: AXError = set_size();
-    let moved = set_position() == AXError::Success;
-    let sized = set_size() == AXError::Success;
-    moved && sized
-}
-
 fn without_window_animations<T>(app: &AppInstanceId, operation: impl FnOnce() -> T) -> T {
     let application = application_element(app.pid);
     let _animations = WindowAnimationGuard::new(&application);
@@ -580,28 +615,68 @@ impl Drop for WindowAnimationGuard<'_> {
     }
 }
 
+/// How resolving a window afresh through its app's `AXWindows` went, after an
+/// operation on its cached handle failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowLookup {
+    /// The app did not answer (busy or hung); nothing shows the handle is stale.
+    Unanswered,
+    /// The app is gone, relaunched, or no longer lists the window.
+    Missing,
+    /// The app listed the window, so its fresh handle replaces the cached one.
+    Found,
+}
+
+/// Whether a cached handle whose operation failed stays cached after `lookup`.
+/// A handle can go stale while the window lives on (an app rebuilds its
+/// accessibility tree), so it is dropped once the app answers. An app that does
+/// not answer keeps it: writes sent on it still land, in order, when the app
+/// resumes, and without it no later write (a rolled-back switch's park, #722)
+/// could reach the app at all until it answers again.
+#[must_use]
+pub fn keeps_failed_handle(lookup: WindowLookup) -> bool {
+    lookup == WindowLookup::Unanswered
+}
+
 fn with_managed_window_result<T>(
     id: &PhysicalWindowId,
     mut operation: impl FnMut(&AXUIElement) -> Result<T, WindowAccessError>,
 ) -> Result<T, WindowAccessError> {
-    if let Some(window) = MANAGED_WINDOWS.with(|windows| windows.borrow().get(id).cloned()) {
-        match operation(&window) {
-            Ok(value) => return Ok(value),
-            // A cached handle can go stale while the window lives on (an app
-            // rebuilds its accessibility tree); resolve it afresh once before
-            // reporting the window gone.
-            Err(_) => evict_managed_window(id),
-        }
+    let cached = MANAGED_WINDOWS.with(|windows| windows.borrow().get(id).cloned());
+    if let Some(window) = &cached
+        && let Ok(value) = operation(window)
+    {
+        return Ok(value);
     }
+    // Resolve the window afresh once before reporting it unavailable or gone.
+    let (lookup, result) = resolve_managed_window(id, &mut operation);
+    if cached.is_some() && !keeps_failed_handle(lookup) && result.is_err() {
+        evict_managed_window(id);
+    }
+    result
+}
+
+fn resolve_managed_window<T>(
+    id: &PhysicalWindowId,
+    operation: &mut impl FnMut(&AXUIElement) -> Result<T, WindowAccessError>,
+) -> (WindowLookup, Result<T, WindowAccessError>) {
     if !process_incarnation_matches(&id.app) {
         evict_managed_app(&id.app);
-        return Err(WindowAccessError::Gone);
+        return (WindowLookup::Missing, Err(WindowAccessError::Gone));
     }
     let app = application_element(id.app.pid);
-    let windows = attribute::<CFArray>(&app, "AXWindows").map_err(|error| match error {
-        AXError::InvalidUIElement => WindowAccessError::Gone,
-        _ => WindowAccessError::Unavailable,
-    })?;
+    let windows = match attribute::<CFArray>(&app, "AXWindows") {
+        Ok(windows) => windows,
+        Err(AXError::InvalidUIElement) => {
+            return (WindowLookup::Missing, Err(WindowAccessError::Gone));
+        }
+        Err(_) => {
+            return (
+                WindowLookup::Unanswered,
+                Err(WindowAccessError::Unavailable),
+            );
+        }
+    };
     for window in cf_array_items::<AXUIElement>(&windows) {
         set_ax_timeout(window);
         if physical_window_id(&id.app, window).as_ref() == Some(id) {
@@ -609,23 +684,32 @@ fn with_managed_window_result<T>(
             if result.is_ok() {
                 cache_managed_window(id, window);
             }
-            return result;
+            return (WindowLookup::Found, result);
         }
     }
-    Err(WindowAccessError::Gone)
+    (WindowLookup::Missing, Err(WindowAccessError::Gone))
 }
 
 /// Reads `AXMinimized` from the cached handle only, with a short timeout, so
 /// an unresponsive app cannot hold up the cycle; no handle means no evidence.
 pub(super) fn cached_window_is_minimized(id: &PhysicalWindowId) -> bool {
+    cached_window_flag(id, "AXMinimized")
+}
+
+/// Whether the cached window is in macOS native fullscreen (`AXFullScreen`).
+pub(super) fn cached_window_is_fullscreen(id: &PhysicalWindowId) -> bool {
+    cached_window_flag(id, "AXFullScreen")
+}
+
+fn cached_window_flag(id: &PhysicalWindowId, attribute: &'static str) -> bool {
     let Some(window) = MANAGED_WINDOWS.with(|windows| windows.borrow().get(id).cloned()) else {
         return false;
     };
     // SAFETY: `window` is a live cached `AXUIElement`; the timeout is restored below.
     let _: AXError = unsafe { window.set_messaging_timeout(0.05) };
-    let minimized = optional_bool_attribute(&window, "AXMinimized").unwrap_or(false);
+    let value = optional_bool_attribute(&window, attribute).unwrap_or(false);
     set_ax_timeout(&window);
-    minimized
+    value
 }
 
 pub(super) fn cache_managed_window(id: &PhysicalWindowId, window: &AXUIElement) {
@@ -652,20 +736,103 @@ pub(super) fn prune_managed_app(app: &AppInstanceId, current: &HashSet<PhysicalW
     MANAGED_WINDOWS.with(|windows| {
         windows
             .borrow_mut()
-            .retain(|window, _| &window.app != app || current.contains(window));
+            .retain(|window, _| keep_cached_window(window, app, current));
     });
+}
+
+fn keep_cached_window(
+    window: &PhysicalWindowId,
+    app: &AppInstanceId,
+    current: &HashSet<PhysicalWindowId>,
+) -> bool {
+    if window.app == *app {
+        current.contains(window)
+    } else {
+        window.app.pid != app.pid || window.app.launched_at > app.launched_at
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
+    use std::collections::HashSet;
+
     use objc2_application_services::AXError;
+    use objc2_core_foundation::CFString;
 
     use super::{
-        FRONTMOST_POLL, FRONTMOST_REASSERTS, confirm_frontmost, focus_sequence, warp_sequence,
-        write_frame,
+        ApplyOutcome, FRONTMOST_POLL, FRONTMOST_REASSERTS, WindowAccessError, WindowLookup,
+        confirm_frontmost, focus_sequence,
+        frame::{FrameWrite, arrived_short, frame_outcome, write_frame},
+        interpret_ax_title, keep_cached_window, keeps_failed_handle, warp_sequence,
     };
+    use crate::{AppInstanceId, PhysicalWindowId, Rect, Settings};
+
+    /// #722: a busy app keeps its window's handle, so a park written after a
+    /// timed-out restore is still sent and lands behind it; once the app
+    /// answers, a failed handle is dropped as before.
+    #[test]
+    fn a_failed_handle_is_kept_only_while_its_app_does_not_answer() {
+        assert!(keeps_failed_handle(WindowLookup::Unanswered));
+        assert!(!keeps_failed_handle(WindowLookup::Missing));
+        assert!(!keeps_failed_handle(WindowLookup::Found));
+    }
+
+    #[test]
+    fn a_window_from_another_display_that_lands_short_is_sized_again() {
+        // #428: center display above, a taller portrait display to its left.
+        let center = Rect {
+            x: 0,
+            y: 30,
+            width: 2560,
+            height: 1410,
+        };
+        let portrait = Rect {
+            x: -1440,
+            y: -583,
+            width: 1440,
+            height: 2530,
+        };
+        let settings = Settings {
+            output: portrait,
+            frame_tolerance: crate::reconcile::DEFAULT_FRAME_TOLERANCE,
+            spacing: crate::spacing::Spacing::default(),
+            layout: crate::config::LayoutMode::default(),
+        };
+        let clamped = Rect {
+            height: 2023,
+            ..portrait
+        };
+        assert!(arrived_short(
+            Some(center),
+            portrait,
+            Some(clamped),
+            &settings
+        ));
+        // Already on the display: a short frame is the app's own answer.
+        assert!(!arrived_short(
+            Some(portrait),
+            portrait,
+            Some(clamped),
+            &settings
+        ));
+        // A full-size landing, or one that did not reach its place, needs nothing.
+        assert!(!arrived_short(
+            Some(center),
+            portrait,
+            Some(portrait),
+            &settings
+        ));
+        let elsewhere = Rect { x: 0, ..clamped };
+        assert!(!arrived_short(
+            Some(center),
+            portrait,
+            Some(elsewhere),
+            &settings
+        ));
+        assert!(!arrived_short(None, portrait, Some(clamped), &settings));
+    }
 
     #[test]
     fn focus_raises_the_window_before_bringing_its_app_forward() {
@@ -759,21 +926,75 @@ mod tests {
             },
         );
 
-        assert!(wrote);
+        assert!(wrote.written());
         assert_eq!(*calls.borrow(), ["size", "position", "size"]);
     }
 
     #[test]
     fn a_refused_move_or_final_size_is_not_written() {
-        assert!(!write_frame(
-            || AXError::Success,
-            || AXError::CannotComplete
-        ));
+        let refused_move = write_frame(|| AXError::Success, || AXError::CannotComplete);
+        assert!(!refused_move.written());
         let sizes = RefCell::new(vec![AXError::CannotComplete, AXError::Success]);
-        assert!(!write_frame(
-            || sizes.borrow_mut().pop().unwrap(),
-            || AXError::Success
-        ));
+        let write = write_frame(|| sizes.borrow_mut().pop().unwrap(), || AXError::Success);
+        assert_eq!(
+            write,
+            FrameWrite {
+                moved: true,
+                sized: false,
+            }
+        );
+        assert!(!write.written());
+    }
+
+    /// #726: a fixed-size window tiled by a `tile` rule refuses every size
+    /// write; moved to its tile's corner it keeps its own size there, which
+    /// must not block the layout of a workspace it is revealed with.
+    #[test]
+    fn a_window_that_moves_but_cannot_resize_is_constrained_not_unavailable() {
+        let tile = Rect {
+            x: 0,
+            y: 30,
+            width: 1280,
+            height: 1410,
+        };
+        let native = Rect {
+            width: 620,
+            height: 420,
+            ..tile
+        };
+        let moved_only = FrameWrite {
+            moved: true,
+            sized: false,
+        };
+        assert_eq!(
+            frame_outcome(moved_only, tile, Some(native), 0),
+            ApplyOutcome::Constrained
+        );
+        let elsewhere = Rect {
+            x: 900,
+            y: 600,
+            ..native
+        };
+        assert_eq!(
+            frame_outcome(moved_only, tile, Some(elsewhere), 0),
+            ApplyOutcome::Unavailable
+        );
+        let refused = FrameWrite {
+            moved: false,
+            sized: false,
+        };
+        assert_eq!(
+            frame_outcome(refused, tile, Some(native), 0),
+            ApplyOutcome::Unavailable
+        );
+        assert_eq!(
+            frame_outcome(refused, tile, Some(tile), 0),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            frame_outcome(moved_only, tile, None, 0),
+            ApplyOutcome::Unavailable
+        );
     }
 
     #[test]
@@ -798,5 +1019,70 @@ mod tests {
             || calls.borrow_mut().push("reassociate"),
         ));
         assert_eq!(*calls.borrow(), ["warp", "reassociate"]);
+    }
+
+    #[test]
+    fn ax_title_timeout_marks_rule_probe_unresolved_instead_of_untitled() {
+        assert_eq!(
+            interpret_ax_title(Ok(CFString::from_str("Work")))
+                .unwrap()
+                .as_deref(),
+            Some("Work")
+        );
+        assert_eq!(interpret_ax_title(Err(AXError::NoValue)), Ok(None));
+        assert_eq!(
+            interpret_ax_title(Err(AXError::AttributeUnsupported)),
+            Ok(None)
+        );
+        assert_eq!(
+            interpret_ax_title(Err(AXError::CannotComplete)),
+            Err(WindowAccessError::Unavailable)
+        );
+        assert_eq!(
+            interpret_ax_title(Err(AXError::APIDisabled)),
+            Err(WindowAccessError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn prune_managed_app_evicts_older_incarnations_reusing_the_same_pid() {
+        let older_app = AppInstanceId {
+            pid: 42,
+            launched_at: 100,
+        };
+        let current_app = AppInstanceId {
+            pid: 42,
+            launched_at: 200,
+        };
+        let other_app = AppInstanceId {
+            pid: 99,
+            launched_at: 50,
+        };
+        let kept_current = PhysicalWindowId {
+            app: current_app.clone(),
+            window_id: 1,
+        };
+        let closed_current = PhysicalWindowId {
+            app: current_app.clone(),
+            window_id: 2,
+        };
+        let stale_reused_pid = PhysicalWindowId {
+            app: older_app,
+            window_id: 3,
+        };
+        let unrelated = PhysicalWindowId {
+            app: other_app,
+            window_id: 4,
+        };
+        let current = HashSet::from([kept_current.clone()]);
+
+        assert!(keep_cached_window(&kept_current, &current_app, &current));
+        assert!(!keep_cached_window(&closed_current, &current_app, &current));
+        assert!(!keep_cached_window(
+            &stale_reused_pid,
+            &current_app,
+            &current
+        ));
+        assert!(keep_cached_window(&unrelated, &current_app, &current));
     }
 }

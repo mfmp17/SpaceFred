@@ -1,6 +1,6 @@
 [package]
 name = "spaceman"
-version = "0.3.3"
+version = "0.3.7"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
@@ -16,6 +16,8 @@ cc = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+# Edits config.toml in place so its comments and order survive (cli/merge.rs, config/write.rs).
+toml_edit = "0.23"
 ctrlc = { version = "3", features = ["termination"] }
 libc = "0.2"
 
@@ -101,6 +103,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSSet",
   "NSValue",
   "NSString",
+  "NSUserDefaults",
 ] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
   "std",

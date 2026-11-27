@@ -40,11 +40,55 @@ fn dragging_to_a_tile_edge_previews_a_nested_insertion() {
     bind(&mut runtime, WorkspaceId::ONE, &target);
     bind(&mut runtime, WorkspaceId::ONE, &third);
 
+    let before = runtime.workspaces.engine(WorkspaceId::ONE).layout().clone();
+
     runtime
         .drop_window(
             moving.clone(),
             (500, 10),
             true,
+            outputs(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+    // Preview moves the siblings on screen without mutating the committed layout (#340).
+    assert_eq!(
+        runtime.workspaces.engine(WorkspaceId::ONE).layout(),
+        &before
+    );
+    assert_eq!(
+        runtime.backend.frames[&target],
+        crate::Rect {
+            x: 0,
+            y: 400,
+            width: 500,
+            height: 400
+        }
+    );
+    assert_eq!(
+        runtime.backend.frames[&third],
+        crate::Rect {
+            x: 500,
+            y: 0,
+            width: 500,
+            height: 800
+        }
+    );
+    assert!(
+        !runtime
+            .backend
+            .calls
+            .iter()
+            .any(|call| matches!(call, BackendCall::Apply(window, _) if window == &moving))
+    );
+
+    // Mouse-up at the same point commits the nested insertion.
+    runtime
+        .drop_window(
+            moving.clone(),
+            (500, 10),
+            false,
             outputs(),
             &AtomicBool::new(false),
         )
@@ -107,12 +151,13 @@ fn dragging_a_tiled_window_over_its_sibling_live_previews_the_swap() {
         )
         .unwrap();
 
+    // Preview slides the sibling into the first slot without mutating the committed order (#340).
     assert_eq!(
         runtime.workspaces.engine(WorkspaceId::ONE).bound_windows(),
-        vec![second.clone(), first.clone()]
+        vec![first.clone(), second.clone()]
     );
     assert!(runtime.backend.calls.contains(&BackendCall::Apply(
-        second,
+        second.clone(),
         crate::Rect {
             x: 0,
             y: 0,
@@ -126,6 +171,21 @@ fn dragging_a_tiled_window_over_its_sibling_live_previews_the_swap() {
             .calls
             .iter()
             .any(|call| matches!(call, BackendCall::Apply(window, _) if window == &first))
+    );
+
+    // Releasing over the sibling commits the swap.
+    runtime
+        .drop_window(
+            first.clone(),
+            (750, 400),
+            false,
+            outputs(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.workspaces.engine(WorkspaceId::ONE).bound_windows(),
+        vec![second, first]
     );
 }
 
@@ -273,7 +333,7 @@ fn releasing_resize_or_drop_after_workspace_switch_keeps_outgoing_workspace_park
     let before_drop = rt.backend.calls.len();
     dispatch(
         &mut rt,
-        QueuedInput::Gesture(FinalGesture::Drop(window(20), (250, 400))),
+        QueuedInput::Gesture(FinalGesture::drop(window(20), (250, 400))),
     );
     assert!(rt.backend.calls[before_drop..].iter().all(
         |call| !matches!(call, BackendCall::Apply(w, _) if w == &window(10) || w == &window(20))
@@ -297,4 +357,129 @@ fn releasing_resize_or_drop_after_workspace_switch_keeps_outgoing_workspace_park
         QueuedInput::Gesture(FinalGesture::Resize(window(20), resized)),
     );
     assert_eq!(widths(&rt, WorkspaceId::ONE), [550, 450]);
+}
+
+#[test]
+fn releasing_a_previewed_swap_keeps_a_layout_toggle_made_while_held() {
+    let first = window(10);
+    let second = window(20);
+    let mut backend = FakeBackend {
+        focused: Some(first.clone()),
+        mouse_down: true,
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(first.clone(), frame(50));
+    backend.frames.insert(second.clone(), frame(500));
+    let mut runtime = runtime(backend);
+    bind(&mut runtime, WorkspaceId::ONE, &first);
+    bind(&mut runtime, WorkspaceId::ONE, &second);
+    let cancelled = AtomicBool::new(false);
+
+    runtime
+        .drop_window(first.clone(), (750, 400), true, outputs(), &cancelled)
+        .unwrap();
+    // Option+/ arrives with the button still held and turns the columns into rows.
+    runtime.toggle_layout(outputs(), &cancelled).unwrap();
+    assert_eq!(
+        runtime.workspaces.engine(WorkspaceId::ONE).root_axis(),
+        crate::Axis::Vertical
+    );
+
+    // Releasing where the swap preview was shown must not bring the columns back (#524).
+    runtime.backend.mouse_down = false;
+    runtime
+        .drop_window(first.clone(), (750, 400), false, outputs(), &cancelled)
+        .unwrap();
+    assert_eq!(
+        runtime.workspaces.engine(WorkspaceId::ONE).root_axis(),
+        crate::Axis::Vertical
+    );
+    let mut bound = runtime.workspaces.engine(WorkspaceId::ONE).bound_windows();
+    bound.sort();
+    assert_eq!(bound, vec![first, second]);
+    assert!(runtime.gesture.is_none());
+}
+
+/// #550: the display under a held cross-display drag switches workspaces;
+/// releasing where the preview was shown drops onto the one shown now.
+#[test]
+fn a_held_cross_display_drop_follows_a_destination_switch() {
+    let dragged = window(10);
+    let sibling = window(11);
+    let shown = window(20);
+    let mut backend = FakeBackend {
+        focused: Some(dragged.clone()),
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(dragged.clone(), frame(50));
+    backend.frames.insert(sibling.clone(), frame(500));
+    backend.frames.insert(shown.clone(), frame(1050));
+    let mut runtime = runtime(backend);
+    bind(&mut runtime, WorkspaceId::ONE, &dragged);
+    bind(&mut runtime, WorkspaceId::ONE, &sibling);
+    bind(&mut runtime, WorkspaceId::SIX, &shown);
+    let cancelled = AtomicBool::new(false);
+    let point = (1500, 400);
+
+    runtime
+        .drop_window(dragged.clone(), point, true, outputs(), &cancelled)
+        .unwrap();
+    let seven = WorkspaceId::new(7).unwrap();
+    runtime.switch(seven, outputs(), &cancelled).unwrap();
+    assert!(runtime.is_visible(seven, &outputs()));
+    assert!(!runtime.is_visible(WorkspaceId::SIX, &outputs()));
+
+    runtime
+        .drop_window(dragged.clone(), point, false, outputs(), &cancelled)
+        .unwrap();
+
+    assert_eq!(runtime.workspaces.workspace_of(&dragged), Some(seven));
+    assert!(!runtime.parked.contains_key(&dragged));
+}
+
+/// #605: the workspace under a held cross-display drag moves to another
+/// display; releasing where the preview was shown drops onto the workspace
+/// shown under the pointer now, not the one that moved away.
+#[test]
+fn a_held_cross_display_drop_stays_under_the_pointer_when_its_workspace_moves() {
+    let dragged = window(10);
+    let sibling = window(11);
+    let shown = window(20);
+    let mut backend = FakeBackend {
+        focused: Some(dragged.clone()),
+        ..FakeBackend::default()
+    };
+    backend.frames.insert(dragged.clone(), frame(50));
+    backend.frames.insert(sibling.clone(), frame(500));
+    backend.frames.insert(shown.clone(), frame(1050));
+    let mut runtime = runtime(backend);
+    bind(&mut runtime, WorkspaceId::ONE, &dragged);
+    bind(&mut runtime, WorkspaceId::ONE, &sibling);
+    bind(&mut runtime, WorkspaceId::SIX, &shown);
+    let cancelled = AtomicBool::new(false);
+    let point = (1500, 400);
+
+    runtime
+        .drop_window(dragged.clone(), point, true, three_outputs(), &cancelled)
+        .unwrap();
+    runtime
+        .switch(WorkspaceId::SIX, three_outputs(), &cancelled)
+        .unwrap();
+    runtime.backend.focused = Some(shown.clone());
+    runtime
+        .move_workspace_to_display(DisplayTarget::Next, three_outputs(), &cancelled)
+        .unwrap();
+    let now_under = runtime.shown_at(point, &three_outputs());
+    assert!(runtime.is_visible(WorkspaceId::SIX, &three_outputs()));
+    assert!(now_under.is_some_and(|workspace| workspace != WorkspaceId::SIX));
+
+    runtime
+        .drop_window(dragged.clone(), point, false, three_outputs(), &cancelled)
+        .unwrap();
+
+    assert_eq!(runtime.workspaces.workspace_of(&dragged), now_under);
+    assert_eq!(
+        runtime.workspaces.workspace_of(&shown),
+        Some(WorkspaceId::SIX)
+    );
 }

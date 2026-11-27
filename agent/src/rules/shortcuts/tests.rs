@@ -437,7 +437,7 @@ fn choosing_option_or_resetting_shortcuts_preserves_detached_modifier_comment() 
         .expect("missing other settings");
     assert!(kb < note && note < other, "{option_saved}");
 
-    // Pressing Reset to Defaults preserves all three comments in order.
+    // Pressing Reset to defaults preserves all three comments in order.
     let mut reset = Doc::parse(source);
     reset.reset_shortcuts();
     let reset_saved = saved(&reset).source();

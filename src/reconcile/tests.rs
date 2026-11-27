@@ -1,10 +1,9 @@
 use super::*;
 use crate::{ObservedApplication, ObservedWindow};
 
-fn weighted_slot(id: u64, weight: u32) -> Slot {
+fn bound_slot(id: u64) -> Slot {
     Slot {
         id: SlotId(id),
-        weight,
         binding: BindingState::Bound(PhysicalWindowId {
             app: AppInstanceId {
                 pid: 1,
@@ -24,12 +23,7 @@ fn flat_placements_partition_without_gaps_or_rounding_loss() {
             width: 101,
             height: 50,
         }),
-        crate::Axis::Horizontal,
-        &[
-            weighted_slot(1, 1),
-            weighted_slot(2, 1),
-            weighted_slot(3, 1),
-        ],
+        &[bound_slot(1), bound_slot(2), bound_slot(3)],
     );
 
     assert_eq!(placements[0].frame.width, 33);
@@ -42,7 +36,7 @@ fn flat_placements_partition_without_gaps_or_rounding_loss() {
 
 #[test]
 fn flat_placements_reserve_unresolved_slots() {
-    let mut unresolved = weighted_slot(2, 1);
+    let mut unresolved = bound_slot(2);
     unresolved.binding = BindingState::Unresolved {
         previous: unresolved.bound_window().unwrap().clone(),
         candidates: Vec::new(),
@@ -55,8 +49,7 @@ fn flat_placements_reserve_unresolved_slots() {
             height: 50,
             ..Rect::default()
         }),
-        crate::Axis::Horizontal,
-        &[weighted_slot(1, 1), unresolved],
+        &[bound_slot(1), unresolved],
     );
     assert_eq!(placements.len(), 2);
     assert_eq!(placements[0].frame.width, 50);
@@ -65,28 +58,25 @@ fn flat_placements_reserve_unresolved_slots() {
 }
 
 #[test]
-fn flat_placements_preserve_cumulative_weight_rounding() {
-    let placements = flat_placements(
-        &Settings::for_output(Rect {
-            x: 10,
-            y: 20,
-            width: 50,
-            height: 101,
-        }),
+fn weighted_rows_preserve_cumulative_weight_rounding() {
+    let output = Rect {
+        x: 10,
+        y: 20,
+        width: 50,
+        height: 101,
+    };
+    let cells = LayoutTree::weighted_flat(
         crate::Axis::Vertical,
-        &[
-            weighted_slot(1, 2),
-            weighted_slot(2, 3),
-            weighted_slot(3, 5),
-        ],
-    );
+        [(SlotId(1), 2), (SlotId(2), 3), (SlotId(3), 5)],
+    )
+    .placements(output);
 
-    assert_eq!(placements[0].frame.height, 20);
-    assert_eq!(placements[1].frame.y, 40);
-    assert_eq!(placements[1].frame.height, 30);
-    assert_eq!(placements[2].frame.y, 70);
-    assert_eq!(placements[2].frame.height, 51);
-    assert_eq!(placements[2].frame.y + placements[2].frame.height, 121);
+    assert_eq!(cells[0].1.height, 20);
+    assert_eq!(cells[1].1.y, 40);
+    assert_eq!(cells[1].1.height, 30);
+    assert_eq!(cells[2].1.y, 70);
+    assert_eq!(cells[2].1.height, 51);
+    assert_eq!(cells[2].1.y + cells[2].1.height, 121);
 }
 
 const OUTPUT: Rect = Rect {
@@ -109,6 +99,7 @@ fn window(app: &AppInstanceId, window_id: u32, frame: Rect) -> ObservedWindow {
         frame,
         resizable: true,
         title: None,
+        document: None,
     }
 }
 
@@ -144,6 +135,7 @@ fn run(model: &Model, cycle: u64, applications: Vec<AppObservation>) -> Reconcil
             output: OUTPUT,
             frame_tolerance: 2,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::default(),
         },
     )
 }
@@ -305,6 +297,7 @@ fn valid_ghostty_replacement_preserves_slot() {
     let slot = first.model.workspace.slots[0].id;
     let evidence = ReconciliationEvidence {
         previous_placements: HashMap::from([(slot, OUTPUT)]),
+        ..ReconciliationEvidence::default()
     };
     let result = reconcile(
         &first.model,
@@ -323,6 +316,7 @@ fn valid_ghostty_replacement_preserves_slot() {
             output: OUTPUT,
             frame_tolerance: 2,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::default(),
         },
     );
 
@@ -339,6 +333,173 @@ fn valid_ghostty_replacement_preserves_slot() {
         result.decisions[0],
         Decision::NativeTabReplaced { .. }
     ));
+}
+
+#[test]
+fn finder_tab_replacement_keeps_its_slot_and_place_in_the_row() {
+    let finder = app(10, 1);
+    let calendar = app(20, 1);
+    let left = Rect {
+        width: 500,
+        ..OUTPUT
+    };
+    let right = Rect {
+        x: 500,
+        width: 500,
+        ..OUTPUT
+    };
+    let first = run(
+        &Model::default(),
+        1,
+        vec![
+            complete(
+                &finder,
+                "com.apple.finder",
+                Some(1),
+                vec![window(&finder, 1, left)],
+            ),
+            complete(
+                &calendar,
+                "com.apple.iCal",
+                Some(2),
+                vec![window(&calendar, 2, right)],
+            ),
+        ],
+    );
+    let order: Vec<_> = first.model.workspace.slots.iter().map(|s| s.id).collect();
+    let evidence = ReconciliationEvidence {
+        previous_placements: HashMap::from([(order[0], left), (order[1], right)]),
+        ..ReconciliationEvidence::default()
+    };
+    let result = reconcile(
+        &first.model,
+        &NativeObservation {
+            cycle: 2,
+            mouse_down: false,
+            applications: vec![complete(
+                &finder,
+                "com.apple.finder",
+                Some(3),
+                vec![window(&finder, 3, left)],
+            )],
+        },
+        &evidence,
+        &Settings::for_output(OUTPUT),
+    );
+
+    let slots = &result.model.workspace.slots;
+    assert_eq!(slots.iter().map(|s| s.id).collect::<Vec<_>>(), order);
+    assert_eq!(slots[0].bound_window().unwrap().window_id, 3);
+    assert_eq!(slots[1].bound_window().unwrap().window_id, 2);
+    assert_eq!(
+        result.decisions,
+        vec![Decision::NativeTabReplaced {
+            slot: order[0],
+            previous: PhysicalWindowId {
+                app: finder.clone(),
+                window_id: 1,
+            },
+            current: PhysicalWindowId {
+                app: finder,
+                window_id: 3,
+            },
+        }]
+    );
+}
+
+/// A tab group with a maximum size never reaches its Fullscreen Layout frame:
+/// the incoming tab is recognized by the frame the outgoing tab was clamped to.
+fn clamped_tab_switch(incoming: Rect) -> (Vec<SlotId>, Reconciliation) {
+    let tabs = app(10, 1);
+    let other = app(20, 1);
+    let clamped = Rect {
+        width: 600,
+        height: 500,
+        ..OUTPUT
+    };
+    let observation = NativeObservation {
+        cycle: 1,
+        mouse_down: false,
+        applications: vec![
+            complete(
+                &tabs,
+                "com.example.tabs",
+                Some(1),
+                vec![window(&tabs, 1, clamped)],
+            ),
+            complete(
+                &other,
+                "com.example.other",
+                Some(2),
+                vec![window(&other, 2, OUTPUT)],
+            ),
+        ],
+    };
+    let first = run(&Model::default(), 1, observation.applications.clone());
+    let order: Vec<_> = first.model.workspace.slots.iter().map(|s| s.id).collect();
+    let mut evidence = ReconciliationEvidence::default();
+    evidence.record(&observation, &first);
+    // Fullscreen Layout asks both tiles for the whole display.
+    evidence.previous_placements = HashMap::from([(order[0], OUTPUT), (order[1], OUTPUT)]);
+    let result = reconcile(
+        &first.model,
+        &NativeObservation {
+            cycle: 2,
+            mouse_down: false,
+            applications: vec![complete(
+                &tabs,
+                "com.example.tabs",
+                Some(3),
+                vec![window(&tabs, 3, incoming)],
+            )],
+        },
+        &evidence,
+        &Settings::for_output(OUTPUT),
+    );
+    (order, result)
+}
+
+#[test]
+fn clamped_tab_replacement_keeps_its_slot_at_the_outgoing_frame() {
+    let (order, result) = clamped_tab_switch(Rect {
+        width: 600,
+        height: 500,
+        ..OUTPUT
+    });
+
+    let slots = &result.model.workspace.slots;
+    assert_eq!(slots.iter().map(|s| s.id).collect::<Vec<_>>(), order);
+    assert_eq!(slots[0].bound_window().unwrap().window_id, 3);
+    assert_eq!(
+        result.decisions,
+        vec![Decision::NativeTabReplaced {
+            slot: order[0],
+            previous: PhysicalWindowId {
+                app: app(10, 1),
+                window_id: 1,
+            },
+            current: PhysicalWindowId {
+                app: app(10, 1),
+                window_id: 3,
+            },
+        }]
+    );
+}
+
+#[test]
+fn a_window_matching_neither_frame_still_gets_a_new_slot() {
+    let (order, result) = clamped_tab_switch(Rect {
+        x: 100,
+        width: 300,
+        height: 300,
+        ..OUTPUT
+    });
+
+    let slots = &result.model.workspace.slots;
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0].id, order[1]);
+    assert_ne!(slots[1].id, order[0]);
+    assert_eq!(slots[1].bound_window().unwrap().window_id, 3);
 }
 
 #[test]
@@ -506,6 +667,7 @@ fn incomplete_observations_do_not_advance_ghostty_settling() {
             output: OUTPUT,
             frame_tolerance: 2,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::default(),
         },
     );
     let unavailable = run(
@@ -557,9 +719,58 @@ fn mouse_down_defers_all_model_changes() {
             output: OUTPUT,
             frame_tolerance: 2,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::default(),
         },
     );
 
     assert_eq!(result.model, model);
     assert_eq!(result.decisions, vec![Decision::MouseDownDeferred]);
+}
+
+/// #706: an incoming native tab caught mid-handoff, at its tile's frame while the outgoing
+/// tab is still listed there or already gone, is pending; one opened anywhere else, or
+/// while the outgoing tab sits somewhere else, is not.
+#[test]
+fn a_native_tab_handoff_is_pending_only_at_its_tiles_frame() {
+    let tabs = app(10, 1);
+    let tile = Rect {
+        width: 620,
+        ..OUTPUT
+    };
+    let model = Model {
+        workspace: crate::model::Workspace {
+            slots: vec![Slot {
+                id: SlotId(1),
+                binding: BindingState::Bound(window(&tabs, 1, tile).id),
+            }],
+        },
+        ..Model::default()
+    };
+    let evidence = ReconciliationEvidence {
+        previous_placements: HashMap::from([(SlotId(1), tile)]),
+        ..ReconciliationEvidence::default()
+    };
+    let settings = Settings::for_output(OUTPUT);
+    let incoming = window(&tabs, 2, tile);
+    let pending = |windows: &[ObservedWindow], candidate: &ObservedWindow| {
+        native_tab_handoff_pending(&model, &evidence, &settings, candidate, windows)
+    };
+
+    assert!(pending(
+        &[window(&tabs, 1, tile), incoming.clone()],
+        &incoming
+    ));
+    assert!(pending(std::slice::from_ref(&incoming), &incoming));
+
+    let elsewhere = Rect {
+        x: 620,
+        width: 380,
+        ..OUTPUT
+    };
+    let opened = window(&tabs, 3, elsewhere);
+    assert!(!pending(&[window(&tabs, 1, tile), opened.clone()], &opened));
+    assert!(!pending(
+        &[window(&tabs, 1, elsewhere), incoming.clone()],
+        &incoming
+    ));
 }

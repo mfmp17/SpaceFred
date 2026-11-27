@@ -1,5 +1,11 @@
 //! Settings controls on `rune-kit` with OpenCode's theme, the same as Hex's and Invoke's: the
-//! raised card, its rows, switches, permission controls and buttons.
+//! page's rails, the raised card and its rows, switches, buttons, the modal shell, shortcut
+//! keys and the permission control. Every size is a token (`tokens.rs`); the rules are in
+//! `docs/design-system.md`.
+
+mod keycaps;
+mod modal;
+mod tokens;
 
 use std::sync::LazyLock;
 
@@ -11,10 +17,18 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Switch};
 
 use crate::{Ui, apps::App};
 
+pub use keycaps::{Held, chords, keycap, roll, tray, tray_held};
+pub use modal::{modal_panel, modal_sheet};
+pub use tokens::{KEYS, METRICS, MODAL, ModalWidth, WINDOW};
+
 /// Row descriptions and secondary copy.
-pub const DESCRIPTION: TextStyle = TextStyle::new(12.0, 440.0).lh(16.0);
-const ROW_HEIGHT: f32 = 44.0;
-const ROW_HEIGHT_DESCRIBED: f32 = 56.0;
+const DESCRIPTION: TextStyle = TextStyle::new(12.0, 440.0).lh(16.0);
+/// A section label's line: the label's own height, so its card sits `label_gap` under it.
+const SECTION_LABEL_LINE: f32 = 16.0;
+/// Clear space above and below a row's copy when a description wraps to a second line.
+const ROW_PY: f32 = 8.0;
+/// Between a row's copy and its control.
+const ROW_GAP: f32 = 24.0;
 const PULSE: LoopSpec = LoopSpec::opacity(2.0, 0.0, 1.0, 0.45);
 
 /// Everything a control needs to paint itself.
@@ -29,6 +43,51 @@ impl Paint {
         Self {
             k: rune_theme_opencode::kit(dark),
             hair: 1.0 / scale,
+        }
+    }
+    /// A section label: above its card, on the page's text rail. Screen readers move between
+    /// sections by it.
+    pub fn section_label(self, title: &str) -> El {
+        text(title)
+            .key("title")
+            .role("heading")
+            .level(2)
+            .font(self.label())
+            .color(self.muted())
+    }
+    /// Pane title and modal title (14/500/21).
+    pub fn title(self) -> TextStyle {
+        self.k.ty.body_medium
+    }
+    /// Section label above a card, and a row's value (13/530/16).
+    pub fn label(self) -> TextStyle {
+        self.k.ty.ui_medium.lh(SECTION_LABEL_LINE)
+    }
+    /// Row title, sidebar item and a pressable row (13/440/20).
+    pub fn row_title(self) -> TextStyle {
+        self.k.ty.ui
+    }
+    /// Button label, a tile's number, the recorder's prompt (13/530/20).
+    pub fn strong(self) -> TextStyle {
+        self.k.ty.ui_medium
+    }
+    /// Row description, note and empty row (12/440/16).
+    pub fn description(self) -> TextStyle {
+        DESCRIPTION
+    }
+    /// Label accessory, sidebar foot and preview caption (11/440/12).
+    pub fn meta(self) -> TextStyle {
+        self.k.ty.small
+    }
+    /// A count or an initial in a chip (11/530/12).
+    pub fn tag(self) -> TextStyle {
+        self.k.ty.small_medium
+    }
+    /// Tabular figures, for a number that changes in place or sits in a column.
+    pub fn tabular(self, style: TextStyle) -> TextStyle {
+        TextStyle {
+            features: "'tnum' 1",
+            ..style
         }
     }
     pub fn text(self) -> Color {
@@ -54,51 +113,72 @@ impl Paint {
     }
 }
 
-/// A small heading over a card, with optional copy on the right.
-pub fn heading(p: Paint, key: &str, title: &str, trailing: Option<&str>) -> El {
-    row()
-        .key(key)
-        .h(20.0)
-        .px(12.0)
-        .center_y()
-        .justify_between()
-        .child(
-            text(title)
-                .key("title")
-                .font(p.k.ty.ui_medium.lh(16.0))
-                .color(p.muted()),
-        )
-        .children(trailing.map(|copy| {
-            text(copy)
-                .key("trailing")
-                .font(p.k.ty.small)
-                .color(p.faint())
-        }))
+/// A settings page: its sections, `section_gap` apart. `view::scroll_body` puts it on the rails.
+pub fn page(key: &str, sections: Vec<El>) -> El {
+    col().key(key).gap(METRICS.section_gap).children(sections)
 }
 
 /// A titled card of rows.
 pub fn section(p: Paint, key: &str, title: &str, rows: Vec<El>) -> El {
     col()
         .key(key)
-        .gap(8.0)
-        .child(heading(p, "header", title, None))
+        .gap(METRICS.label_gap)
+        .child(section_header(p, title, None))
         .child(card(p, "card", rows))
 }
 
-/// A raised card of rows with hairline separators between them.
+/// A [`section`] with an accessory on its label's line: a caption (see [`caption`]) or a small
+/// control. The line keeps the label's height, and the accessory ends where the rows' controls
+/// do.
+pub fn section_with(p: Paint, key: &str, title: &str, accessory: El, rows: Vec<El>) -> El {
+    col()
+        .key(key)
+        .gap(METRICS.label_gap)
+        .child(section_header(p, title, Some(accessory)))
+        .child(card(p, "card", rows))
+}
+
+/// A section's label line on its own, for a view that lays its own content under it (the Rules
+/// map). Inset `row_px` from the card edge, so the label sits on the text rail.
+pub fn section_header(p: Paint, title: &str, accessory: Option<El>) -> El {
+    row()
+        .key("header")
+        .h(SECTION_LABEL_LINE)
+        .mx(METRICS.row_px)
+        .gap(8.0)
+        .center_y()
+        .child(p.section_label(title).grow(1.0))
+        .children(accessory)
+}
+
+/// Quiet copy for a section label's line.
+pub fn caption(p: Paint, copy: &str) -> El {
+    text(copy.to_owned())
+        .key("caption")
+        .font(p.meta())
+        .color(p.muted())
+}
+
+/// A raised card of rows with hairline separators between them. The card has no padding: rows
+/// reach its edges and take its corners, so a row's fill (a deep link's highlight, a press) is
+/// full-bleed and needs no radius of its own.
 pub fn card(p: Paint, key: &str, rows: Vec<El>) -> El {
-    let mut card = surface(p, col().key(key).padding(4.0));
+    let radius = p.k.radius.lg;
+    let last = rows.len().saturating_sub(1);
+    let mut card = surface(p, col().key(key));
     for (index, row) in rows.into_iter().enumerate() {
         if index > 0 {
             card = card.child(
                 el().key(format!("sep{index}"))
                     .h(p.hair)
-                    .ml(12.0)
-                    .mr(12.0)
-                    .fill(p.k.c.border_muted),
+                    .mx(METRICS.row_px)
+                    .fill(p.k.c.border_muted)
+                    .a11y_hidden(),
             );
         }
-        card = card.child(row);
+        let top = if index == 0 { radius } else { 0.0 };
+        let bottom = if index == last { radius } else { 0.0 };
+        card = card.child(row.corners([top, top, bottom, bottom]));
     }
     card
 }
@@ -110,6 +190,30 @@ pub fn surface(p: Paint, element: El) -> El {
         element = element.box_shadow(*shadow);
     }
     element
+}
+
+/// The fill a `spaceman://` deep link gives the row or card it points at.
+pub fn highlight(p: Paint, element: El, on: bool) -> El {
+    if on {
+        element.fill(p.k.c.layer_02)
+    } else {
+        element
+    }
+}
+
+/// A card row's frame: its height (as a minimum, so wrapped copy grows it), its inset to the
+/// text rail, and its content centred. Every row in a card is built on it.
+pub fn row_frame(key: &str, described: bool) -> El {
+    row()
+        .key(key)
+        .min_h(if described {
+            METRICS.row_h_described
+        } else {
+            METRICS.row_h
+        })
+        .px(METRICS.row_px)
+        .py(ROW_PY)
+        .center_y()
 }
 
 /// A setting: title and optional description on the left, its control on the right.
@@ -132,7 +236,7 @@ pub fn icon_row(
     description: Option<(String, Color)>,
     control: El,
 ) -> El {
-    let lead = icon(glyph, 16.0).key("icon").color(p.k.c.icon_base);
+    let lead = icon(glyph, METRICS.icon).key("icon").color(p.k.c.icon_base);
     leading_row(p, key, Some(lead), title, description, control)
 }
 
@@ -144,33 +248,23 @@ fn leading_row(
     description: Option<(String, Color)>,
     control: El,
 ) -> El {
-    let height = if description.is_some() {
-        ROW_HEIGHT_DESCRIBED
-    } else {
-        ROW_HEIGHT
-    };
+    let frame = row_frame(key, description.is_some());
     let copy = col()
         .key("copy")
         .grow(1.0)
         .shrink()
         .gap(2.0)
-        .child(text(title).key("label").font(p.k.ty.ui).color(p.text()))
+        .child(text(title).key("label").font(p.row_title()).color(p.text()))
         .children(description.map(|(copy, color)| {
             text(copy)
                 .key("description")
-                .font(DESCRIPTION)
+                .font(p.description())
                 .color(color)
                 .wrap()
         }));
-    row()
-        .key(key)
-        .min_h(height)
-        .px(12.0)
-        .py(8.0)
-        .gap(24.0)
-        .center_y()
+    frame
+        .gap(ROW_GAP)
         .justify_between()
-        .radius(p.k.radius.md)
         .label(title)
         .child(match lead {
             None => copy,
@@ -178,7 +272,7 @@ fn leading_row(
                 .key("lead")
                 .grow(1.0)
                 .shrink()
-                .gap(12.0)
+                .gap(METRICS.icon_lead - METRICS.icon)
                 .center_y()
                 .child(lead)
                 .child(copy),
@@ -197,23 +291,6 @@ pub fn toggle_row(
 ) -> El {
     let switch = Switch::new(on).build(p.k).key("switch").focusable(false);
     setting_row(p, key, title, description, switch)
-        .role("toggle")
-        .focusable(true)
-        .on_press(flip)
-}
-
-/// An [`icon_row`] whose whole row toggles a switch.
-pub fn icon_toggle_row(
-    p: Paint,
-    key: &str,
-    glyph: &'static Icon,
-    title: &str,
-    description: Option<(String, Color)>,
-    on: bool,
-    flip: impl Fn(&mut Ui) + 'static,
-) -> El {
-    let switch = Switch::new(on).build(p.k).key("switch").focusable(false);
-    icon_row(p, key, glyph, title, description, switch)
         .role("toggle")
         .focusable(true)
         .on_press(flip)
@@ -244,6 +321,10 @@ pub fn reveal_in_finder(path: &std::path::Path) {
     );
 }
 
+/// A push button's text inset; the granted permission pill keeps it, so `Allow` holds still as
+/// it becomes `Allowed`.
+const BUTTON_PX: f32 = 12.0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ButtonKind {
     Primary,
@@ -257,21 +338,55 @@ pub fn button(
     kind: ButtonKind,
     press: impl Fn(&mut Ui, &mut Tx) + 'static,
 ) -> El {
+    button_enabled(p, key, label, kind, true, press)
+}
+
+/// A [`button`] that is dimmed and takes no press while there is nothing for it to do.
+pub fn button_enabled(
+    p: Paint,
+    key: &str,
+    label: &str,
+    kind: ButtonKind,
+    enabled: bool,
+    press: impl Fn(&mut Ui, &mut Tx) + 'static,
+) -> El {
     Button::new(label)
         .variant(match kind {
             ButtonKind::Primary => ButtonVariant::Contrast,
             ButtonKind::Secondary => ButtonVariant::Neutral,
         })
         .on_press_tx(press)
+        .disabled(!enabled)
         .control_size(ControlSize::Large)
         .build(p.k)
-        .px(11.0)
+        .px(BUTTON_PX)
+        .radius(p.k.radius.md)
+        .key(key)
+}
+
+/// A quiet button beside a row's main control: it opens that feature's refinements
+/// (`Customize…`). No fill at rest, so the main control stays the row's one loud thing.
+pub fn quiet_button(
+    p: Paint,
+    key: &str,
+    label: &str,
+    press: impl Fn(&mut Ui, &mut Tx) + 'static,
+) -> El {
+    Button::new(label)
+        .variant(ButtonVariant::GhostMuted)
+        .on_press_tx(press)
+        .control_size(ControlSize::Large)
+        .build(p.k)
+        .px(8.0)
         .radius(p.k.radius.md)
         .key(key)
 }
 
 pub fn status_dot(color: Color) -> El {
-    el().key("dot").size(8.0, 8.0).radius(4.0).fill(color)
+    el().key("dot")
+        .size(METRICS.dot, METRICS.dot)
+        .radius(METRICS.dot / 2.0)
+        .fill(color)
 }
 
 pub fn pulsing_dot(color: Color) -> El {
@@ -289,7 +404,7 @@ pub fn icon_or_initial(p: Paint, app: Option<&App>, name: &str, size: f32) -> El
             .center()
             .child(
                 text(name.chars().next().map(String::from).unwrap_or_default())
-                    .font(p.k.ty.small_medium)
+                    .font(p.tag())
                     .color(p.muted()),
             ),
     }
@@ -319,7 +434,6 @@ const APPEAR: &[Beat] = &[
     Beat::new(0.1).opacity(0.0),
     Beat::new(0.15).opacity(1.0).easing(Easing::EASE_OUT),
 ];
-const PILL_PADDING: f32 = 11.0;
 const CHECK_INK: [f32; 4] = [4.6, 4.6, 6.8, 6.8];
 const CHECK_START: [f32; 2] = [5.2, 9.15];
 const CHECK_X: f32 = 4.0;
@@ -370,7 +484,7 @@ pub fn permission_control(
                 .child(
                     text("Allowed")
                         .key("label")
-                        .font(p.k.ty.ui_medium)
+                        .font(p.strong())
                         .color(p.success()),
                 );
         }
@@ -459,13 +573,13 @@ fn allowed_pill(p: Paint, key: &str, kind: ButtonKind) -> El {
         ButtonKind::Primary => (k.c.bg_contrast, &k.elevation.button_contrast),
         ButtonKind::Secondary => (k.c.bg_button_neutral, &k.elevation.button_neutral),
     };
-    let font = k.ty.ui_medium;
+    let font = p.strong();
     let ink = p.success();
     let mut pill = row()
         .key(key)
         .label("Allowed")
         .h(28.0)
-        .pl(PILL_PADDING)
+        .pl(BUTTON_PX)
         .center_y()
         .radius(k.radius.md)
         .fill(fill.alpha(0.0));

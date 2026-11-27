@@ -1,3 +1,5 @@
+pub mod window_scope;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::{
@@ -125,6 +127,7 @@ mod tests {
             },
             frame_tolerance: 2,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::default(),
         };
         let mut observation = NativeObservation {
             cycle: 1,
@@ -144,6 +147,7 @@ mod tests {
                     },
                     resizable: true,
                     title: None,
+                    document: None,
                 }],
             }],
         };
@@ -183,6 +187,7 @@ mod tests {
             },
             frame_tolerance: 2,
             spacing: crate::spacing::Spacing::NONE,
+            layout: crate::config::LayoutMode::default(),
         };
         let initial = reconcile(
             &Model::default(),
@@ -200,6 +205,7 @@ mod tests {
                         frame: settings.output,
                         resizable: true,
                         title: None,
+                        document: None,
                     }],
                 }],
             },

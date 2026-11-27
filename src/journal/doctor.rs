@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{Rect, WorkspaceId};
 
 use super::{
-    AnomalyKind, AnomalyState, ArrangedWindow, Arrangement, CORRECTION_WINDOW, JournalEvent,
-    JournalLine, PlacementSource, WindowChange, WindowRole,
+    ANOMALY_SETTLE, AnomalyKind, AnomalyState, ArrangedWindow, Arrangement, CORRECTION_WINDOW,
+    JournalEvent, JournalLine, PlacementSource, WindowChange, WindowRole,
 };
 
 /// One anomaly kind's begin count, time spent, and the apps it touched.
@@ -37,6 +37,11 @@ pub struct Summary<'a> {
     pub anomalies: BTreeMap<AnomalyKind, KindSummary>,
     /// The arrangement rebuilt from the last snapshot and the diffs after it.
     pub arrangement: Option<Arrangement>,
+}
+
+/// The settle window in milliseconds, the least a journaled anomaly has already persisted.
+fn settle_ms() -> u64 {
+    u64::try_from(ANOMALY_SETTLE.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl<'a> Summary<'a> {
@@ -91,7 +96,11 @@ impl<'a> Summary<'a> {
                             let kind = summary.anomalies.entry(anomaly.kind).or_default();
                             kind.count += 1;
                             *kind.bundles.entry(anomaly.bundle_id.clone()).or_default() += 1;
-                            open.insert(key, line.t);
+                            // A begin is journaled only after the settle window, and records how
+                            // long the disagreement had already persisted. Older journals wrote
+                            // no value: assume the minimum settle window.
+                            let settled = duration_ms.unwrap_or_else(settle_ms);
+                            open.insert(key, line.t.saturating_sub(settled));
                         }
                         AnomalyState::End => {
                             if open.remove(&key).is_some() {

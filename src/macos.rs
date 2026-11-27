@@ -6,8 +6,10 @@ mod displays;
 mod events;
 mod keys;
 mod presenter;
+mod spaces;
 mod swipes;
 mod symbolic_hotkeys;
+mod tabs;
 #[cfg(test)]
 mod tests;
 mod window_attributes;
@@ -30,23 +32,29 @@ use crate::{
 };
 
 pub use apply::{
-    ApplyOutcome, ApplyResult, WindowAccessError, apply, apply_managed, apply_while, focus_window,
-    frame, raise_window, set_parked_position, set_position_only, warp_pointer,
+    ApplyOutcome, ApplyResult, WindowAccessError, WindowLookup, WindowRuleProbe, apply,
+    apply_managed, apply_while, focus_window, frame, keeps_failed_handle, raise_window,
+    set_parked_position, set_position_only, set_restore_frame, warp_pointer, window_rule_probe,
 };
 pub use ax::{
-    onscreen_window_frames, onscreen_window_order, window_server_frame, window_server_frames,
-    windows_at_point,
+    hover_window_at, onscreen_window_frames, onscreen_window_order, window_server_frame,
+    window_server_frames, windows_at_point,
 };
 pub use display_link::{DisplayFrame, DisplayLink, DisplayLinkError};
-pub use displays::{DisplayOutput, DisplayOutputs, display_ids, outputs};
+pub use displays::{
+    DisplayOutput, DisplayOutputs, DisplayTopology, display_ids, display_topology, displays_asleep,
+    outputs,
+};
 pub use events::WindowEventMonitor;
-pub use keys::KeyMonitor;
+pub use keys::{KeyMonitor, key_press};
 pub use presenter::{
     AppSink, AxBackend, EnhancedUi, InteractivePresenter, PresenterBackend, PresenterStats,
     WriteOutcome,
 };
+pub use spaces::{last_active_space_change, last_space_gesture, take_active_space_changed};
 pub use swipes::SwipeMonitor;
 pub(crate) use symbolic_hotkeys::mission_control_shortcuts;
+pub use tabs::{TabDetachResult, detach_tab};
 
 use apply::{cache_managed_window, evict_managed_app, prune_managed_app};
 use ax::{
@@ -54,7 +62,9 @@ use ax::{
     onscreen_windows, optional_bool_attribute, physical_window_id, set_ax_timeout,
     window_server_windows,
 };
-use classify::{TitleBar, TitleButton, is_dialog, is_ignored};
+use classify::{
+    DialogHint, TitleBar, TitleButton, is_dialog, is_file_panel_identifier, is_ignored,
+};
 use displays::main_output;
 use window_attributes::{WindowAttribute, WindowAttributes};
 
@@ -110,7 +120,9 @@ pub fn snapshot_in_outputs(
     cycle: u64,
     outputs: &DisplayOutputs,
 ) -> Result<NativeObservation, SnapshotError> {
-    snapshot_in_output(cycle, outputs.union()).map(|(observation, _)| observation)
+    // Full bounds: a new window centered over the topmost display's menu bar strip is on
+    // screen, though above every usable frame (#586).
+    snapshot_in_output(cycle, outputs.screen_union()).map(|(observation, _)| observation)
 }
 
 pub fn snapshot_for_window(
@@ -280,6 +292,38 @@ pub fn mouse_down() -> bool {
     CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, CGMouseButton::Left)
 }
 
+/// The modifier keys held now, from the event system's state: no Accessibility, cheap enough
+/// for every main-thread tick.
+#[must_use]
+pub fn held_modifiers() -> crate::shortcuts::Modifiers {
+    let flags = CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState);
+    crate::shortcuts::Modifiers {
+        command: flags.contains(CGEventFlags::MaskCommand),
+        control: flags.contains(CGEventFlags::MaskControl),
+        option: flags.contains(CGEventFlags::MaskAlternate),
+        shift: flags.contains(CGEventFlags::MaskShift),
+    }
+}
+
+/// Whether any mouse button is held: left, right or middle. A pointer warp
+/// under a held button would yank a drag or a context menu away (#422).
+#[must_use]
+pub fn any_mouse_button_down() -> bool {
+    any_button_down(|button| {
+        CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, button)
+    })
+}
+
+fn any_button_down(pressed: impl Fn(CGMouseButton) -> bool) -> bool {
+    [
+        CGMouseButton::Left,
+        CGMouseButton::Right,
+        CGMouseButton::Center,
+    ]
+    .into_iter()
+    .any(pressed)
+}
+
 /// How long ago the user last typed, clicked, or changed modifiers, and
 /// whether Command is held. Tells Command-Tab apart from an app activating
 /// itself in focus-follow logs, without recording which keys were pressed.
@@ -328,8 +372,20 @@ pub(super) fn running_application(
 ) -> Option<objc2::rc::Retained<NSRunningApplication>> {
     autoreleasepool(|_| {
         NSRunningApplication::runningApplicationWithProcessIdentifier(id.pid)
-            .filter(|application| launch_time(application, id.pid) == id.launched_at)
+            .filter(|application| same_launch(launch_time(application, id.pid), id.launched_at))
     })
+}
+
+/// How far apart two reads of one process's launch time may be. `launchDate` and the
+/// kernel start time it falls back to differ by a few milliseconds (#735); a reused pid
+/// starts long after the process it replaces has exited.
+const LAUNCH_TIME_TOLERANCE_MS: u64 = 250;
+
+fn same_launch(observed: u64, recorded: u64) -> bool {
+    observed == recorded
+        || (observed != 0
+            && recorded != 0
+            && observed.abs_diff(recorded) <= LAUNCH_TIME_TOLERANCE_MS)
 }
 
 pub(super) fn process_incarnation_matches(id: &AppInstanceId) -> bool {
@@ -343,6 +399,27 @@ pub fn is_process_incarnation_running(id: &AppInstanceId) -> bool {
         evict_managed_app(id);
     }
     running
+}
+
+/// The running application instance owning each of `window_ids`, per the window server.
+/// Windows it no longer lists, windows off the normal layer (always-on-top windows, which
+/// observation ignores), or whose process is not a running application, are left out.
+#[must_use]
+pub fn window_owners(window_ids: &HashSet<u32>) -> HashMap<u32, AppInstanceId> {
+    autoreleasepool(|_| {
+        let Some(windows) = window_server_windows(CGWindowListOption::OptionAll) else {
+            return HashMap::new();
+        };
+        windows
+            .into_iter()
+            .filter(|window| window.pid > 0 && window.layer == 0 && window_ids.contains(&window.id))
+            .filter_map(|window| {
+                let application =
+                    NSRunningApplication::runningApplicationWithProcessIdentifier(window.pid)?;
+                Some((window.id, app_instance_with_pid(&application, window.pid)))
+            })
+            .collect()
+    })
 }
 
 pub(super) fn app_instance_with_pid(application: &NSRunningApplication, pid: i32) -> AppInstanceId {
@@ -438,6 +515,12 @@ pub(crate) fn confirms_set_aside(window: &PhysicalWindowId) -> bool {
     running_application(&window.app).is_some_and(|application| {
         application.isHidden() || apply::cached_window_is_minimized(window)
     })
+}
+
+/// The window is in macOS native fullscreen, on its own Space. Observation
+/// skips such a window, so its tile leaves the layout until it exits (#740).
+pub(crate) fn confirms_native_fullscreen(window: &PhysicalWindowId) -> bool {
+    running_application(&window.app).is_some() && apply::cached_window_is_fullscreen(window)
 }
 
 fn observe_application(
@@ -548,7 +631,9 @@ enum WindowObservation {
     Ignored,
 }
 
-const MIN_MANAGEABLE_WINDOW_DIMENSION: i32 = 64;
+// Matches the smallest tile the layout makes (and `resize` accepts), so a tile
+// sized down to it stays managed instead of dropping out of its workspace (#702).
+const MIN_MANAGEABLE_WINDOW_DIMENSION: i32 = crate::layout_tree::MIN_TILE_EXTENT;
 
 fn observe_window(
     id: PhysicalWindowId,
@@ -620,23 +705,47 @@ fn observe_window(
     let modal = attributes
         .optional_bool(WindowAttribute::Modal)
         .unwrap_or(false);
+    let hint = DialogHint {
+        file_panel: attributes
+            .get::<CFString>(WindowAttribute::Identifier)
+            .is_ok_and(|id| is_file_panel_identifier(&id.to_string())),
+        cancel_button: attributes
+            .get::<AXUIElement>(WindowAttribute::CancelButton)
+            .is_ok(),
+        default_button: attributes
+            .get::<AXUIElement>(WindowAttribute::DefaultButton)
+            .is_ok(),
+    };
     // The zoom button's state costs its own round trip, and only decides a
-    // regular application's closable window without a fullscreen button.
-    if !accessory && !modal && close && bar.fullscreen == TitleButton::Absent {
+    // regular application's closable (or default-button) window without a
+    // fullscreen button.
+    if !accessory
+        && !modal
+        && !hint.file_panel
+        && !hint.cancel_button
+        && bar.fullscreen == TitleButton::Absent
+        && (close || hint.default_button)
+    {
         bar.zoom = title_button(&attributes, WindowAttribute::ZoomButton);
     }
-    let dialog = is_dialog(accessory, modal, bar);
+    let dialog = is_dialog(accessory, modal, bar, hint);
     let resizable = !dialog
         && is_settable(window, "AXSize").map_err(|error| format!("AXSize settable: {error:?}"))?;
     let title = match attributes.get::<CFString>(WindowAttribute::Title) {
         Ok(title) => Some(std::sync::Arc::from(title.to_string())),
         Err(_) => None,
     };
+    let document = attributes
+        .get::<CFString>(WindowAttribute::Document)
+        .ok()
+        .and_then(|document| crate::window_memory::normalize_document(&document.to_string()))
+        .map(std::sync::Arc::from);
     Ok(WindowObservation::Observed(ObservedWindow {
         id,
         frame,
         resizable,
         title,
+        document,
     }))
 }
 
