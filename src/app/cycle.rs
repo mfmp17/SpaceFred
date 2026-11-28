@@ -1,3 +1,4 @@
+mod activation;
 mod affinity;
 mod deck;
 mod float_tab;
@@ -143,31 +144,41 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         // One window-server snapshot serves every authoritative-frame check in
         // this cycle; per-window queries would each copy the full window list.
         let server_snapshot = self.backend.window_server_frames();
-        // A pinned window shows on every workspace, so focusing it never switches.
-        let focus_workspace = if focused_is_frontmost {
-            focused
-                .as_ref()
-                .filter(|focused| !self.workspaces.is_pinned(focused))
-                .and_then(|focused| self.workspaces.workspace_of_any(focused))
-        } else {
-            // Only windows the window server still lists count: an app whose
-            // windows all just closed has nothing on a hidden workspace to
-            // follow (#516). No snapshot proves nothing closed.
-            frontmost.as_ref().and_then(|app| {
-                self.workspaces.workspace_for_live_app(app, |window| {
-                    server_snapshot
-                        .as_ref()
-                        .is_none_or(|frames| frames.contains_key(&window.window_id))
-                })
-            })
-        };
         // A guard lasts until Accessibility reports a different focus, and a
         // report a focus request in flight explains is no focus change at all:
-        // it must neither switch a display nor rewrite history (#399).
+        // it must neither switch a display nor rewrite history (#399). A Space
+        // slide that explains a failed follow lifts that guard first, so the
+        // decision below does not treat the retry as Cmd-N.
         self.retry_follow_after_space_change();
         if focused_is_frontmost && let Some(reported) = focused.as_ref() {
             self.reclaim_from_sibling(reported, &visible);
         }
+        // Only windows the window server still lists count: an app whose
+        // windows all just closed has nothing on a hidden workspace to
+        // follow (#516). No snapshot proves nothing closed.
+        let listed = |window: &crate::PhysicalWindowId| {
+            server_snapshot
+                .as_ref()
+                .is_none_or(|frames| frames.contains_key(&window.window_id))
+        };
+        // A pinned window shows on every workspace, so focusing it never switches.
+        let focus_workspace = if focused_is_frontmost {
+            focused.as_ref().and_then(|focused| {
+                if self.workspaces.is_pinned(focused) {
+                    return None;
+                }
+                self.workspaces.workspace_of_any(focused).or_else(|| {
+                    // Dock and Cmd-Tab can focus a window this app just created
+                    // while the windows it already owns live on another workspace.
+                    let app = frontmost.as_ref()?;
+                    self.unowned_activation_workspace(app, &visible, listed)
+                })
+            })
+        } else {
+            frontmost
+                .as_ref()
+                .and_then(|app| self.workspaces.workspace_for_live_app(app, listed))
+        };
         let suppressed = self.focus.holds_back(
             self.backend.now(),
             focused.as_ref(),
@@ -181,56 +192,46 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     .iter()
                     .any(|resolved| resolved.workspace == workspace)
                 {
-                    let input = self
-                        .backend
-                        .recent_input()
-                        .map_or_else(|| "input unknown".into(), |input| input.to_string());
-                    log_event!(
-                        "focus follow: {:?} (frontmost {:?}) -> workspace {} ({})",
-                        focused,
-                        frontmost,
+                    return self.follow_workspace(
                         workspace,
-                        input
-                    );
-                    let follow_started = self.backend.now();
-                    // A follow answers focus the user already moved: the pointer stays.
-                    let followed = self.switch_with(
-                        workspace,
-                        outputs.clone(),
+                        focused.as_ref(),
+                        frontmost.as_ref(),
+                        outputs,
                         cancelled,
-                        super::switching::RepeatSwitch::KeepFocus,
-                        super::commands::CommandOrigin::Passive,
                     );
-                    // An activation (or a finished drag) cancels background
-                    // cycles, often the very one this follow answers (a
-                    // notification click). A cancelled follow lets the next cycle
-                    // follow again; a switch that fails for any other reason keeps
-                    // focus suppressed so it can't loop, unless a macOS Space
-                    // slide explains the failure.
-                    if matches!(&followed, Err(error) if error.ends_with("cancelled")) {
-                        self.clear_suppressed_focus();
-                    } else if followed.is_err() {
-                        self.focus.follow_failed(follow_started);
-                        if self.retry_follow_after_space_change() {
-                            let until = self
-                                .space_transition_until()
-                                .unwrap_or_else(|| self.backend.now() + SPACE_TRANSITION_SETTLE);
-                            return Ok(self.defer_for_space_transition(until, &outputs));
-                        }
-                    }
-                    return followed;
                 }
                 // Focus moved to a workspace already on screen, such as a click
                 // on another display. Option+Tab goes back from here.
                 self.record_focused_workspace(workspace);
             }
         }
+        let empty_server_frames = HashMap::new();
+        let server_frames = server_snapshot.as_ref().unwrap_or(&empty_server_frames);
+        // The app brought a parked window back on screen (a Dock click often
+        // does this before Accessibility reports that window, and sometimes
+        // while focus is still the window a move left behind). Switch to its
+        // workspace instead of letting heal tile it into the current layout.
+        // Runs even while focus is suppressed: the on-screen reappearance is
+        // the activation, and the park-settle grace stops a switch we just
+        // made from following a stale frame straight back.
+        if let Some(workspace) = self.workspace_summoned_on_screen(
+            &visible,
+            frontmost.as_ref(),
+            focused.as_ref(),
+            server_frames,
+        ) {
+            return self.follow_workspace(
+                workspace,
+                focused.as_ref(),
+                frontmost.as_ref(),
+                outputs,
+                cancelled,
+            );
+        }
         for resolved in &visible {
             self.workspaces
                 .seed_display_front(&resolved.display_id, &resolved.selector);
         }
-        let empty_server_frames = HashMap::new();
-        let server_frames = server_snapshot.as_ref().unwrap_or(&empty_server_frames);
         // Recovery records this cycle did not create: a hidden tab group's outgoing tab may
         // only hand over its tile when it was on screen going in (#753).
         let parked_before: HashSet<_> = self.parked.keys().cloned().collect();

@@ -40,8 +40,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// A window observed on-screen while still recorded as parked was brought back by
     /// its app or the user. Accessibility frames can be stale right after a park, so
     /// the reappearance must be confirmed by the window server before trusting it.
-    /// Fighting a genuinely reappeared window back off-screen loses, so drop the
-    /// stale recovery frame and re-home the window to the workspace it reappeared on.
+    /// Re-home it when its app already has a window on screen; otherwise it keeps its
+    /// hidden workspace and focus follow switches there.
     pub(super) fn heal_reappeared_window(
         &mut self,
         window: &crate::ObservedWindow,
@@ -70,6 +70,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         if self.returned_by_space_slide(&window.id) {
             // macOS put it back while leaving the app's fullscreen Space (#489);
             // parking pushes it back off-screen.
+            return None;
+        }
+        // A hidden home, and nothing of this app already on screen: the view
+        // switches there. Joining the workspace on screen would split it.
+        if !self.rehome_reappearance(&window.id, visible) {
             return None;
         }
         self.honor_reappearance(&window.id, frame, original, target)
@@ -322,7 +327,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// A parked window observed on-screen in the background re-asserted its
     /// saved bounds (Electron does this on screen-parameter changes). Push it
     /// back to its parked spot; the recovery frame is already recorded. A
-    /// frontmost app's window is left for heal to re-home instead.
+    /// frontmost window is left for heal when it should join the workspace it
+    /// appeared on. One whose home is a hidden workspace, and whose app has
+    /// nothing on screen, is pushed back so the view can switch there instead.
     fn repark_drifted_window(
         &mut self,
         window: &crate::PhysicalWindowId,
@@ -349,10 +356,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let moved_since_park = self.parked.settling_from(window, now).is_some_and(|from| {
             !server.position_approximately_equals(from, RESTORE_CONFIRM_TOLERANCE)
         });
-        if (self.parked.settling(window, now) && !moved_since_park)
-            || (context.frontmost.as_ref() == Some(&window.app)
-                && !self.returned_by_space_slide(window))
-        {
+        let leave_for_heal = context.frontmost.as_ref() == Some(&window.app)
+            && !self.returned_by_space_slide(window)
+            && self.rehome_reappearance(window, context.visible);
+        if (self.parked.settling(window, now) && !moved_since_park) || leave_for_heal {
             return None;
         }
         if server.width < original.width.saturating_sub(RESTORE_CONFIRM_TOLERANCE)
