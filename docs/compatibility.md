@@ -54,8 +54,11 @@ windows, utility panels, dialogs with other subroles, and applications with inco
 Accessibility implementations remain global and are ignored so Spaceman never fights their bounds.
 
 Some applications reposition their own windows. If a parked window reappears on screen while its
-application is frontmost, the user summoned it: the stale recovery frame is discarded and the window —
-tiled or floating — is re-homed to the workspace it reappeared on. If it reappears in the background —
+application is frontmost and that application already has a window on the workspace where it
+reappeared, the user summoned it there: the stale recovery frame is discarded and the window —
+tiled or floating — is re-homed to that workspace. If the application has no window on the
+workspace currently showing, the reappearance switches to the window's own workspace instead of
+joining the current layout. If it reappears in the background —
 Electron applications re-assert saved bounds on screen-parameter changes — it is quietly pushed back
 off screen with its recovery frame intact, even in the first moments after it was parked (an
 application unhidden in the background). The same holds for a frontmost application's other

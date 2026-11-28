@@ -203,12 +203,19 @@ Window overlay ([labs] window_overlay, off)                 // ws.window-overlay
 └── Fullscreen Layout shows only the front tile's card; parked and hidden windows have none
 
 Focus follows                                              // ws.focus-follow
-├── Focusing a window that lives on a hidden workspace (Dock, Cmd+Tab, notification)
-│   -> that workspace becomes active, with focus on that window (not its remembered tile)
+├── Activating an app whose windows all live on one hidden workspace (Dock, Cmd+Tab,
+│   notification, or the app bringing that window back on screen)
+│   -> that workspace becomes active, with focus on that window (not its remembered tile);
+│      the workspace you were on keeps its layout
+│   ├── A window this activation just created, while the app was already frontmost (Cmd-N)
+│   │   -> the new window tiles on the active workspace; parked windows stay where they are
 │   └── Switch interrupted by that same activation -> retiles every 40 ms for 500 ms and follows it
 │       as soon as Accessibility catches up
 │   └── Activation slides macOS to another Space (Cmd+Tab out of a native fullscreen app)
 │       -> follows once the slide settles; a follow the slide made fail is retried, not re-homed
+├── The app already has a window on the active workspace -> stay. A parked window of it that
+│   comes back on screen is re-homed here. Right after a Space slide, only the focused window
+│   counts as summoned; the others are re-parked (#489)
 ├── Focusing a window on another display's visible workspace -> no switch; Option+Tab remembers it
 ├── Focusing a pinned window (`action = "pin"`, `ctl pin`, a `pin` shortcut) -> never switches: it shows everywhere
 └── No focused window reported -> follows the frontmost app only when all its windows, tiled
@@ -408,7 +415,13 @@ on the same letter.
   `following_focus_to_a_hidden_workspace_keeps_the_window_that_took_it`,
   `a_follow_cancelled_by_the_activation_it_answers_follows_on_the_next_cycle` and
   `a_follow_that_fails_while_an_activation_cancels_stays_suppressed` (`focus.rs`, notification
-  clicks),
+  clicks). Unit (FakeBackend), `src/app/tests/activation.rs`:
+  `activating_an_app_on_another_workspace_switches_instead_of_splitting`,
+  `an_unowned_focus_follows_the_apps_hidden_workspace`,
+  `a_new_window_of_the_frontmost_app_stays_on_the_current_workspace` and
+  `a_fresh_park_stays_put_until_it_settles` (Dock / Cmd-Tab switches to the app's workspace
+  instead of tiling its window into the current one; Cmd-N stays; a park still settling does not
+  bounce),
   `workspace_back_and_forth_bounces_between_the_last_two_focused_workspaces`,
   `workspace_back_and_forth_on_one_display_switches_like_before`,
   `switching_to_an_unconfigured_named_workspace_is_rejected`.
